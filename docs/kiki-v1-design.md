@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS session_runs (
     id TEXT PRIMARY KEY,
     topic_id TEXT NOT NULL,
     trigger_message_id TEXT NOT NULL,
-    agent_type TEXT NOT NULL, -- 如 'claude_code', 'pi', 'custom_agent'
+    agent_type TEXT NOT NULL, -- 如 'gemini_agent' (默认内置), 'claude_code', 'pi'
     status TEXT CHECK(status IN ('queued', 'running', 'waiting_input', 'completed', 'failed', 'cancelled')) DEFAULT 'queued',
     current_step TEXT,
     error_message TEXT,
@@ -98,7 +98,34 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 ---
 
-## 三、 Decision Model 路由逻辑与 Prompt
+## 三、 大模型接入方案与 Decision Model 路由设计
+
+### 1. 模型选型与 SDK 接入规范
+* **默认模型**：统一优先采用 **Gemini 3.8 Flash**（Model ID：`gemini-3.8-flash`，支持 1M 输入上下文、64K 最大输出、Structured Outputs、Function Calling 及分级推理控制）。
+* **免费额度（Free Tier）与演进**：
+  * 通过 [Google AI Studio](https://aistudio.google.com/) 创建未绑定结算账户的项目 API Key，即可在 **Free Tier（免费层）** 的 Standard 模式下零成本调用 `gemini-3.8-flash`（输入、输出、思考 Token 及 Context Caching 均免费），非常适合个人 Agent 原型与日常轻量使用。
+  * **免费层边界注意**：
+    1. 受项目级速率配额（RPM / TPM / RPD）限制，触发限流时返回 `429 RESOURCE_EXHAUSTED`；
+    2. 免费层**不支持**内置 `google_search` / `google_maps` Grounding 及 Batch/Flex 模式；
+    3. 免费层请求内容默认可能用于 Google 产品改进（Interactions 默认服务端保留 1 天，Kiki 自建 SQLite 历史可设 `store=False`），切勿直接传入高敏生产密钥。后续绑定结算升级至 Paid Tier 后自动解除训练用途并解锁更高配额。
+* **SDK 与配置隔离**：
+  * 后端采用最新官方 **`google-genai >= 3.2.0`** Python SDK，统一使用 GA 版 **Interactions API**（`client.aio.interactions.create`，替代旧版 `generate_content`）以适配 FastAPI 异步与 SSE 流。
+  * 密钥与模型名通过本地 `.env` 注入（严禁纳入版本控制）：
+    ```ini
+    GEMINI_API_KEY=your_ai_studio_api_key
+    GEMINI_MODEL=gemini-3.8-flash
+    ```
+
+### 2. Kiki 三条核心调用链路配置
+仅需单个 `GEMINI_API_KEY`，即可驱动 Kiki 前后台完整闭环：
+
+| 调用链路 | 模型 ID | `thinking_level` | 关键特性与 Interactions API 调用方式 |
+| :--- | :--- | :--- | :--- |
+| **① Decision Model（意图路由）** | `gemini-3.8-flash` | `low` | `client.aio.interactions.create` + `response_format={"type": "text", "mime_type": "application/json", "schema": RouteDecision.model_json_schema()}`，低延迟稳定输出路由 JSON（注：`3.8-flash` 支持 `low`/`medium`/`high`，不支持 `minimal`）。 |
+| **② Fast-Path（前台轻量陪聊）** | `gemini-3.8-flash` | `low` | `client.aio.interactions.create(..., stream=True)` 监听 `step.delta` 文本增量事件，注入 Kiki 小猫性格 `system_instruction` 与当前 Topic 上下文，通过 SSE 实时推送聊天气泡。 |
+| **③ Heavy-Path（后台重型任务）** | `gemini-3.8-flash` | `medium` / `high` | 默认内置 `gemini_agent` 执行器，基于 `tools` Function Calling（受控文件读写、Shell 执行、`request_human_approval` 人工拍板挂起）处理 `function_call` / `function_result` 步骤循环，每步落库 `step_logs` 并推送 SSE；同时保留 `agent_type` 扩展对接 `claude_code` 等外部 Agent 的能力。 |
+
+### 3. Decision Model 路由逻辑与 Prompt
 
 每当用户在全局流发送新消息时，先调用决策模型判断其所属 Topic 与执行路径：
 
@@ -189,7 +216,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 1. **`<KikiAvatar status={currentStatus} size="md" />`**
    * 封装状态：`'idle' | 'thinking' | 'running' | 'waiting_input'`。
-   * 负责从 `assets/kiki-states.png` 中按坐标裁剪对应的猫咪图像，并附带平滑过渡 CSS 动画。
+   * 负责从 `reference/kiki` 中按坐标裁剪对应的猫咪图像，并附带平滑过渡 CSS 动画。
 
 2. **`<UnifiedMessageList />`**
    * 渲染全局消息流或 Topic 过滤流。
@@ -208,18 +235,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 在 Antigravity 中启动该项目开发时，请使用以下指令：
 
 ```text
-@docs/kiki-v1-design.md @assets/kiki-states.png
+@docs/kiki-v1-design.md @reference/kiki
 请完整阅读设计全景文档，并参考素材图片，按以下顺序开始构建：
 
 1. 项目结构初始化：
-   - 创建 backend/ (FastAPI + SQLite)
+   - 创建 backend/ (FastAPI + SQLite + `google-genai` SDK)，提供 `.env.example` 配置 `GEMINI_API_KEY` 与 `GEMINI_MODEL=gemini-3.8-flash`
    - 创建 frontend/ (React + Tailwind CSS)
-   - 创建 assets/ 存放 kiki-states.png
-
+   
 2. 后端开发：
-   - 在 backend/ 运行 5 张 SQLite 表建表 DDL。
-   - 实现 Decision Model 路由模块 (`router.py`)，输出置信度与 Topic 方案。
-   - 实现 TaskManager 调度器 (`task_manager.py`) 与 SSE 广播模块。
+   - 在 backend/ 运行 5 张 SQLite 表建表 DDL（数据库文件置于 `data/` 目录）。
+   - 封装统一大模型客户端 (`llm.py`)，默认接入 `gemini-3.8-flash` 异步接口。
+   - 实现 Decision Model 路由模块 (`router.py`)，基于 Structured Outputs (`thinking_level="low"`) 输出置信度与 Topic 方案，并实现 Fast-Path 流式陪聊回复。
+   - 实现 TaskManager 调度器 (`task_manager.py`)、默认内置 `gemini_agent` 多步工具循环 (`thinking_level="medium"`) 与 SSE 广播模块。
 
 3. 前端 UI 开发：
    - 开发 `KikiAvatar` 组件，实现 4 种猫咪状态的图幅裁剪与显示。
