@@ -38,7 +38,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261122b';
+const ASSET_VER = 'v=20261123a';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
@@ -67,7 +67,20 @@ interface SpriteLayer {
 }
 
 /** Keep in sync with `kikiFadeIn` / `kikiFadeOut` duration in tailwind.config.js */
-const FADE_MS = 520;
+const FADE_MS = 800;
+
+/**
+ * How long an ambient mood plays before settling back to idle: one full loop of the
+ * smoothed WebP (see scripts/smooth_kiki_sprites.py), so the routine is never cut mid-motion.
+ */
+const BURST_MS: Record<'idle_lazy' | 'idle_playful', number> = {
+  idle_lazy: 9400,
+  idle_playful: 7900,
+};
+
+/** Quiet rest between one ambient routine ending and the next one starting. */
+const REST_MIN_MS = 14000;
+const REST_JITTER_MS = 9000;
 
 const POSE_MOTION_CLASS: Record<KikiPose, string> = {
   idle: 'animate-kiki-breathe origin-bottom',
@@ -153,7 +166,7 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
       setAmbientQuip(quip);
       onMoodRef.current?.(quip);
 
-      const durationMs = nextPose === 'idle_lazy' ? 5200 : 3600;
+      const durationMs = BURST_MS[nextPose];
       revertTimerRef.current = window.setTimeout(() => {
         setAmbientPose('idle');
         setAmbientQuip(null);
@@ -180,15 +193,24 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
     }
 
     let scheduleTimer: number | null = null;
-    const scheduleNext = (initial = false) => {
+    let lastPick: 'idle_lazy' | 'idle_playful' | null = null;
+    const scheduleNext = (initial = false, afterMs = 0) => {
       const delay = initial
-        ? 4500 + Math.random() * 3000
-        : 9000 + Math.random() * 5500;
+        ? 6000 + Math.random() * 4000
+        : afterMs + REST_MIN_MS + Math.random() * REST_JITTER_MS;
       scheduleTimer = window.setTimeout(() => {
+        // Alternate moods more often than not so the cat doesn't repeat itself.
         const pick: 'idle_lazy' | 'idle_playful' =
-          Math.random() < 0.55 ? 'idle_playful' : 'idle_lazy';
+          lastPick && Math.random() < 0.7
+            ? lastPick === 'idle_lazy'
+              ? 'idle_playful'
+              : 'idle_lazy'
+            : Math.random() < 0.5
+              ? 'idle_playful'
+              : 'idle_lazy';
+        lastPick = pick;
         triggerMoodBurst(pick);
-        scheduleNext(false);
+        scheduleNext(false, BURST_MS[pick]);
       }, delay);
     };
 
