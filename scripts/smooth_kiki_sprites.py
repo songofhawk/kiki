@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Rebuild Kiki animated WebPs with eased in-between frames.
+"""Build frame-by-frame animated Kiki WebPs using real hand-drawn in-betweens.
 
-The hand-drawn sprites are only a few key poses each, so playing them back
-directly hard-cuts between very different poses (sitting -> licking paw ->
-waving). This script reads the key-pose WebPs from `assets/kiki/` (source of
-truth) and writes smoother versions to `frontend/public/kiki/` by inserting
-transition frames between consecutive key poses (including the loop seam):
-a short squash-and-stretch beat for big pose changes (no ghosting), a brief
-dissolve only for near-identical poses. Hold durations of the key poses are preserved.
+Source keyframes live in `assets/kiki/*.webp` (transparent RGBA).
+Generated in-between frames live in `assets/kiki/interp/gen/*.jpg` (pure white
+background). This script:
+  1. Flood-fills the white background to clean anti-aliased transparency (protecting
+     interior cream/white fur).
+  2. Aligns each generated frame's scale and bottom-center ground anchor smoothly
+     between its start and end keyframes so the cat never jumps or resizes.
+  3. Assembles `frontend/public/kiki/*.webp` with natural holds on key poses and
+     crisp frame-by-frame transitions (zero ghosting, zero artificial squash),
+     and writes `frontend/src/components/kikiSpriteMeta.ts`.
 
 Usage: python3 scripts/smooth_kiki_sprites.py
 """
 from __future__ import annotations
 
-import math
-import struct
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -22,178 +24,236 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "assets" / "kiki"
+GEN = SRC / "interp" / "gen"
 DST = ROOT / "frontend" / "public" / "kiki"
-
-OUT_SIZE = 256  # displayed at <=144px CSS, so 288px is plenty even at 2x
-STEP_MS = 60  # duration of each in-between frame
-
-# Poses to smooth. working/delivering are intentionally fast cycles and stay as-is.
-POSES = ["idle", "idle_lazy", "idle_playful", "thinking", "waiting_input"]
-
-# Slow the held key poses so the cat feels less twitchy.
-HOLD_SCALE = {
-    "idle": 1.0,
-    "idle_lazy": 1.15,
-    "idle_playful": 1.35,
-    "thinking": 1.2,
-    "waiting_input": 1.3,
-}
-
-# Every real pose must be held for a while before the next movement starts: the cat
-# should not be moving all the time. Quick frames (blink halves) are exempt.
-MIN_HOLD_MS = {
-    "idle": 1600,
-    "idle_lazy": 2600,
-    "idle_playful": 2000,
-    "thinking": 2200,
-    "waiting_input": 1800,
-}
-
 META_TS = ROOT / "frontend" / "src" / "components" / "kikiSpriteMeta.ts"
-LOOP_MS: dict[str, int] = {}
+
+OUT_SIZE = 320  # rendered at <=144px CSS (2x retina crisp)
 
 
-def read_durations(path: Path) -> list[int]:
-    b = path.read_bytes()
-    i, out = 12, []
-    while i < len(b):
-        tag = b[i : i + 4]
-        n = struct.unpack("<I", b[i + 4 : i + 8])[0]
-        if tag == b"ANMF":
-            out.append(int.from_bytes(b[i + 20 : i + 23], "little"))
-        i += 8 + n + (n & 1)
-    return out
+def load_keyframe(webp_name: str, frame_idx: int) -> Image.Image:
+    im = Image.open(SRC / f"{webp_name}.webp")
+    im.seek(frame_idx)
+    return im.convert("RGBA").resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
 
 
-def load_frames(path: Path) -> list[np.ndarray]:
-    im = Image.open(path)
-    frames = []
-    for i in range(im.n_frames):
-        im.seek(i)
-        f = im.convert("RGBA").resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
-        a = np.asarray(f, dtype=np.float32) / 255.0
-        a[..., :3] *= a[..., 3:4]  # premultiply so transparent edges don't fringe
-        frames.append(a)
-    return frames
+def bbox_metrics(im: Image.Image) -> tuple[float, float, float]:
+    """Return (center_x, bottom_y, height) of non-transparent pixels in [0..OUT_SIZE]."""
+    alpha = np.asarray(im)[..., 3]
+    ys, xs = np.where(alpha > 20)
+    if len(ys) == 0:
+        return OUT_SIZE / 2, OUT_SIZE * 0.9, OUT_SIZE * 0.7
+    return (float(xs.min() + xs.max()) / 2.0, float(ys.max()), float(ys.max() - ys.min()))
 
 
-def to_image(a: np.ndarray) -> Image.Image:
-    a = a.copy()
-    alpha = a[..., 3:4]
-    rgb = np.where(alpha > 1e-4, a[..., :3] / np.maximum(alpha, 1e-4), 0.0)
-    out = np.concatenate([rgb, alpha], axis=-1)
-    return Image.fromarray((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8), "RGBA")
+def cutout_white_bg(path: Path) -> Image.Image:
+    """Flood-fill remove outer white background with clean anti-aliased edges."""
+    rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+    h, w = rgb.shape[:2]
+
+    # Pixel is "near white background" if bright and low saturation
+    r, g, b = rgb[..., 0].astype(np.int16), rgb[..., 1].astype(np.int16), rgb[..., 2].astype(np.int16)
+    lum = (r + g + b) / 3.0
+    chroma = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+    is_bg_cand = (lum >= 232) & (chroma <= 22)
+
+    visited = np.zeros((h, w), dtype=bool)
+    q: deque[tuple[int, int]] = deque()
+    for x in range(w):
+        for y in (0, h - 1):
+            if is_bg_cand[y, x] and not visited[y, x]:
+                visited[y, x] = True
+                q.append((y, x))
+    for y in range(h):
+        for x in (0, w - 1):
+            if is_bg_cand[y, x] and not visited[y, x]:
+                visited[y, x] = True
+                q.append((y, x))
+
+    while q:
+        cy, cx = q.popleft()
+        for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and is_bg_cand[ny, nx]:
+                visited[ny, nx] = True
+                q.append((ny, nx))
+
+    alpha = np.where(visited, 0.0, 255.0).astype(np.float32)
+
+    # Soften 2-pixel fringe bordering background to eliminate white halo
+    fringe = np.zeros((h, w), dtype=bool)
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+        shifted = np.roll(np.roll(visited, dy, axis=0), dx, axis=1)
+        fringe |= shifted & (~visited)
+    fringe2 = fringe.copy()
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        shifted = np.roll(np.roll(fringe, dy, axis=0), dx, axis=1)
+        fringe2 |= shifted & (~visited)
+
+    # On fringe pixels that are bright & desaturated, compute partial alpha & de-matte white
+    f_rgb = rgb.astype(np.float32)
+    bright_fringe = fringe2 & (lum > 180) & (chroma < 38)
+    t_alpha = np.clip((248.0 - lum) / 68.0, 0.0, 1.0)
+    alpha = np.where(bright_fringe, t_alpha * 255.0, alpha)
+
+    # De-fringe RGB against white background: C_fg = (C - (1-a)*255) / a
+    a_norm = np.clip(alpha / 255.0, 0.0, 1.0)[..., None]
+    de_rgb = np.where(
+        (bright_fringe[..., None]) & (a_norm > 0.05),
+        np.clip((f_rgb - (1.0 - a_norm) * 255.0) / np.maximum(a_norm, 0.05), 0.0, 255.0),
+        f_rgb,
+    )
+    rgba = np.concatenate([de_rgb, alpha[..., None]], axis=-1).astype(np.uint8)
+    return Image.fromarray(rgba, "RGBA")
 
 
-def smoothstep(t: float) -> float:
-    return t * t * (3 - 2 * t)
+def align_gen_frame(
+    gen_name: str,
+    start_kf: Image.Image,
+    end_kf: Image.Image,
+    t: float,
+) -> Image.Image:
+    """Cut out `gen_name` and align its scale & bottom-center anchor between start_kf and end_kf."""
+    cut = cutout_white_bg(GEN / f"{gen_name}.jpg")
+    # Crop tight around non-transparent content
+    alpha = np.asarray(cut)[..., 3]
+    ys, xs = np.where(alpha > 20)
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
+    cropped = cut.crop((x0, y0, x1, y1))
+
+    scx, sby, sh = bbox_metrics(start_kf)
+    ecx, eby, eh = bbox_metrics(end_kf)
+    target_cx = scx * (1 - t) + ecx * t
+    target_by = sby * (1 - t) + eby * t
+    target_h = sh * (1 - t) + eh * t
+
+    scale = target_h / max(1, cropped.height)
+    nw = max(1, round(cropped.width * scale))
+    nh = max(1, round(cropped.height * scale))
+    # Clamp if wider than canvas
+    if nw > OUT_SIZE - 8:
+        clamp = (OUT_SIZE - 8) / nw
+        nw = round(nw * clamp)
+        nh = round(nh * clamp)
+
+    resized = cropped.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGBA", (OUT_SIZE, OUT_SIZE), (0, 0, 0, 0))
+    px = round(target_cx - nw / 2.0)
+    py = round(target_by - nh)
+    px = max(0, min(OUT_SIZE - nw, px))
+    py = max(0, min(OUT_SIZE - nh, py))
+    canvas.paste(resized, (px, py), resized)
+    return canvas
 
 
-def squash(a: np.ndarray, sx: float, sy: float) -> np.ndarray:
-    """Scale a premultiplied frame around its bottom-centre (the cat's contact point)."""
-    h, w = a.shape[:2]
-    img = Image.fromarray((np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8), "RGBA")
-    nw, nh = max(1, round(w * sx)), max(1, round(h * sy))
-    img = img.resize((nw, nh), Image.BICUBIC)
-    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    canvas.paste(img, ((w - nw) // 2, h - nh))
-    return np.asarray(canvas, dtype=np.float32) / 255.0
-
-
-# Squash & stretch pose-change beat. Cross-dissolving two *different* poses leaves a
-# ghost, so big changes are hidden behind a slow, eased body motion instead:
-# settle down (anticipation) -> brief dissolve at the lowest point -> spring back up.
-ANTICIPATE_MS = 480  # slow press-down before the pose changes
-MID_DISSOLVE_STEPS = 2  # very short, only while the body is squashed low
-RECOVER_MS = 620  # damped spring back to normal after the new pose appears
-MAX_SQUASH = 0.075  # how far the body presses down (fraction of height)
-STEP_MS_MOTION = 60
-
-
-def _squash_scale(depth: float) -> tuple[float, float]:
-    """depth>0 = pressed down & wider, depth<0 = stretched up & narrower."""
-    return 1.0 + depth * MAX_SQUASH * 0.55, 1.0 - depth * MAX_SQUASH
-
-
-def anticipate_curve() -> list[tuple[float, float]]:
-    n = round(ANTICIPATE_MS / STEP_MS_MOTION)
-    return [_squash_scale(smoothstep(k / n)) for k in range(1, n + 1)]
-
-
-def recover_curve() -> list[tuple[float, float]]:
-    n = round(RECOVER_MS / STEP_MS_MOTION)
-    out = []
-    for k in range(n):
-        t = k / n
-        depth = math.exp(-3.2 * t) * math.cos(5.0 * t)  # 1 -> overshoot (<0) -> settle
-        out.append(_squash_scale(depth))
-    return out
-
-
-QUICK_HOLD_MS = 150  # blink half-frames etc.: plain cut, they are meant to be fast
-SMALL_DIFF = 0.07  # nearly identical poses: a short dissolve shows no ghost
-
-
-def build(name: str) -> None:
-    src = SRC / f"{name}.webp"
-    frames = load_frames(src)
-    holds = []
-    for d in read_durations(src):
-        h = max(1, round(d * HOLD_SCALE[name]))
-        if d >= QUICK_HOLD_MS:
-            h = max(h, MIN_HOLD_MS[name])
-        holds.append(h)
-    out_imgs: list[Image.Image] = []
-    out_durs: list[int] = []
-
-    def emit(arr: np.ndarray, ms: int) -> None:
-        out_imgs.append(to_image(arr))
-        out_durs.append(ms)
-
-    n = len(frames)
-    for i in range(n):
-        cur, nxt = frames[i], frames[(i + 1) % n]
-        diff = float(np.abs(cur - nxt).mean())
-        if holds[i] < QUICK_HOLD_MS or diff < 0.01:
-            emit(cur, holds[i])
-        elif diff < SMALL_DIFF:
-            emit(cur, holds[i])
-            for s in (1, 2):
-                t = smoothstep(s / 3)
-                emit(cur * (1 - t) + nxt * t, STEP_MS)
-        else:
-            emit(cur, holds[i])
-            for sx, sy in anticipate_curve():
-                emit(squash(cur, sx, sy), STEP_MS_MOTION)
-            low_x, low_y = _squash_scale(1.0)
-            low_cur, low_nxt = squash(cur, low_x, low_y), squash(nxt, low_x, low_y)
-            for k in range(1, MID_DISSOLVE_STEPS + 1):
-                t = k / (MID_DISSOLVE_STEPS + 1)
-                emit(low_cur * (1 - t) + low_nxt * t, STEP_MS_MOTION)
-            for sx, sy in recover_curve():
-                emit(squash(nxt, sx, sy), STEP_MS_MOTION)
+def save_webp(name: str, frames: list[Image.Image], durations: list[int]) -> int:
     DST.mkdir(parents=True, exist_ok=True)
     dst = DST / f"{name}.webp"
-    out_imgs[0].save(
+    frames[0].save(
         dst,
         save_all=True,
-        append_images=out_imgs[1:],
-        duration=out_durs,
+        append_images=frames[1:],
+        duration=durations,
         loop=0,
-        quality=70,
-        alpha_quality=85,
+        quality=82,
+        alpha_quality=90,
         method=4,
     )
-    LOOP_MS[name] = sum(out_durs)
-    print(f"{name}: {n} key poses -> {len(out_imgs)} frames, {sum(out_durs)}ms loop, {dst.stat().st_size // 1024}KB")
+    total = sum(durations)
+    print(f"{name}: {len(frames)} frames, {total}ms loop, {dst.stat().st_size // 1024}KB")
+    return total
+
+
+def main() -> None:
+    loop_ms: dict[str, int] = {}
+
+    # 1. idle: crisp original frames (sit, blink, ear/tail micro-motion) with calm holds
+    idle_src = [load_keyframe("idle", i) for i in range(7)]
+    idle_durs = [2800, 95, 130, 95, 2200, 850, 1500]
+    loop_ms["idle"] = save_webp("idle", idle_src, idle_durs)
+
+    # 2. idle_lazy: full hand-drawn frame-by-frame sequence
+    k_lying = load_keyframe("idle_lazy", 0)
+    k_yawn = load_keyframe("idle_lazy", 1)
+    k_relaxed = load_keyframe("idle_lazy", 2)
+    k_sleep = load_keyframe("idle_lazy", 3)
+
+    g_la33 = align_gen_frame("lazy_a_33", k_lying, k_yawn, 0.33)
+    g_la66 = align_gen_frame("lazy_a_66", k_lying, k_yawn, 0.66)
+    g_lb33 = align_gen_frame("lazy_b_33", k_yawn, k_relaxed, 0.33)
+    g_lb66 = align_gen_frame("lazy_b_66", k_yawn, k_relaxed, 0.66)
+    g_lc33 = align_gen_frame("lazy_c_33", k_relaxed, k_sleep, 0.33)
+    g_lc66 = align_gen_frame("lazy_c_66", k_relaxed, k_sleep, 0.66)
+    g_ld50 = align_gen_frame("lazy_d_50", k_sleep, k_lying, 0.50)
+
+    lazy_seq = [
+        (k_lying, 2400),
+        (g_la33, 170),
+        (g_la66, 170),
+        (k_yawn, 1500),
+        (g_lb33, 170),
+        (g_lb66, 180),
+        (k_relaxed, 2200),
+        (g_lc33, 180),
+        (g_lc66, 220),
+        (k_sleep, 2800),
+        (g_lc66, 360),   # gentle sleep exhale (bubble pops)
+        (k_sleep, 2600), # deep nap continues
+        (g_ld50, 240),   # drowsy wake-up back to lying
+    ]
+    loop_ms["idle_lazy"] = save_webp(
+        "idle_lazy", [f for f, _ in lazy_seq], [d for _, d in lazy_seq]
+    )
+
+    # 3. idle_playful: full hand-drawn frame-by-frame sequence
+    k_tilt = load_keyframe("idle_playful", 0)
+    k_lick = load_keyframe("idle_playful", 1)
+    k_paw = load_keyframe("idle_playful", 3)
+    k_wave = load_keyframe("idle_playful", 4)
+
+    g_pa33 = align_gen_frame("play_a_33", k_tilt, k_lick, 0.33)
+    g_pa66 = align_gen_frame("play_a_66", k_tilt, k_lick, 0.66)
+    g_pb33 = align_gen_frame("play_b_33", k_tilt, k_paw, 0.33)
+    g_pb66 = align_gen_frame("play_b_66", k_tilt, k_paw, 0.66)
+    g_pc50 = align_gen_frame("play_c_50", k_paw, k_wave, 0.50)
+
+    play_seq = [
+        (k_tilt, 1900),
+        (g_pa33, 150),
+        (g_pa66, 150),
+        (k_lick, 1600),
+        (g_pa66, 150),
+        (g_pa33, 150),
+        (k_tilt, 1700),
+        (g_pb33, 150),
+        (g_pb66, 150),
+        (k_paw, 1200),
+        (g_pc50, 140),
+        (k_wave, 1350),
+        (g_pc50, 140),
+        (k_paw, 950),
+        (g_pb66, 150),
+        (g_pb33, 150),
+    ]
+    loop_ms["idle_playful"] = save_webp(
+        "idle_playful", [f for f, _ in play_seq], [d for _, d in play_seq]
+    )
+
+    # 4. thinking & waiting_input: crisp original frames with natural holds
+    think_src = [load_keyframe("thinking", i) for i in range(6)]
+    think_durs = [700, 650, 1100, 800, 850, 650]
+    loop_ms["thinking"] = save_webp("thinking", think_src, think_durs)
+
+    wait_src = [load_keyframe("waiting_input", i) for i in range(4)]
+    wait_durs = [550, 480, 550, 620]
+    loop_ms["waiting_input"] = save_webp("waiting_input", wait_src, wait_durs)
+
+    body = "\n".join(f"  {k}: {v}," for k, v in loop_ms.items())
+    META_TS.write_text(
+        "// Generated by scripts/smooth_kiki_sprites.py - do not edit by hand.\n"
+        "/** One full loop of each animated WebP, in ms. */\n"
+        f"export const KIKI_LOOP_MS = {{\n{body}\n}} as const;\n"
+    )
 
 
 if __name__ == "__main__":
-    for p in POSES:
-        build(p)
-    body = "\n".join(f"  {k}: {v}," for k, v in LOOP_MS.items())
-    META_TS.write_text(
-        "// Generated by scripts/smooth_kiki_sprites.py - do not edit by hand.\n"
-        "/** One full loop of each smoothed animated WebP, in ms. */\n"
-        f"export const KIKI_LOOP_MS = {{\n{body}\n}} as const;\n"
-    )
+    main()

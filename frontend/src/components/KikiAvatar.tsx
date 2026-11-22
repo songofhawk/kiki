@@ -39,7 +39,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261123d';
+const ASSET_VER = 'v=20261123e';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
