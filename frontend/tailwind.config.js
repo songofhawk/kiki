@@ -41,12 +41,12 @@ export default {
           '100%': { transform: 'translateX(-10px)', opacity: '0' },
         },
         kikiFadeIn: {
-          '0%': { opacity: '0', transform: 'scale(0.96)' },
+          '0%': { opacity: '0', transform: 'scale(0.97)' },
           '100%': { opacity: '1', transform: 'scale(1)' },
         },
         kikiFadeOut: {
           '0%': { opacity: '1', transform: 'scale(1)' },
-          '100%': { opacity: '0', transform: 'scale(1.02)' },
+          '100%': { opacity: '0', transform: 'scale(1)' },
         },
         toastSlideIn: {
           '0%': { opacity: '0', transform: 'translateX(24px)' },
@@ -60,8 +60,8 @@ export default {
         'kiki-wave': 'kikiWave 1.4s ease-in-out infinite',
         'kiki-shadow': 'kikiShadow 0.48s ease-in-out infinite',
         'kiki-dash': 'kikiDash 0.65s linear infinite',
-        'kiki-fade-in': 'kikiFadeIn 800ms ease-in-out both',
-        'kiki-fade-out': 'kikiFadeOut 800ms ease-in-out both',
+        'kiki-fade-in': 'kikiFadeIn 220ms ease-in-out both',
+        'kiki-fade-out': 'kikiFadeOut 220ms ease-in-out both',
         'toast-in': 'toastSlideIn 0.25s ease-out forwards',
       },
     },

@@ -38,7 +38,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261123a';
+const ASSET_VER = 'v=20261123b';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
@@ -67,15 +67,15 @@ interface SpriteLayer {
 }
 
 /** Keep in sync with `kikiFadeIn` / `kikiFadeOut` duration in tailwind.config.js */
-const FADE_MS = 800;
+const FADE_MS = 220;
 
 /**
  * How long an ambient mood plays before settling back to idle: one full loop of the
  * smoothed WebP (see scripts/smooth_kiki_sprites.py), so the routine is never cut mid-motion.
  */
 const BURST_MS: Record<'idle_lazy' | 'idle_playful', number> = {
-  idle_lazy: 9400,
-  idle_playful: 7900,
+  idle_lazy: 7700,
+  idle_playful: 6400,
 };
 
 /** Quiet rest between one ambient routine ending and the next one starting. */
@@ -330,7 +330,7 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
       {outgoing && (
         <div
           key={`out-${outgoing.key}`}
-          className="absolute inset-0 z-10 pointer-events-none animate-kiki-fade-out"
+          className="absolute inset-0 z-10 pointer-events-none animate-kiki-fade-out origin-bottom"
         >
           <img
             src={outgoing.src}
@@ -342,7 +342,7 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
       )}
       <div
         key={`in-${layerKey}`}
-        className={`relative z-10 w-full h-full ${outgoing ? 'animate-kiki-fade-in' : ''}`}
+        className={`relative z-10 w-full h-full ${outgoing ? 'animate-kiki-fade-in origin-bottom' : ''}`}
       >
         <img
           src={imgSrc}

@@ -5,8 +5,9 @@ The hand-drawn sprites are only a few key poses each, so playing them back
 directly hard-cuts between very different poses (sitting -> licking paw ->
 waving). This script reads the key-pose WebPs from `assets/kiki/` (source of
 truth) and writes smoother versions to `frontend/public/kiki/` by inserting
-eased cross-dissolve frames between consecutive key poses (including the
-loop seam). Hold durations of the key poses are preserved.
+transition frames between consecutive key poses (including the loop seam):
+a short squash-and-stretch beat for big pose changes (no ghosting), a brief
+dissolve only for near-identical poses. Hold durations of the key poses are preserved.
 
 Usage: python3 scripts/smooth_kiki_sprites.py
 """
@@ -24,8 +25,6 @@ DST = ROOT / "frontend" / "public" / "kiki"
 
 OUT_SIZE = 288  # displayed at <=144px CSS, so 288px is plenty even at 2x
 STEP_MS = 60  # duration of each in-between frame
-MIN_TRANSITION_MS = 240
-MAX_TRANSITION_MS = 640
 
 # Poses to smooth. working/delivering are intentionally fast cycles and stay as-is.
 POSES = ["idle", "idle_lazy", "idle_playful", "thinking", "waiting_input"]
@@ -76,27 +75,55 @@ def smoothstep(t: float) -> float:
     return t * t * (3 - 2 * t)
 
 
+def squash(a: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    """Scale a premultiplied frame around its bottom-centre (the cat's contact point)."""
+    h, w = a.shape[:2]
+    img = Image.fromarray((np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8), "RGBA")
+    nw, nh = max(1, round(w * sx)), max(1, round(h * sy))
+    img = img.resize((nw, nh), Image.BICUBIC)
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    canvas.paste(img, ((w - nw) // 2, h - nh))
+    return np.asarray(canvas, dtype=np.float32) / 255.0
+
+
+# Squash & stretch keyframes used to hide a pose change (sx, sy, ms).
+# Cross-dissolving two *different* poses leaves a ghost, so big changes are cut
+# on the beat of a tiny body squash: anticipate (press down) -> cut -> overshoot -> settle.
+ANTICIPATE = [(1.015, 0.975, 70), (1.035, 0.94, 80)]
+OVERSHOOT = [(0.985, 1.035, 80), (1.005, 0.99, 70)]
+
+QUICK_HOLD_MS = 150  # blink half-frames etc.: plain cut, they are meant to be fast
+SMALL_DIFF = 0.07  # nearly identical poses: a short dissolve shows no ghost
+
+
 def build(name: str) -> None:
     src = SRC / f"{name}.webp"
     frames = load_frames(src)
     holds = [max(1, round(d * HOLD_SCALE[name])) for d in read_durations(src)]
     out_imgs: list[Image.Image] = []
     out_durs: list[int] = []
+
+    def emit(arr: np.ndarray, ms: int) -> None:
+        out_imgs.append(to_image(arr))
+        out_durs.append(ms)
+
     n = len(frames)
     for i in range(n):
         cur, nxt = frames[i], frames[(i + 1) % n]
-        out_imgs.append(to_image(cur))
-        out_durs.append(holds[i])
         diff = float(np.abs(cur - nxt).mean())
-        trans = int(np.clip(180 + diff * 5000, MIN_TRANSITION_MS, MAX_TRANSITION_MS))
-        # Quick key poses (e.g. blink half-frames) must stay quick: never dissolve
-        # for longer than the pose is held.
-        trans = min(trans, holds[i])
-        steps = max(0, round(trans / STEP_MS) - 1)
-        for s in range(1, steps + 1):
-            t = smoothstep(s / (steps + 1))
-            out_imgs.append(to_image(cur * (1 - t) + nxt * t))
-            out_durs.append(STEP_MS)
+        if holds[i] < QUICK_HOLD_MS or diff < 0.01:
+            emit(cur, holds[i])
+        elif diff < SMALL_DIFF:
+            emit(cur, holds[i])
+            for s in (1, 2):
+                t = smoothstep(s / 3)
+                emit(cur * (1 - t) + nxt * t, STEP_MS)
+        else:
+            emit(cur, holds[i])
+            for sx, sy, ms in ANTICIPATE:
+                emit(squash(cur, sx, sy), ms)
+            for sx, sy, ms in OVERSHOOT:
+                emit(squash(nxt, sx, sy), ms)
     DST.mkdir(parents=True, exist_ok=True)
     dst = DST / f"{name}.webp"
     out_imgs[0].save(
@@ -105,10 +132,9 @@ def build(name: str) -> None:
         append_images=out_imgs[1:],
         duration=out_durs,
         loop=0,
-        quality=70,
-        alpha_quality=80,
+        quality=75,
+        alpha_quality=85,
         method=4,
-        minimize_size=False,
     )
     print(f"{name}: {n} key poses -> {len(out_imgs)} frames, {sum(out_durs)}ms loop, {dst.stat().st_size // 1024}KB")
 
