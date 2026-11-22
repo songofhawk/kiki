@@ -13,6 +13,15 @@ export type KikiPose =
 export interface KikiAvatarProps {
   status: KikiStatus;
   pose?: KikiPose;
+  /**
+   * Whether this Kiki instance plays multi-frame WebP & CSS motion.
+   * Defaults to `false` so historical messages, brand marks, and badges stay calm & static.
+   */
+  animated?: boolean;
+  /**
+   * Enables periodic random lazy/playful actions (when `animated` is true)
+   * and click-to-pet interaction when idle.
+   */
   companion?: boolean;
   size?: 'xs' | 'sm' | 'md' | 'lg' | 'xl' | 'hero';
   className?: string;
@@ -29,14 +38,26 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const SPRITE_SRC: Record<KikiPose, string> = {
-  idle: '/kiki/idle.webp',
-  idle_lazy: '/kiki/idle_lazy.webp',
-  idle_playful: '/kiki/idle_playful.webp',
-  thinking: '/kiki/thinking.webp',
-  working: '/kiki/working.webp',
-  delivering: '/kiki/delivering.webp',
-  waiting_input: '/kiki/waiting_input.webp',
+const ASSET_VER = 'v=20261122b';
+
+const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
+  idle: `/kiki/idle.webp?${ASSET_VER}`,
+  idle_lazy: `/kiki/idle_lazy.webp?${ASSET_VER}`,
+  idle_playful: `/kiki/idle_playful.webp?${ASSET_VER}`,
+  thinking: `/kiki/thinking.webp?${ASSET_VER}`,
+  working: `/kiki/working.webp?${ASSET_VER}`,
+  delivering: `/kiki/delivering.webp?${ASSET_VER}`,
+  waiting_input: `/kiki/waiting_input.webp?${ASSET_VER}`,
+};
+
+const STATIC_PNG_SRC: Record<KikiPose, string> = {
+  idle: `/kiki/idle.png?${ASSET_VER}`,
+  idle_lazy: `/kiki/idle_lazy.png?${ASSET_VER}`,
+  idle_playful: `/kiki/idle_playful.png?${ASSET_VER}`,
+  thinking: `/kiki/thinking.png?${ASSET_VER}`,
+  working: `/kiki/working.png?${ASSET_VER}`,
+  delivering: `/kiki/delivering.png?${ASSET_VER}`,
+  waiting_input: `/kiki/waiting_input.png?${ASSET_VER}`,
 };
 
 const POSE_MOTION_CLASS: Record<KikiPose, string> = {
@@ -80,20 +101,22 @@ const PLAYFUL_MOOD_QUIPS = [
 
 function statusToDefaultPose(status: KikiStatus): KikiPose {
   switch (status) {
-    case 'idle':
-      return 'idle';
     case 'thinking':
       return 'thinking';
     case 'running':
       return 'working';
     case 'waiting_input':
       return 'waiting_input';
+    case 'idle':
+    default:
+      return 'idle';
   }
 }
 
 export const KikiAvatar: React.FC<KikiAvatarProps> = ({
   status,
   pose,
+  animated = false,
   companion = false,
   size = 'md',
   className = '',
@@ -102,6 +125,7 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
 }) => {
   const [ambientPose, setAmbientPose] = useState<'idle' | 'idle_lazy' | 'idle_playful'>('idle');
   const [ambientQuip, setAmbientQuip] = useState<string | null>(null);
+  const [usePngFallback, setUsePngFallback] = useState(false);
   const revertTimerRef = useRef<number | null>(null);
   const tapToggleRef = useRef<boolean>(false);
   const onMoodRef = useRef(onCompanionMoodChange);
@@ -131,16 +155,18 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
     []
   );
 
-  // Reset ambient mood whenever Kiki enters an active non-idle state
   useEffect(() => {
-    if (!isCompanionIdle) {
-      if (revertTimerRef.current !== null) {
-        window.clearTimeout(revertTimerRef.current);
-        revertTimerRef.current = null;
+    // Only auto-schedule random ambient bursts when both `companion` AND `animated` are true
+    if (!isCompanionIdle || !animated) {
+      if (!isCompanionIdle) {
+        if (revertTimerRef.current !== null) {
+          window.clearTimeout(revertTimerRef.current);
+          revertTimerRef.current = null;
+        }
+        setAmbientPose('idle');
+        setAmbientQuip(null);
+        onMoodRef.current?.(null);
       }
-      setAmbientPose('idle');
-      setAmbientQuip(null);
-      onMoodRef.current?.(null);
       return;
     }
 
@@ -151,7 +177,7 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
         : 9000 + Math.random() * 5500;
       scheduleTimer = window.setTimeout(() => {
         const pick: 'idle_lazy' | 'idle_playful' =
-          Math.random() < 0.52 ? 'idle_playful' : 'idle_lazy';
+          Math.random() < 0.55 ? 'idle_playful' : 'idle_lazy';
         triggerMoodBurst(pick);
         scheduleNext(false);
       }, delay);
@@ -168,13 +194,20 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
         revertTimerRef.current = null;
       }
     };
-  }, [isCompanionIdle, triggerMoodBurst]);
+  }, [isCompanionIdle, animated, triggerMoodBurst]);
 
   const resolvedPose: KikiPose = pose
     ? pose
     : isCompanionIdle
       ? ambientPose
       : statusToDefaultPose(status);
+
+  // If a static companion (e.g. Welcome Hero) is clicked by the user, animate just that burst
+  const effectiveAnimated = animated || (isCompanionIdle && ambientPose !== 'idle');
+
+  useEffect(() => {
+    setUsePngFallback(false);
+  }, [resolvedPose, effectiveAnimated]);
 
   const labelText =
     (isCompanionIdle && ambientQuip) || KIKI_POSE_LABELS[resolvedPose] || KIKI_STATUS_LABELS[status];
@@ -191,6 +224,13 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
       triggerMoodBurst('idle_lazy', '呼噜呼噜…揉脑门好犯困呀 zZ');
     }
   };
+
+  const imgSrc =
+    !effectiveAnimated || usePngFallback
+      ? STATIC_PNG_SRC[resolvedPose]
+      : ANIMATED_WEBP_SRC[resolvedPose];
+
+  const motionClass = effectiveAnimated ? POSE_MOTION_CLASS[resolvedPose] : '';
 
   const sprite = (
     <div
@@ -213,32 +253,33 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
         canPet ? 'cursor-pointer active:scale-95 transition-transform' : ''
       } ${className}`}
     >
-      {/* Ground contact shadow for large companion/stage sizes */}
       {isLarge && (
         <div
           className={`absolute bottom-0.5 left-1/2 -translate-x-1/2 w-[66%] h-2.5 rounded-full bg-[#B8ACA0]/40 blur-[3px] pointer-events-none ${
-            resolvedPose === 'delivering' ? 'animate-kiki-shadow' : ''
+            effectiveAnimated && resolvedPose === 'delivering' ? 'animate-kiki-shadow' : ''
           }`}
         />
       )}
 
-      {/* Ambient motion accents */}
-      {isLarge && resolvedPose === 'delivering' && (
+      {effectiveAnimated && isLarge && resolvedPose === 'delivering' && (
         <div className="absolute -left-1 bottom-6 flex flex-col gap-1 pointer-events-none">
           <span className="w-3.5 h-0.5 rounded-full bg-[#8C8378]/55 animate-kiki-dash" />
           <span className="w-2.5 h-0.5 rounded-full bg-[#8C8378]/40 animate-kiki-dash [animation-delay:220ms]" />
         </div>
       )}
-      {isLarge && resolvedPose === 'waiting_input' && (
+      {effectiveAnimated && isLarge && resolvedPose === 'waiting_input' && (
         <span className="absolute top-0.5 left-1/2 -translate-x-1/2 w-5 h-5 rounded-full bg-amber-400/30 animate-ping pointer-events-none" />
       )}
 
       <img
-        key={resolvedPose}
-        src={SPRITE_SRC[resolvedPose]}
+        key={`${resolvedPose}-${effectiveAnimated ? 'anim' : 'static'}`}
+        src={imgSrc}
         alt={`Kiki ${resolvedPose}`}
         draggable={false}
-        className={`relative z-10 w-full h-full object-contain drop-shadow-[0_2px_4px_rgba(38,36,34,0.09)] ${POSE_MOTION_CLASS[resolvedPose]}`}
+        onError={() => {
+          if (!usePngFallback) setUsePngFallback(true);
+        }}
+        className={`relative z-10 w-full h-full object-contain drop-shadow-[0_2px_4px_rgba(38,36,34,0.09)] ${motionClass}`}
       />
     </div>
   );

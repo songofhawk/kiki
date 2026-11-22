@@ -19,6 +19,7 @@ import KikiAvatar from './KikiAvatar';
 
 export interface RunStatusCardProps {
   sessionRun: SessionRun;
+  animateAvatar?: boolean;
   onOpenLogDrawer: (runId: string) => void;
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
@@ -71,6 +72,7 @@ const FALLBACK_HITL_OPTIONS: HitlOption[] = [
 
 export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   sessionRun,
+  animateAvatar = true,
   onOpenLogDrawer,
   onResumeRun,
   onCancelRun,
@@ -126,11 +128,30 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   const renderStatusIcon = () => {
     switch (sessionRun.status) {
       case 'queued':
-        return <KikiAvatar status="running" pose="delivering" size="sm" />;
+        return (
+          <KikiAvatar
+            status="running"
+            pose="delivering"
+            animated={animateAvatar}
+            size="sm"
+          />
+        );
       case 'running':
-        return <KikiAvatar status="running" pose="working" size="sm" />;
+        return (
+          <KikiAvatar
+            status="running"
+            pose="working"
+            animated={animateAvatar}
+            size="sm"
+          />
+        );
       case 'waiting_input':
-        return <KikiAvatar status="waiting_input" size="sm" />;
+        // HITL card right below shows the animated paw-waving Kiki, so keep L1 bar a crisp badge
+        return (
+          <div className="w-8 h-8 rounded-full bg-amber-100 border border-amber-300 flex items-center justify-center shrink-0">
+            <AlertCircle className="w-4 h-4 text-amber-700" />
+          </div>
+        );
       case 'completed':
         return (
           <div className="w-8 h-8 rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center shrink-0">
@@ -326,7 +347,12 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
       {isWaitingInput && (
         <div className="rounded-2xl border-2 border-amber-400 bg-amber-50/80 p-3.5 shadow-sm shadow-amber-900/5 animate-kiki-fade-up">
           <div className="flex items-start gap-3">
-            <KikiAvatar status="waiting_input" size="md" className="mt-0.5" />
+            <KikiAvatar
+              status="waiting_input"
+              animated={animateAvatar}
+              size="md"
+              className="mt-0.5"
+            />
             <div className="flex-1 min-w-0">
               <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-900">
                 <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />

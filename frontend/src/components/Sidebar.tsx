@@ -8,7 +8,8 @@ export interface SidebarProps {
   topics: Topic[];
   focusTopicId: string | null;
   globalKikiStatus: KikiStatus;
-  isDelivering?: boolean;
+  companionPose?: KikiPose;
+  companionCaption?: string | null;
   sseConnected: boolean;
   onSelectAllStream: () => void;
   onSelectTopic: (topicId: string) => void;
@@ -23,7 +24,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   topics,
   focusTopicId,
   globalKikiStatus,
-  isDelivering = false,
+  companionPose,
+  companionCaption = null,
   sseConnected,
   onSelectAllStream,
   onSelectTopic,
@@ -38,17 +40,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const activeTopics = topics.filter((t) => t.status === 'active');
 
-  const companionPoseOverride: KikiPose | undefined = isDelivering
-    ? 'delivering'
-    : globalKikiStatus === 'running'
-      ? 'working'
-      : undefined;
+  const isPureIdle = globalKikiStatus === 'idle' && (!companionPose || companionPose === 'idle');
 
-  const statusBadgeText = companionPoseOverride
-    ? KIKI_POSE_LABELS[companionPoseOverride]
-    : globalKikiStatus === 'idle' && companionMoodLabel
+  const statusBadgeText = companionCaption
+    ? companionCaption
+    : isPureIdle && companionMoodLabel
       ? companionMoodLabel
-      : KIKI_STATUS_LABELS[globalKikiStatus];
+      : companionPose
+        ? KIKI_POSE_LABELS[companionPose]
+        : KIKI_STATUS_LABELS[globalKikiStatus];
 
   const handleDrop = async (e: React.DragEvent, targetTopicId: string) => {
     e.preventDefault();
@@ -77,15 +77,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside className="w-64 lg:w-72 shrink-0 h-full bg-[#F5F1EB] border-r border-[#E6DFD5] flex flex-col select-none">
-      {/* Brand Header + Customer Profile Avatar */}
+      {/* Brand Header (Static brand emblem) + Customer Profile Avatar */}
       <div className="px-4 py-3.5 border-b border-[#E8E2D9] flex items-center justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-10 h-10 rounded-2xl bg-[#FAF8F5] border border-[#E2D9CC] shadow-sm flex items-center justify-center shrink-0 overflow-hidden">
-            <KikiAvatar
-              status={globalKikiStatus}
-              pose={companionPoseOverride}
-              size="sm"
-            />
+            <KikiAvatar status="idle" animated={false} size="sm" />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
@@ -235,21 +231,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* Bottom Pinned Kiki Companion Stage */}
+      {/* Bottom Pinned Kiki Companion Stage (Live animated companion) */}
       <div className="p-3 border-t border-[#E8E2D9]">
         <div
           className={`rounded-2xl border px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
             globalKikiStatus === 'waiting_input'
               ? 'bg-amber-50/70 border-amber-300'
-              : isDelivering || globalKikiStatus === 'running'
+              : globalKikiStatus === 'running'
                 ? 'bg-[#EEF4F8] border-[#C9DAE8]'
                 : 'bg-[#FAF8F5] border-[#E6DFD5]'
           }`}
         >
           <KikiAvatar
-            status={globalKikiStatus}
-            pose={companionPoseOverride}
-            companion
+            status={isPureIdle ? 'idle' : globalKikiStatus}
+            pose={isPureIdle ? undefined : companionPose}
+            animated
+            companion={isPureIdle}
             size="xl"
             className="-my-1.5 -ml-1"
             onCompanionMoodChange={setCompanionMoodLabel}
@@ -263,7 +260,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className={`inline-block max-w-full truncate px-2 py-0.5 rounded-full text-[11px] font-medium ${
                   globalKikiStatus === 'waiting_input'
                     ? 'bg-amber-200/80 text-amber-900'
-                    : isDelivering || globalKikiStatus === 'running'
+                    : globalKikiStatus === 'running'
                       ? 'bg-[#5B7A95]/15 text-[#3B5972]'
                       : globalKikiStatus === 'thinking'
                         ? 'bg-[#EAE4DC] text-[#4E4842]'
@@ -277,7 +274,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </span>
             </div>
             <div className="mt-1 text-[10px] text-[#8C8378] truncate">
-              {globalKikiStatus === 'idle' && !isDelivering
+              {isPureIdle
                 ? '点点 Kiki 可逗她 · 拖拽消息改绑'
                 : '拖拽消息可快速改绑话题'}
             </div>

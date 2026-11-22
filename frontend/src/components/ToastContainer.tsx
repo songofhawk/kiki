@@ -18,7 +18,7 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({
 
   return (
     <div className="fixed top-4 right-4 z-50 flex flex-col gap-2.5 max-w-sm w-[calc(100vw-2rem)] pointer-events-none">
-      {toasts.map((toast) => (
+      {toasts.map((toast, idx) => (
         <div
           key={toast.id}
           onClick={() => {
@@ -36,7 +36,12 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({
           className="pointer-events-auto group cursor-pointer rounded-2xl bg-white/95 backdrop-blur-md border border-[#E4DDD2] shadow-lg shadow-stone-900/10 p-3.5 flex items-start gap-3 hover:border-[#5B7A95] transition-all animate-toast-in"
         >
           <div className="w-11 h-11 rounded-2xl bg-[#EEF4F8] border border-[#D4E2ED] flex items-center justify-center shrink-0 -my-0.5">
-            <KikiAvatar status="running" pose="delivering" size="sm" />
+            <KikiAvatar
+              status="running"
+              pose="delivering"
+              animated={idx === 0}
+              size="sm"
+            />
           </div>
 
           <div className="flex-1 min-w-0">

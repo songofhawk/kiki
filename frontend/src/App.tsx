@@ -42,6 +42,7 @@ import type {
   Topic,
 } from './types';
 import Sidebar from './components/Sidebar';
+import type { KikiPose } from './components/KikiAvatar';
 import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
@@ -425,15 +426,6 @@ export const App: React.FC = () => {
     [messages]
   );
 
-  const isDelivering = useMemo(() => {
-    const allRuns = Object.values(runsById);
-    return (
-      sending ||
-      toasts.length > 0 ||
-      allRuns.some((r) => r.status === 'queued')
-    );
-  }, [runsById, sending, toasts.length]);
-
   const globalKikiStatus: KikiStatus = useMemo(() => {
     const allRuns = Object.values(runsById);
     if (allRuns.some((r) => r.status === 'waiting_input')) {
@@ -447,6 +439,79 @@ export const App: React.FC = () => {
     }
     return serverKikiStatus;
   }, [runsById, sending, hasStreamingMessage, serverKikiStatus]);
+
+  // Compute which Kiki animations are currently visible in the main stream / toast
+  // so the bottom-left companion Kiki NEVER performs the exact same animation at the same time.
+  const { companionPose, companionCaption } = useMemo((): {
+    companionPose: KikiPose | undefined;
+    companionCaption: string | null;
+  } => {
+    const usedInMainView = new Set<KikiPose>();
+
+    if (sending || toasts.length > 0) {
+      usedInMainView.add('delivering');
+    }
+    if (visibleMessages.some((m) => m.streaming)) {
+      usedInMainView.add('thinking');
+    }
+
+    const seenRunIds = new Set<string>();
+    for (const msg of visibleMessages) {
+      const rId =
+        msg.session_run?.id ??
+        (typeof msg.metadata?.session_run_id === 'string'
+          ? msg.metadata.session_run_id
+          : undefined);
+      const run = rId ? runsById[rId] ?? msg.session_run ?? null : msg.session_run ?? null;
+      if (!run || seenRunIds.has(run.id)) continue;
+      seenRunIds.add(run.id);
+      if (run.status === 'queued') usedInMainView.add('delivering');
+      if (run.status === 'running') usedInMainView.add('working');
+      if (run.status === 'waiting_input') usedInMainView.add('waiting_input');
+    }
+
+    const pickDistinct = (candidates: KikiPose[]): KikiPose =>
+      candidates.find((p) => !usedInMainView.has(p)) ?? 'idle';
+
+    switch (globalKikiStatus) {
+      case 'waiting_input': {
+        if (!usedInMainView.has('waiting_input')) {
+          return { companionPose: 'waiting_input', companionCaption: '其他话题等你拍板！' };
+        }
+        return {
+          companionPose: pickDistinct(['thinking', 'idle']),
+          companionCaption: '等你拍板确认中...',
+        };
+      }
+      case 'thinking': {
+        if (sending) {
+          return {
+            companionPose: pickDistinct(['thinking', 'idle']),
+            companionCaption: '歪头判断话题分流中...',
+          };
+        }
+        if (usedInMainView.has('thinking')) {
+          return {
+            companionPose: 'idle',
+            companionCaption: '前台轻聊回复中...',
+          };
+        }
+        return { companionPose: 'thinking', companionCaption: '歪头思考分流中...' };
+      }
+      case 'running': {
+        if (!usedInMainView.has('working')) {
+          return { companionPose: 'working', companionCaption: '后台敲键盘干活中...' };
+        }
+        return {
+          companionPose: pickDistinct(['delivering', 'thinking', 'idle']),
+          companionCaption: '后台跑腿盯梢中...',
+        };
+      }
+      case 'idle':
+      default:
+        return { companionPose: undefined, companionCaption: null };
+    }
+  }, [visibleMessages, runsById, sending, toasts.length, globalKikiStatus]);
 
   const handleSelectTopic = useCallback(
     async (topicId: string) => {
@@ -789,7 +854,8 @@ export const App: React.FC = () => {
           topics={topics}
           focusTopicId={focusTopicId}
           globalKikiStatus={globalKikiStatus}
-          isDelivering={isDelivering}
+          companionPose={companionPose}
+          companionCaption={companionCaption}
           sseConnected={sseConnected}
           onSelectAllStream={handleSelectAllStream}
           onSelectTopic={handleSelectTopic}
@@ -810,7 +876,8 @@ export const App: React.FC = () => {
               topics={topics}
               focusTopicId={focusTopicId}
               globalKikiStatus={globalKikiStatus}
-              isDelivering={isDelivering}
+              companionPose={companionPose}
+              companionCaption={companionCaption}
               sseConnected={sseConnected}
               onSelectAllStream={handleSelectAllStream}
               onSelectTopic={handleSelectTopic}

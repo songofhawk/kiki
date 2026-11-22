@@ -1,5 +1,13 @@
 import React, { useEffect, useRef } from 'react';
-import { Check, GripVertical, Sparkles, Terminal, ShieldAlert, MessageCircle } from 'lucide-react';
+import {
+  Check,
+  GripVertical,
+  Loader2,
+  MessageCircle,
+  ShieldAlert,
+  Sparkles,
+  Terminal,
+} from 'lucide-react';
 import type {
   Message,
   ReassignTopicPayload,
@@ -133,7 +141,8 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
       <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-10 flex flex-col items-center justify-center">
         <div className="max-w-xl w-full text-center space-y-6 animate-kiki-fade-up">
           <div className="flex flex-col items-center gap-2">
-            <KikiAvatar status="idle" companion size="hero" />
+            {/* Static by default so she doesn't sync-blink with bottom-left Kiki, but responds if clicked! */}
+            <KikiAvatar status="idle" animated={false} companion size="hero" />
             <div>
               <h2 className="text-xl font-semibold text-[#262422] tracking-tight">
                 {focusTopicId ? '这个话题还没有消息' : '你好，我是 Kiki'}
@@ -182,6 +191,34 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
     );
   }
 
+  // Pre-compute the latest streaming message ID and latest active run per status
+  // so no two cats in the message list ever animate the same loop simultaneously.
+  let latestStreamingMsgId: string | null = null;
+  const preSeenRunIds = new Set<string>();
+  const latestRunIdByStatus: Partial<Record<SessionRun['status'], string>> = {};
+
+  for (const msg of messages) {
+    if (msg.streaming) {
+      latestStreamingMsgId = msg.id;
+    }
+    const rId =
+      msg.session_run?.id ??
+      (typeof msg.metadata?.session_run_id === 'string'
+        ? msg.metadata.session_run_id
+        : undefined);
+    const cand = rId ? runsById[rId] ?? msg.session_run ?? null : msg.session_run ?? null;
+    if (cand && !preSeenRunIds.has(cand.id)) {
+      preSeenRunIds.add(cand.id);
+      if (
+        cand.status === 'queued' ||
+        cand.status === 'running' ||
+        cand.status === 'waiting_input'
+      ) {
+        latestRunIdByStatus[cand.status] = cand.id;
+      }
+    }
+  }
+
   const renderedRunIds = new Set<string>();
 
   return (
@@ -190,6 +227,8 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
         {messages.map((msg) => {
           const isUser = msg.role === 'user';
           const isSystem = msg.role === 'system';
+          const isSelectable = !isSystem && !msg.metadata?.optimistic;
+          const isSelected = Boolean(selectedMessageIds?.has(msg.id));
           const topic = topicsById[msg.topic_id] ?? msg.topic ?? null;
           const confidence =
             typeof msg.metadata?.confidence === 'number'
@@ -209,9 +248,47 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             sessionRun = candidateRun;
           }
 
+          const shouldAnimateRun = Boolean(
+            sessionRun &&
+              latestRunIdByStatus[sessionRun.status] === sessionRun.id &&
+              !(sending && sessionRun.status === 'queued')
+          );
+
           const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+            if (selectionMode) {
+              e.preventDefault();
+              return;
+            }
             e.dataTransfer.setData('text/kiki-message-id', msg.id);
             e.dataTransfer.effectAllowed = 'move';
+          };
+
+          const handleRowSelectClick = (e: React.MouseEvent) => {
+            if (!selectionMode || !isSelectable || !onToggleSelectMessage) return;
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelectMessage(msg.id, e.shiftKey);
+          };
+
+          const renderCheckbox = () => {
+            if (!selectionMode || !isSelectable) return null;
+            return (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleSelectMessage?.(msg.id, e.shiftKey);
+                }}
+                aria-label={isSelected ? '取消选中消息' : '选中消息'}
+                className={`mt-2 w-5 h-5 rounded-md border flex items-center justify-center shrink-0 transition-colors ${
+                  isSelected
+                    ? 'bg-[#5B7A95] border-[#5B7A95] text-white'
+                    : 'bg-white border-[#CFC6B9] hover:border-[#5B7A95]'
+                }`}
+              >
+                {isSelected && <Check className="w-3.5 h-3.5" />}
+              </button>
+            );
           };
 
           if (isSystem) {
@@ -227,35 +304,19 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             );
           }
 
-          const isSelected = Boolean(selectedMessageIds?.has(msg.id));
-          const canSelect = !isSystem && !msg.metadata?.optimistic;
-
-          const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>) => {
-            if (!canSelect) return;
-            const targetEl = e.target as HTMLElement | null;
-            if (targetEl?.closest('button, a, input, textarea, select')) {
-              return;
-            }
-            if (selectionMode) {
-              e.preventDefault();
-              onToggleSelectMessage?.(msg.id, e.shiftKey);
-            } else if ((e.metaKey || e.ctrlKey) && onStartMultiSelect) {
-              e.preventDefault();
-              onStartMultiSelect(msg.id);
-            }
-          };
-
           if (isUser) {
             return (
               <div
                 key={msg.id}
                 draggable={!selectionMode}
                 onDragStart={handleDragStart}
-                onClick={handleContainerClick}
-                className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up ${
-                  selectionMode ? 'cursor-pointer select-none' : ''
-                }`}
+                onClick={selectionMode ? handleRowSelectClick : undefined}
+                className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
+                  selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
+                } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''}`}
               >
+                {renderCheckbox()}
+
                 <div className="flex-1 min-w-0 flex flex-col items-end">
                   <div className="flex items-center gap-2 mb-1.5">
                     {!selectionMode && (
@@ -278,9 +339,9 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                         compact
                       />
                     ) : msg.metadata?.optimistic ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
-                        <KikiAvatar status="running" pose="delivering" size="xs" />
-                        <span>Kiki 送信归类中...</span>
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269]">
+                        <Loader2 className="w-3 h-3 text-[#5B7A95] animate-spin" />
+                        <span>归类路由中...</span>
                       </span>
                     ) : null}
                     <span className="text-[11px] text-[#9A9187]">
@@ -291,21 +352,15 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     </span>
                   </div>
 
-                  <div
-                    className={`max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words transition-all ${
-                      selectionMode && isSelected
-                        ? 'ring-2 ring-[#5B7A95] ring-offset-2 ring-offset-[#FAF8F5]'
-                        : ''
-                    }`}
-                  >
+                  <div className="max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words">
                     {msg.content}
                   </div>
 
-                  {/* Heavy-path RunStatusCard if attached directly to the user trigger message */}
                   {sessionRun && (
                     <div className="w-full max-w-[92%] sm:max-w-[85%]">
                       <RunStatusCard
                         sessionRun={sessionRun}
+                        animateAvatar={shouldAnimateRun}
                         onOpenLogDrawer={onOpenLogDrawer}
                         onResumeRun={onResumeRun}
                         onCancelRun={onCancelRun}
@@ -318,50 +373,31 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                 <div className="shrink-0 mt-1">
                   <UserAvatar size="md" editable={!selectionMode} />
                 </div>
-
-                {selectionMode && canSelect && (
-                  <span
-                    aria-hidden="true"
-                    className={`mt-3 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
-                      isSelected
-                        ? 'bg-[#5B7A95] border-[#5B7A95] text-white'
-                        : 'bg-white border-[#D6CFC4] text-transparent'
-                    }`}
-                  >
-                    <Check className="w-3 h-3" />
-                  </span>
-                )}
               </div>
             );
           }
 
-          // Assistant message
+          // Assistant message:
+          // Completed messages stay completely static (`animated={false}`);
+          // Only the actively streaming message animates (`thinking`).
+          const isActivelyStreaming = Boolean(msg.streaming && msg.id === latestStreamingMsgId);
+
           return (
             <div
               key={msg.id}
               draggable={!selectionMode}
               onDragStart={handleDragStart}
-              onClick={handleContainerClick}
-              className={`group flex items-start gap-2.5 animate-kiki-fade-up ${
-                selectionMode ? 'cursor-pointer select-none' : ''
-              }`}
+              onClick={selectionMode ? handleRowSelectClick : undefined}
+              className={`group flex items-start gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
+                selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
+              } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''}`}
             >
-              {selectionMode && canSelect && (
-                <span
-                  aria-hidden="true"
-                  className={`mt-3 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
-                    isSelected
-                      ? 'bg-[#5B7A95] border-[#5B7A95] text-white'
-                      : 'bg-white border-[#D6CFC4] text-transparent'
-                  }`}
-                >
-                  <Check className="w-3 h-3" />
-                </span>
-              )}
+              {renderCheckbox()}
 
               <div className="shrink-0 mt-0.5">
                 <KikiAvatar
-                  status={msg.streaming ? 'thinking' : 'idle'}
+                  status={isActivelyStreaming ? 'thinking' : 'idle'}
+                  animated={isActivelyStreaming}
                   size="md"
                 />
               </div>
@@ -396,21 +432,10 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       onStartMultiSelect={onStartMultiSelect}
                       compact
                     />
-                  ) : msg.metadata?.optimistic ? (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
-                      <KikiAvatar status="running" pose="delivering" size="xs" />
-                      <span>Kiki 送信归类中...</span>
-                    </span>
                   ) : null}
                 </div>
 
-                <div
-                  className={`rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words transition-all ${
-                    selectionMode && isSelected
-                      ? 'ring-2 ring-[#5B7A95] ring-offset-2 ring-offset-[#FAF8F5]'
-                      : ''
-                  }`}
-                >
+                <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
                   {renderInlineMarkdown(msg.content)}
                   {msg.streaming && (
                     <span className="inline-flex items-center gap-1 ml-1.5 align-middle">
@@ -424,6 +449,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                 {sessionRun && (
                   <RunStatusCard
                     sessionRun={sessionRun}
+                    animateAvatar={shouldAnimateRun}
                     onOpenLogDrawer={onOpenLogDrawer}
                     onResumeRun={onResumeRun}
                     onCancelRun={onCancelRun}
@@ -437,7 +463,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
         {sending && (
           <div className="flex items-start gap-2.5 animate-kiki-fade-up">
             <div className="shrink-0 mt-0.5">
-              <KikiAvatar status="running" pose="delivering" size="md" />
+              <KikiAvatar status="running" pose="delivering" animated size="md" />
             </div>
             <div className="mt-2 rounded-2xl rounded-tl-sm bg-white/85 border border-[#E8E2D9] px-4 py-2.5 text-xs text-[#7A7269] inline-flex items-center gap-2 shadow-sm">
               <span>Kiki 正在飞奔递信并分流话题</span>
