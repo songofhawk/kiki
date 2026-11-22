@@ -21,3 +21,8 @@ data/
 .DS_Store
 .vscode/
 .idea/
+
+# Frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo

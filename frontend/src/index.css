@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: #FAF8F5;
+    color: #262422;
+  }
+
+  body {
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Subtle warm paper scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #DCD4C8;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #BFB5A6;
+}
+
+/* Dark terminal scrollbar for L3 LogDrawer */
+.kiki-terminal-scroll::-webkit-scrollbar-thumb {
+  background: #3F3D3A;
+}
+
+.kiki-terminal-scroll::-webkit-scrollbar-thumb:hover {
+  background: #57534E;
+}
+
+/* Subtle paper grain background utility */
+.kiki-paper-bg {
+  background-color: #FAF8F5;
+  background-image: radial-gradient(rgba(120, 108, 92, 0.05) 1px, transparent 0);
+  background-size: 20px 20px;
+}
+
+/* Smooth fade-in for messages & cards */
+@keyframes kikiFadeUp {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-kiki-fade-up {
+  animation: kikiFadeUp 0.22s ease-out forwards;
+}
