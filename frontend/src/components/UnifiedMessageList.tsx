@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { GripVertical, Sparkles, Terminal, ShieldAlert, MessageCircle } from 'lucide-react';
+import { Check, GripVertical, Sparkles, Terminal, ShieldAlert, MessageCircle } from 'lucide-react';
 import type {
   Message,
   ReassignTopicPayload,
@@ -8,6 +8,7 @@ import type {
   Topic,
 } from '../types';
 import KikiAvatar from './KikiAvatar';
+import UserAvatar, { useUserProfile } from './UserAvatar';
 import TopicBadge from './TopicBadge';
 import RunStatusCard from './RunStatusCard';
 
@@ -18,6 +19,10 @@ export interface UnifiedMessageListProps {
   runsById: Record<string, SessionRun>;
   focusTopicId: string | null;
   sending?: boolean;
+  selectionMode?: boolean;
+  selectedMessageIds?: Set<string>;
+  onToggleSelectMessage?: (messageId: string, shiftKey?: boolean) => void;
+  onStartMultiSelect?: (messageId: string) => void;
   onSelectTopic: (topicId: string) => void;
   onReassignMessage: (
     messageId: string,
@@ -105,6 +110,10 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   runsById,
   focusTopicId,
   sending = false,
+  selectionMode = false,
+  selectedMessageIds,
+  onToggleSelectMessage,
+  onStartMultiSelect,
   onSelectTopic,
   onReassignMessage,
   onOpenLogDrawer,
@@ -113,6 +122,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   onStarterPrompt,
 }) => {
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const [userProfile] = useUserProfile();
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -123,7 +133,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
       <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-10 flex flex-col items-center justify-center">
         <div className="max-w-xl w-full text-center space-y-6 animate-kiki-fade-up">
           <div className="flex flex-col items-center gap-2">
-            <KikiAvatar status="idle" size="hero" />
+            <KikiAvatar status="idle" companion size="hero" />
             <div>
               <h2 className="text-xl font-semibold text-[#262422] tracking-tight">
                 {focusTopicId ? '这个话题还没有消息' : '你好，我是 Kiki'}
@@ -217,56 +227,109 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             );
           }
 
+          const isSelected = Boolean(selectedMessageIds?.has(msg.id));
+          const canSelect = !isSystem && !msg.metadata?.optimistic;
+
+          const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+            if (!canSelect) return;
+            const targetEl = e.target as HTMLElement | null;
+            if (targetEl?.closest('button, a, input, textarea, select')) {
+              return;
+            }
+            if (selectionMode) {
+              e.preventDefault();
+              onToggleSelectMessage?.(msg.id, e.shiftKey);
+            } else if ((e.metaKey || e.ctrlKey) && onStartMultiSelect) {
+              e.preventDefault();
+              onStartMultiSelect(msg.id);
+            }
+          };
+
           if (isUser) {
             return (
               <div
                 key={msg.id}
-                draggable
+                draggable={!selectionMode}
                 onDragStart={handleDragStart}
-                className="group flex flex-col items-end animate-kiki-fade-up"
+                onClick={handleContainerClick}
+                className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up ${
+                  selectionMode ? 'cursor-pointer select-none' : ''
+                }`}
               >
-                <div className="flex items-center gap-2 mb-1.5">
-                  <span
-                    title="可拖拽此消息到左侧任意话题进行改绑"
-                    className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
-                  >
-                    <GripVertical className="w-3.5 h-3.5" />
-                  </span>
-                  <span className="text-[11px] text-[#9A9187]">
-                    {formatTime(msg.created_at)}
-                  </span>
-                  {topic ? (
-                    <TopicBadge
-                      topic={topic}
-                      messageId={msg.id}
-                      confidence={confidence}
-                      allTopics={allTopics}
-                      onSelectTopic={onSelectTopic}
-                      onReassign={onReassignMessage}
-                      compact
-                    />
-                  ) : msg.metadata?.optimistic ? (
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
-                      <KikiAvatar status="thinking" size="xs" />
-                      <span>Kiki 归类中...</span>
+                <div className="flex-1 min-w-0 flex flex-col items-end">
+                  <div className="flex items-center gap-2 mb-1.5">
+                    {!selectionMode && (
+                      <span
+                        title="可拖拽此消息到左侧任意话题进行改绑"
+                        className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
+                      >
+                        <GripVertical className="w-3.5 h-3.5" />
+                      </span>
+                    )}
+                    {topic ? (
+                      <TopicBadge
+                        topic={topic}
+                        messageId={msg.id}
+                        confidence={confidence}
+                        allTopics={allTopics}
+                        onSelectTopic={onSelectTopic}
+                        onReassign={onReassignMessage}
+                        onStartMultiSelect={onStartMultiSelect}
+                        compact
+                      />
+                    ) : msg.metadata?.optimistic ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
+                        <KikiAvatar status="running" pose="delivering" size="xs" />
+                        <span>Kiki 送信归类中...</span>
+                      </span>
+                    ) : null}
+                    <span className="text-[11px] text-[#9A9187]">
+                      {formatTime(msg.created_at)}
                     </span>
-                  ) : null}
-                </div>
-
-                <div className="max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words">
-                  {msg.content}
-                </div>
-
-                {/* Heavy-path RunStatusCard if attached directly to the user trigger message */}
-                {sessionRun && (
-                  <div className="w-full max-w-[92%] sm:max-w-[85%]">
-                    <RunStatusCard
-                      sessionRun={sessionRun}
-                      onOpenLogDrawer={onOpenLogDrawer}
-                      onResumeRun={onResumeRun}
-                      onCancelRun={onCancelRun}
-                    />
+                    <span className="text-xs font-semibold text-[#262422]">
+                      {userProfile.name}
+                    </span>
                   </div>
+
+                  <div
+                    className={`max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words transition-all ${
+                      selectionMode && isSelected
+                        ? 'ring-2 ring-[#5B7A95] ring-offset-2 ring-offset-[#FAF8F5]'
+                        : ''
+                    }`}
+                  >
+                    {msg.content}
+                  </div>
+
+                  {/* Heavy-path RunStatusCard if attached directly to the user trigger message */}
+                  {sessionRun && (
+                    <div className="w-full max-w-[92%] sm:max-w-[85%]">
+                      <RunStatusCard
+                        sessionRun={sessionRun}
+                        onOpenLogDrawer={onOpenLogDrawer}
+                        onResumeRun={onResumeRun}
+                        onCancelRun={onCancelRun}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Customer's own avatar */}
+                <div className="shrink-0 mt-1">
+                  <UserAvatar size="md" editable={!selectionMode} />
+                </div>
+
+                {selectionMode && canSelect && (
+                  <span
+                    aria-hidden="true"
+                    className={`mt-3 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
+                      isSelected
+                        ? 'bg-[#5B7A95] border-[#5B7A95] text-white'
+                        : 'bg-white border-[#D6CFC4] text-transparent'
+                    }`}
+                  >
+                    <Check className="w-3 h-3" />
+                  </span>
                 )}
               </div>
             );
@@ -276,10 +339,26 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           return (
             <div
               key={msg.id}
-              draggable
+              draggable={!selectionMode}
               onDragStart={handleDragStart}
-              className="group flex items-start gap-2.5 animate-kiki-fade-up"
+              onClick={handleContainerClick}
+              className={`group flex items-start gap-2.5 animate-kiki-fade-up ${
+                selectionMode ? 'cursor-pointer select-none' : ''
+              }`}
             >
+              {selectionMode && canSelect && (
+                <span
+                  aria-hidden="true"
+                  className={`mt-3 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
+                    isSelected
+                      ? 'bg-[#5B7A95] border-[#5B7A95] text-white'
+                      : 'bg-white border-[#D6CFC4] text-transparent'
+                  }`}
+                >
+                  <Check className="w-3 h-3" />
+                </span>
+              )}
+
               <div className="shrink-0 mt-0.5">
                 <KikiAvatar
                   status={msg.streaming ? 'thinking' : 'idle'}
@@ -296,12 +375,14 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     <span className="text-[11px] text-[#9A9187]">
                       {formatTime(msg.created_at)}
                     </span>
-                    <span
-                      title="可拖拽此消息到左侧任意话题进行改绑"
-                      className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
-                    >
-                      <GripVertical className="w-3.5 h-3.5" />
-                    </span>
+                    {!selectionMode && (
+                      <span
+                        title="可拖拽此消息到左侧任意话题进行改绑"
+                        className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
+                      >
+                        <GripVertical className="w-3.5 h-3.5" />
+                      </span>
+                    )}
                   </div>
 
                   {topic ? (
@@ -312,17 +393,24 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       allTopics={allTopics}
                       onSelectTopic={onSelectTopic}
                       onReassign={onReassignMessage}
+                      onStartMultiSelect={onStartMultiSelect}
                       compact
                     />
                   ) : msg.metadata?.optimistic ? (
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
-                      <KikiAvatar status="thinking" size="xs" />
-                      <span>Kiki 归类中...</span>
+                      <KikiAvatar status="running" pose="delivering" size="xs" />
+                      <span>Kiki 送信归类中...</span>
                     </span>
                   ) : null}
                 </div>
 
-                <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
+                <div
+                  className={`rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words transition-all ${
+                    selectionMode && isSelected
+                      ? 'ring-2 ring-[#5B7A95] ring-offset-2 ring-offset-[#FAF8F5]'
+                      : ''
+                  }`}
+                >
                   {renderInlineMarkdown(msg.content)}
                   {msg.streaming && (
                     <span className="inline-flex items-center gap-1 ml-1.5 align-middle">
@@ -349,10 +437,10 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
         {sending && (
           <div className="flex items-start gap-2.5 animate-kiki-fade-up">
             <div className="shrink-0 mt-0.5">
-              <KikiAvatar status="thinking" size="md" />
+              <KikiAvatar status="running" pose="delivering" size="md" />
             </div>
-            <div className="mt-2 rounded-2xl rounded-tl-sm bg-white/80 border border-[#E8E2D9] px-4 py-2.5 text-xs text-[#7A7269] inline-flex items-center gap-2 shadow-sm">
-              <span>Kiki 正在思考并分流话题</span>
+            <div className="mt-2 rounded-2xl rounded-tl-sm bg-white/85 border border-[#E8E2D9] px-4 py-2.5 text-xs text-[#7A7269] inline-flex items-center gap-2 shadow-sm">
+              <span>Kiki 正在飞奔递信并分流话题</span>
               <span className="inline-flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />
                 <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:150ms]" />

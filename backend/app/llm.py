@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Optional
 from google import genai
 
 from .config import Settings
-from .schemas import BacktrackDecision, RouteDecision
+from .schemas import BacktrackDecision, DreamConsolidationPlan, RouteDecision
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,48 @@ BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手
 1. 仔细判断候选消息中哪些与目标话题属于同一件事/同一主题的延续（包括前面铺垫背景、追问以及紧随其后的 Kiki 回复）。
 2. 纯粹无关的寒暄问候（如“早安”“哈哈”）或明显属于其他无关事件的闲聊不要选入。
 3. 只能返回上述候选消息列表中真实存在的 `id`；若本批候选消息均不属于目标话题，请返回空数组 `[]`。
+"""
+
+DREAM_SYSTEM_PROMPT_TEMPLATE = """你是 Kiki 在后台空闲打盹时的“做梦记忆整理”引擎。
+你的职责：在用户不知不觉中，安静地整理“日常闲聊（topic-general）”里被错放或逐渐成形的历史对话，并为缺少/过时摘要的活跃话题补全一句话摘要。
+
+现有活跃话题（含已有摘要）：
+{active_topics_json}
+
+待整理的“日常闲聊”历史消息（按时间从早到晚排列）：
+{general_messages_text}
+
+缺少摘要或需要刷新摘要的话题近期内容：
+{topics_to_summarize_text}
+
+请输出 JSON，切勿包含其他多余字符：
+{{
+  "migrations": [
+    {{
+      "action": "move_to_existing" | "create_topic",
+      "target_topic_id": "Existing Topic ID if move_to_existing, else null",
+      "new_topic_title": "Short title if create_topic, else null",
+      "new_topic_summary": "One-sentence summary if create_topic, else null",
+      "message_ids": ["msg-..."],
+      "confidence": 0.0 - 1.0,
+      "reasoning": "简短说明归并或建话题理由"
+    }}
+  ],
+  "topic_summaries": [
+    {{
+      "topic_id": "topic-...",
+      "summary": "一句简明扼要的话题摘要（不超过40字）"
+    }}
+  ],
+  "reasoning": "本次做梦整理的整体说明"
+}}
+
+整理原则（宁缺毋滥）：
+1. 仅当确信“日常闲聊”里的某些消息明显属于某个已有非闲聊话题时，使用 `move_to_existing`（建议 `confidence >= 0.78`）。切勿把消息迁移到 `topic-general`。
+2. 仅当“日常闲聊”里存在连续多条（至少 2 轮/3 条以上）围绕同一个具体主题展开的实质性对话、且现有活跃话题都无法覆盖时，才使用 `create_topic` 新建简短话题（建议 `confidence >= 0.82`）。
+3. 纯寒暄（如“早安”“哈哈”“好的”）、一次性随口吐槽不要强行归类或建话题，保持在“日常闲聊”即可。
+4. `message_ids` 必须严格来自上述待整理消息列表，并将对应的用户提问与 Kiki 回复一并选入。
+5. 若暂无需要整理的内容，返回空的 `migrations: []`。
 """
 
 KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点傲娇小性格的手绘风蓝灰虎斑小猫个人智能体（Personal Agent）。
@@ -251,6 +293,55 @@ class KikiLLMClient:
         return BacktrackDecision(
             matched_message_ids=[],
             reasoning=f"回溯模型暂不可用 ({type(last_exc).__name__ if last_exc else 'Error'})",
+        )
+
+    async def consolidate_dream(
+        self,
+        *,
+        active_topics: list[dict[str, Any]],
+        general_messages: list[dict[str, Any]],
+        topics_to_summarize: Optional[list[dict[str, Any]]] = None,
+    ) -> DreamConsolidationPlan:
+        if not general_messages and not topics_to_summarize:
+            return DreamConsolidationPlan(reasoning="暂无需要做梦整理的内容")
+
+        compact_topics = [
+            {
+                "id": t["id"],
+                "title": t["title"],
+                "summary": t.get("summary") or "",
+            }
+            for t in active_topics
+            if t.get("id") != "topic-general"
+        ]
+        summary_blocks: list[str] = []
+        for t in topics_to_summarize or []:
+            msgs = t.get("recent_messages") or []
+            if not msgs:
+                continue
+            summary_blocks.append(
+                f"话题 [{t['id']}] #{t['title']}（当前摘要：{t.get('summary') or '无'}）：\n"
+                + self._format_context_lines(msgs)
+            )
+
+        system_instruction = DREAM_SYSTEM_PROMPT_TEMPLATE.format(
+            active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2),
+            general_messages_text=self._format_context_lines(general_messages, include_id=True),
+            topics_to_summarize_text="\n\n".join(summary_blocks) if summary_blocks else "（无）",
+        )
+        parsed, last_exc = await self._run_structured_json(
+            input_text="请整理待处理的日常闲聊记录并生成必要的话题摘要。",
+            system_instruction=system_instruction,
+            schema_cls=DreamConsolidationPlan,
+            call_label="Dream Model",
+        )
+        if parsed is not None:
+            return parsed
+
+        return DreamConsolidationPlan(
+            migrations=[],
+            topic_summaries=[],
+            reasoning=f"做梦模型暂不可用 ({type(last_exc).__name__ if last_exc else 'Error'})",
         )
 
     async def stream_fast_reply(

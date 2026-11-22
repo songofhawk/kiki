@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, FolderInput, GitBranchPlus, Check } from 'lucide-react';
+import { ChevronDown, FolderInput, GitBranchPlus, Check, CheckSquare } from 'lucide-react';
 import type { ReassignTopicPayload, Topic } from '../types';
 import KikiAvatar from './KikiAvatar';
 
@@ -11,6 +11,7 @@ export interface TopicBadgeProps {
   allTopics?: Topic[];
   onSelectTopic?: (topicId: string) => void;
   onReassign?: (messageId: string, payload: ReassignTopicPayload) => Promise<void> | void;
+  onStartMultiSelect?: (messageId: string) => void;
   compact?: boolean;
 }
 
@@ -39,6 +40,7 @@ export const TopicBadge: React.FC<TopicBadgeProps> = ({
   allTopics = [],
   onSelectTopic,
   onReassign,
+  onStartMultiSelect,
   compact = false,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -222,15 +224,32 @@ export const TopicBadge: React.FC<TopicBadgeProps> = ({
             )}
 
             {!showSplitInput ? (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => setShowSplitInput(true)}
-                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium text-[#262422] hover:bg-[#FAF8F5] transition-colors disabled:opacity-50"
-              >
-                <GitBranchPlus className="w-3.5 h-3.5 text-[#5B7A95]" />
-                <span>拆为新话题</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setShowSplitInput(true)}
+                  className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium text-[#262422] hover:bg-[#FAF8F5] transition-colors disabled:opacity-50"
+                >
+                  <GitBranchPlus className="w-3.5 h-3.5 text-[#5B7A95]" />
+                  <span>拆为新话题</span>
+                </button>
+                {onStartMultiSelect && messageId && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setShowSplitInput(false);
+                      onStartMultiSelect(messageId);
+                    }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-[#4E4842] hover:bg-[#FAF8F5] transition-colors disabled:opacity-50"
+                  >
+                    <CheckSquare className="w-3.5 h-3.5 text-[#5B7A95]" />
+                    <span>多选消息整理</span>
+                  </button>
+                )}
+              </>
             ) : (
               <form onSubmit={handleSplit} className="p-1.5 space-y-1.5">
                 <input

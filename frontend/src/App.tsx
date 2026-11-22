@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Check,
+  FolderInput,
+  GitBranchPlus,
   Lock,
   Menu,
   Send,
@@ -11,6 +14,7 @@ import {
   Compass,
 } from 'lucide-react';
 import {
+  batchReassignMessageTopics,
   cancelRun,
   connectEventStream,
   createTopic,
@@ -26,6 +30,7 @@ import {
 } from './api';
 import type {
   AdapterInfo,
+  BatchReassignTopicPayload,
   HealthResponse,
   KikiStatus,
   Message,
@@ -146,8 +151,15 @@ export const App: React.FC = () => {
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchMoveOpen, setBatchMoveOpen] = useState(false);
+  const [batchSplitOpen, setBatchSplitOpen] = useState(false);
+  const [batchSplitTitle, setBatchSplitTitle] = useState('');
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastSelectedMsgIdRef = useRef<string | null>(null);
   const pendingOptimisticRef = useRef<Array<{ tempId: string; content: string }>>([]);
   const resolvedOptimisticMapRef = useRef<Map<string, string>>(new Map());
 
@@ -413,6 +425,15 @@ export const App: React.FC = () => {
     [messages]
   );
 
+  const isDelivering = useMemo(() => {
+    const allRuns = Object.values(runsById);
+    return (
+      sending ||
+      toasts.length > 0 ||
+      allRuns.some((r) => r.status === 'queued')
+    );
+  }, [runsById, sending, toasts.length]);
+
   const globalKikiStatus: KikiStatus = useMemo(() => {
     const allRuns = Object.values(runsById);
     if (allRuns.some((r) => r.status === 'waiting_input')) {
@@ -591,6 +612,106 @@ export const App: React.FC = () => {
     []
   );
 
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedMessageIds(new Set());
+    setBatchMoveOpen(false);
+    setBatchSplitOpen(false);
+    setBatchSplitTitle('');
+    lastSelectedMsgIdRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!selectionMode) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        exitSelectionMode();
+      }
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [selectionMode, exitSelectionMode]);
+
+  const handleStartMultiSelect = useCallback((messageId: string) => {
+    setSelectionMode(true);
+    setSelectedMessageIds(new Set([messageId]));
+    setBatchMoveOpen(false);
+    setBatchSplitOpen(false);
+    lastSelectedMsgIdRef.current = messageId;
+  }, []);
+
+  const handleToggleSelectMessage = useCallback(
+    (messageId: string, shiftKey = false) => {
+      setSelectedMessageIds((prev) => {
+        const next = new Set(prev);
+        if (shiftKey && lastSelectedMsgIdRef.current) {
+          const selectable = visibleMessages.filter(
+            (m) => m.role !== 'system' && !m.metadata?.optimistic
+          );
+          const startIdx = selectable.findIndex(
+            (m) => m.id === lastSelectedMsgIdRef.current
+          );
+          const endIdx = selectable.findIndex((m) => m.id === messageId);
+          if (startIdx >= 0 && endIdx >= 0) {
+            const [lo, hi] = startIdx < endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+            for (let i = lo; i <= hi; i += 1) {
+              next.add(selectable[i].id);
+            }
+            return next;
+          }
+        }
+        if (next.has(messageId)) {
+          next.delete(messageId);
+        } else {
+          next.add(messageId);
+        }
+        return next;
+      });
+      lastSelectedMsgIdRef.current = messageId;
+    },
+    [visibleMessages]
+  );
+
+  const handleBatchReassign = useCallback(
+    async (payload: Omit<BatchReassignTopicPayload, 'message_ids'>) => {
+      const ids = Array.from(selectedMessageIds);
+      if (ids.length === 0 || batchBusy) return;
+      setBatchBusy(true);
+      try {
+        const res = await batchReassignMessageTopics({
+          ...payload,
+          message_ids: ids,
+        });
+        if (res.topic) {
+          setTopics((prev) => upsertTopic(prev, res.topic));
+        }
+        if (res.messages?.length) {
+          setMessages((prev) =>
+            res.messages.reduce(
+              (acc, msg) =>
+                upsertMessage(acc, {
+                  ...msg,
+                  topic: res.topic ?? msg.topic,
+                }),
+              prev
+            )
+          );
+        }
+        fetchTopics()
+          .then((list) => setTopics(list))
+          .catch(() => { });
+        exitSelectionMode();
+      } catch (err) {
+        setErrorBanner(
+          err instanceof Error ? err.message : '批量调整话题归属失败'
+        );
+      } finally {
+        setBatchBusy(false);
+      }
+    },
+    [selectedMessageIds, batchBusy, exitSelectionMode]
+  );
+
   const handleOpenLogDrawer = useCallback(async (runId: string) => {
     setActiveDrawerRunId(runId);
     try {
@@ -668,6 +789,7 @@ export const App: React.FC = () => {
           topics={topics}
           focusTopicId={focusTopicId}
           globalKikiStatus={globalKikiStatus}
+          isDelivering={isDelivering}
           sseConnected={sseConnected}
           onSelectAllStream={handleSelectAllStream}
           onSelectTopic={handleSelectTopic}
@@ -688,6 +810,7 @@ export const App: React.FC = () => {
               topics={topics}
               focusTopicId={focusTopicId}
               globalKikiStatus={globalKikiStatus}
+              isDelivering={isDelivering}
               sseConnected={sseConnected}
               onSelectAllStream={handleSelectAllStream}
               onSelectTopic={handleSelectTopic}
@@ -776,6 +899,10 @@ export const App: React.FC = () => {
           runsById={runsById}
           focusTopicId={focusTopicId}
           sending={sending}
+          selectionMode={selectionMode}
+          selectedMessageIds={selectedMessageIds}
+          onToggleSelectMessage={handleToggleSelectMessage}
+          onStartMultiSelect={handleStartMultiSelect}
           onSelectTopic={handleSelectTopic}
           onReassignMessage={handleReassignMessage}
           onOpenLogDrawer={handleOpenLogDrawer}
@@ -784,9 +911,127 @@ export const App: React.FC = () => {
           onStarterPrompt={(prompt) => handleSend(prompt)}
         />
 
-        {/* Bottom Composer */}
+        {/* Bottom Composer or Hidden Multi-Select Floating Bar */}
         <div className="shrink-0 px-4 sm:px-6 lg:px-8 pb-4 pt-2 bg-gradient-to-t from-[#FAF8F5] via-[#FAF8F5] to-transparent">
           <div className="max-w-3xl mx-auto">
+            {selectionMode ? (
+              <div className="relative rounded-2xl bg-white border border-[#D8CFC2] shadow-lg shadow-stone-900/5 px-4 py-3 flex flex-wrap items-center justify-between gap-3 animate-kiki-fade-up">
+                <div className="flex items-center gap-2.5 text-xs text-[#4E4842]">
+                  <span className="inline-flex items-center justify-center px-2 py-0.5 rounded-full bg-[#EAF0F5] text-[#3B5972] font-semibold">
+                    已选 {selectedMessageIds.size} 条
+                  </span>
+                  <span className="hidden sm:inline text-[#8C8378]">
+                    点击气泡多选 · Shift 区间连选
+                  </span>
+                </div>
+
+                {batchSplitOpen ? (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void handleBatchReassign({
+                        action: 'split',
+                        new_topic_title: batchSplitTitle.trim() || undefined,
+                      });
+                    }}
+                    className="flex items-center gap-2 flex-1 justify-end min-w-[240px]"
+                  >
+                    <input
+                      type="text"
+                      autoFocus
+                      value={batchSplitTitle}
+                      onChange={(e) => setBatchSplitTitle(e.target.value)}
+                      placeholder="新话题标题（留空自动命名）"
+                      className="w-48 sm:w-56 px-2.5 py-1.5 text-xs rounded-lg border border-[#E8E2D9] bg-[#FAF8F5] focus:outline-none focus:border-[#5B7A95]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBatchSplitOpen(false);
+                        setBatchSplitTitle('');
+                      }}
+                      className="px-2 py-1.5 text-xs text-[#7A7269] hover:text-[#262422]"
+                    >
+                      返回
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={batchBusy || selectedMessageIds.size === 0}
+                      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-[#5B7A95] text-white hover:bg-[#4A6882] disabled:opacity-40"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      确认拆分
+                    </button>
+                  </form>
+                ) : (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="relative">
+                      <button
+                        type="button"
+                        disabled={batchBusy || selectedMessageIds.size === 0}
+                        onClick={() => setBatchMoveOpen((prev) => !prev)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium bg-[#FAF8F5] hover:bg-[#F1ECE5] border border-[#E4DDD2] text-[#262422] disabled:opacity-40 transition-colors"
+                      >
+                        <FolderInput className="w-3.5 h-3.5 text-[#5B7A95]" />
+                        <span>移至话题</span>
+                      </button>
+
+                      {batchMoveOpen && (
+                        <div className="absolute bottom-full right-0 mb-2 w-56 rounded-xl bg-white border border-[#E8E2D9] shadow-xl shadow-stone-900/10 p-1.5 z-50">
+                          <div className="px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-[#8C8378]">
+                            选择目标话题
+                          </div>
+                          <div className="max-h-48 overflow-y-auto space-y-0.5">
+                            {topics
+                              .filter((t) => t.status === 'active')
+                              .map((t) => (
+                                <button
+                                  key={t.id}
+                                  type="button"
+                                  disabled={batchBusy}
+                                  onClick={() => {
+                                    setBatchMoveOpen(false);
+                                    void handleBatchReassign({
+                                      action: 'move',
+                                      target_topic_id: t.id,
+                                    });
+                                  }}
+                                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs text-[#3A3530] hover:bg-[#FAF8F5] truncate transition-colors"
+                                >
+                                  #{t.title}
+                                </button>
+                              ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={batchBusy || selectedMessageIds.size === 0}
+                      onClick={() => {
+                        setBatchMoveOpen(false);
+                        setBatchSplitOpen(true);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium bg-[#5B7A95] hover:bg-[#4B6882] text-white disabled:opacity-40 transition-colors"
+                    >
+                      <GitBranchPlus className="w-3.5 h-3.5" />
+                      <span>拆为新话题</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={exitSelectionMode}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs text-[#7A7269] hover:text-[#262422] hover:bg-[#F3EFE9] transition-colors"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>取消</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
             {/* Subtle Path Toggle Row */}
             <div className="flex items-center justify-between gap-2 mb-1.5 px-1 flex-wrap">
               <div className="flex items-center gap-2 flex-wrap">
@@ -874,6 +1119,8 @@ export const App: React.FC = () => {
                 <Send className="w-4 h-4" />
               </button>
             </div>
+              </>
+            )}
           </div>
         </div>
       </main>

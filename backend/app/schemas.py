@@ -43,6 +43,38 @@ class BacktrackDecision(BaseModel):
     )
 
 
+class DreamMigrationGroup(BaseModel):
+    action: Literal["move_to_existing", "create_topic"] = Field(
+        description="Whether to merge messages into an existing topic or create a new topic",
+    )
+    target_topic_id: Optional[str] = Field(
+        default=None,
+        description="Existing active Topic ID when action is move_to_existing",
+    )
+    new_topic_title: Optional[str] = Field(
+        default=None,
+        description="Short concise title when action is create_topic",
+    )
+    new_topic_summary: Optional[str] = Field(
+        default=None,
+        description="One-sentence summary when action is create_topic",
+    )
+    message_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = Field(default="")
+
+
+class DreamTopicSummaryUpdate(BaseModel):
+    topic_id: str
+    summary: str
+
+
+class DreamConsolidationPlan(BaseModel):
+    migrations: list[DreamMigrationGroup] = Field(default_factory=list)
+    topic_summaries: list[DreamTopicSummaryUpdate] = Field(default_factory=list)
+    reasoning: str = Field(default="")
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     model: str
@@ -192,6 +224,18 @@ class MessageTopicReassignRequest(BaseModel):
 
 class MessageTopicReassignResponse(BaseModel):
     message: MessageItem
+    topic: TopicSummary
+
+
+class BatchMessageTopicReassignRequest(BaseModel):
+    message_ids: list[str] = Field(min_length=1)
+    action: Literal["move", "split"]
+    target_topic_id: Optional[str] = None
+    new_topic_title: Optional[str] = None
+
+
+class BatchMessageTopicReassignResponse(BaseModel):
+    messages: list[MessageItem]
     topic: TopicSummary
 
 

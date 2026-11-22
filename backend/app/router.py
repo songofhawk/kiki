@@ -237,6 +237,10 @@ class FastPathService:
         self._idle_status_provider = idle_status_provider
         self._tasks: set[asyncio.Task[Any]] = set()
 
+    @property
+    def is_busy(self) -> bool:
+        return bool(self._tasks)
+
     def start_reply(
         self,
         topic: dict[str, Any],

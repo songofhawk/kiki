@@ -1,6 +1,7 @@
 import React from 'react';
-import { Sparkles, X, ArrowUpRight } from 'lucide-react';
+import { X, ArrowUpRight } from 'lucide-react';
 import type { ToastNotification } from '../types';
+import KikiAvatar from './KikiAvatar';
 
 export interface ToastContainerProps {
   toasts: ToastNotification[];
@@ -34,14 +35,14 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({
           }}
           className="pointer-events-auto group cursor-pointer rounded-2xl bg-white/95 backdrop-blur-md border border-[#E4DDD2] shadow-lg shadow-stone-900/10 p-3.5 flex items-start gap-3 hover:border-[#5B7A95] transition-all animate-toast-in"
         >
-          <div className="w-8 h-8 rounded-xl bg-[#EAF0F5] text-[#5B7A95] flex items-center justify-center shrink-0 mt-0.5">
-            <Sparkles className="w-4 h-4" />
+          <div className="w-11 h-11 rounded-2xl bg-[#EEF4F8] border border-[#D4E2ED] flex items-center justify-center shrink-0 -my-0.5">
+            <KikiAvatar status="running" pose="delivering" size="sm" />
           </div>
 
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-[#262422]">
               <span className="text-[#5B7A95] truncate">#{toast.topic_title}</span>
-              <span className="shrink-0">已搞定</span>
+              <span className="shrink-0">捷报送达</span>
               <ArrowUpRight className="w-3.5 h-3.5 text-[#8C8378] opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
             </div>
             <p className="mt-0.5 text-xs text-[#5C554E] line-clamp-2 leading-relaxed">

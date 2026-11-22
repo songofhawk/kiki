@@ -157,14 +157,17 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 ## 四、 Kiki 猫咪 UI 形象与状态机映射
 
-视觉图源文件存放于 `reference/kiki`（包含 2x2 网格手绘风高性格小猫）。
+原始手绘视觉参考稿存放于 `reference/kiki`（只读源素材）；工程化生成的正视图/多角度手绘序列帧原图存放于 `assets/sprites/`，经去背与重心对齐后的透明动态 WebP（`.webp`）输出至 `assets/kiki/` 与 `frontend/public/kiki/`。同时，界面中的「客户头像」由独立组件 `UserAvatar` 承载（支持预设风格与自定义头像上传），与 Kiki 的全身伴宠形象完全解耦。
 
-| 系统状态 / 事件 | Kiki 状态编码 | UI 形象剪裁区域 | 前端展示位置与视觉行为 |
+| 系统状态 / 场景 | Kiki 姿态编码 (`KikiPose`) | 视角与动态表现（透明多帧动态 WebP） | 前端展示位置与交互行为 |
 | :--- | :--- | :--- | :--- |
-| **Idle（待机）** | `idle` | 左上角（揣手手趴姿） | 常驻于底部输入框右侧或侧边栏底部，呈静止趴姿，偶现极轻微呼吸/眨眼微动。 |
-| **Routing / Thinking（路由与思考）** | `thinking` | 右上角（傲娇歪头+思考小云朵） | 当 Decision Model 正在路由判断，或 Fast-Path 正在生成前台回答时展示。 |
-| **Running（后台跑腿干活）** | `running` | 左下角（戴邮差帽叼信封奔跑） | 嵌入在消息流的 `SessionRun` 进度卡片左侧，配有小腿微动动画与 SSE 原地刷新文案。 |
-| **Waiting Input（HITL 人工挂起）** | `waiting_input` | 右下角（端坐举爪+头顶问号） | 高亮暂停卡片左侧，举爪提示用户选择快捷按钮或拍板授权。 |
+| **Idle（日常待机）** | `idle` | 正视图全身坐姿：自然呼吸、眨眼、耳尖轻颤与尾巴摇摆 | 常驻于左下角伴宠小窝、空状态欢迎舞台与已完成助手消息左侧。 |
+| **Idle Lazy（慵懒小动作）** | `idle_lazy` | 正面微侧全身：困倦眯眼 $\rightarrow$ 张嘴打大哈欠 $\rightarrow$ 趴卧打盹冒鼻泡 | 左下角伴宠小窝或欢迎舞台处于待机时定时随机触发（点击摸摸 Kiki 亦可触发）。 |
+| **Idle Playful（调皮小动作）** | `idle_playful` | 正视图全身：竖耳歪头 $\rightarrow$ 舔爪洗脸 $\rightarrow$ 伸出肉垫拍屏幕逗弄 | 左下角伴宠小窝处于待机时随机轮换触发，支持用户点击互动击掌。 |
+| **Thinking（路由与思考）** | `thinking` | 正视图端坐歪头：托腮思索、眼神流转与头顶思考云朵浮动 | 当 Decision Model 判断路由、Fast-Path 流式生成或低置信度提示时展示。 |
+| **Delivering（运送消息/派单）** | `delivering` | 微侧正脸斜向奔跑：戴邮差帽背挎包叼信封，四肢交替迈步飞奔 | 消息发送分流中、`SessionRun` 排队派单（`queued`）及右上角任务完成捷报 Toast 时展示。 |
+| **Working（专注干活）** | `working` | 正视图坐于笔记本电脑后：戴报童帽左右爪交替快速敲击键盘、抬头巡检 | 后台重型任务执行中（`running`）时，在 `RunStatusCard` 与左下角伴宠小窝同步展示。 |
+| **Waiting Input（人工拍板）** | `waiting_input` | 正视图端坐举爪：挥动肉垫小爪招手、眨眼示意与头顶问号跳动 | HITL 挂起审批卡片与左下角伴宠小窝高亮展示，提醒用户一键拍板。 |
 
 ---
 

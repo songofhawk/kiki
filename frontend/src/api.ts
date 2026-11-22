@@ -1,6 +1,8 @@
 import type {
   AdapterInfo,
   Artifact,
+  BatchReassignTopicPayload,
+  BatchReassignTopicResponse,
   ChatRequest,
   ChatResponse,
   HealthResponse,
@@ -105,6 +107,15 @@ export async function reassignMessageTopic(
       body: JSON.stringify(payload),
     }
   );
+}
+
+export async function batchReassignMessageTopics(
+  payload: BatchReassignTopicPayload
+): Promise<BatchReassignTopicResponse> {
+  return requestJson<BatchReassignTopicResponse>('/messages/batch-topic', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function fetchRun(runId: string): Promise<SessionRun> {

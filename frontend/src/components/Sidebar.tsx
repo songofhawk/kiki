@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import { Hash, Layers, Loader2, PawPrint, Plus } from 'lucide-react';
 import type { KikiStatus, ReassignTopicPayload, Topic } from '../types';
-import KikiAvatar, { KIKI_STATUS_LABELS } from './KikiAvatar';
+import KikiAvatar, { KIKI_POSE_LABELS, KIKI_STATUS_LABELS, type KikiPose } from './KikiAvatar';
+import UserAvatar from './UserAvatar';
 
 export interface SidebarProps {
   topics: Topic[];
   focusTopicId: string | null;
   globalKikiStatus: KikiStatus;
+  isDelivering?: boolean;
   sseConnected: boolean;
   onSelectAllStream: () => void;
   onSelectTopic: (topicId: string) => void;
@@ -21,6 +23,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   topics,
   focusTopicId,
   globalKikiStatus,
+  isDelivering = false,
   sseConnected,
   onSelectAllStream,
   onSelectTopic,
@@ -31,8 +34,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [addingTopic, setAddingTopic] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
+  const [companionMoodLabel, setCompanionMoodLabel] = useState<string | null>(null);
 
   const activeTopics = topics.filter((t) => t.status === 'active');
+
+  const companionPoseOverride: KikiPose | undefined = isDelivering
+    ? 'delivering'
+    : globalKikiStatus === 'running'
+      ? 'working'
+      : undefined;
+
+  const statusBadgeText = companionPoseOverride
+    ? KIKI_POSE_LABELS[companionPoseOverride]
+    : globalKikiStatus === 'idle' && companionMoodLabel
+      ? companionMoodLabel
+      : KIKI_STATUS_LABELS[globalKikiStatus];
 
   const handleDrop = async (e: React.DragEvent, targetTopicId: string) => {
     e.preventDefault();
@@ -61,14 +77,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside className="w-64 lg:w-72 shrink-0 h-full bg-[#F5F1EB] border-r border-[#E6DFD5] flex flex-col select-none">
-      {/* Brand Header */}
-      <div className="px-4 py-4 border-b border-[#E8E2D9] flex items-center justify-between">
-        <div className="flex items-center gap-3 min-w-0">
-          <img
-            src="/kiki-avatar.jpg"
-            alt="Kiki"
-            className="w-10 h-10 rounded-2xl object-cover border border-[#DDD5C9] shadow-sm shrink-0"
-          />
+      {/* Brand Header + Customer Profile Avatar */}
+      <div className="px-4 py-3.5 border-b border-[#E8E2D9] flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-10 h-10 rounded-2xl bg-[#FAF8F5] border border-[#E2D9CC] shadow-sm flex items-center justify-center shrink-0 overflow-hidden">
+            <KikiAvatar
+              status={globalKikiStatus}
+              pose={companionPoseOverride}
+              size="sm"
+            />
+          </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
               <h1 className="text-base font-bold text-[#262422] tracking-tight">
@@ -76,13 +94,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </h1>
               <span
                 title={sseConnected ? '实时事件流已连接' : '事件流重连中'}
-                className={`w-2 h-2 rounded-full ${sseConnected ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'
-                  }`}
+                className={`w-2 h-2 rounded-full ${
+                  sseConnected ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'
+                }`}
               />
             </div>
             <p className="text-[11px] text-[#7D756C] truncate">Personal Agent</p>
           </div>
         </div>
+
+        {/* Customer's own avatar (clickable to customize photo & display name) */}
+        <UserAvatar size="sm" editable />
       </div>
 
       {/* Primary Navigation */}
@@ -90,15 +112,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={onSelectAllStream}
-          className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${focusTopicId === null
+          className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
+            focusTopicId === null
               ? 'bg-white text-[#262422] shadow-sm border border-[#E5DED4]'
               : 'text-[#5A534C] hover:bg-[#ECE6DD] border border-transparent'
-            }`}
+          }`}
         >
           <span className="flex items-center gap-2.5">
             <Layers
-              className={`w-4 h-4 ${focusTopicId === null ? 'text-[#5B7A95]' : 'text-[#8C8378]'
-                }`}
+              className={`w-4 h-4 ${
+                focusTopicId === null ? 'text-[#5B7A95]' : 'text-[#8C8378]'
+              }`}
             />
             <span>All Stream</span>
             <span className="text-[11px] text-[#8C8378] font-normal">全局流</span>
@@ -166,17 +190,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   }
                 }}
                 onDrop={(e) => handleDrop(e, topic.id)}
-                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border ${isDragTarget
+                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border ${
+                  isDragTarget
                     ? 'bg-amber-50 border-amber-400 ring-2 ring-amber-300/60 scale-[1.01]'
                     : isSelected
                       ? 'bg-white text-[#262422] font-semibold border-[#E5DED4] shadow-sm'
                       : 'text-[#4E4842] hover:bg-[#ECE6DD] border-transparent'
-                  }`}
+                }`}
               >
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <Hash
-                    className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-[#5B7A95]' : 'text-[#9A9187]'
-                      }`}
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      isSelected ? 'text-[#5B7A95]' : 'text-[#9A9187]'
+                    }`}
                   />
                   <span className="truncate">{topic.title}</span>
                 </div>
@@ -209,37 +235,51 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* Bottom Pinned Kiki Status Card */}
+      {/* Bottom Pinned Kiki Companion Stage */}
       <div className="p-3 border-t border-[#E8E2D9]">
         <div
-          className={`rounded-2xl border px-3 py-2.5 flex items-center gap-3 transition-colors ${globalKikiStatus === 'waiting_input'
+          className={`rounded-2xl border px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
+            globalKikiStatus === 'waiting_input'
               ? 'bg-amber-50/70 border-amber-300'
-              : globalKikiStatus === 'running'
+              : isDelivering || globalKikiStatus === 'running'
                 ? 'bg-[#EEF4F8] border-[#C9DAE8]'
                 : 'bg-[#FAF8F5] border-[#E6DFD5]'
-            }`}
+          }`}
         >
-          <KikiAvatar status={globalKikiStatus} size="lg" className="-my-1" />
+          <KikiAvatar
+            status={globalKikiStatus}
+            pose={companionPoseOverride}
+            companion
+            size="xl"
+            className="-my-1.5 -ml-1"
+            onCompanionMoodChange={setCompanionMoodLabel}
+          />
           <div className="min-w-0 flex-1">
             <div className="text-[10px] font-semibold uppercase tracking-wider text-[#8C8378]">
-              Kiki 状态
+              Kiki 伴宠小窝
             </div>
             <div className="mt-1">
               <span
-                className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium ${globalKikiStatus === 'waiting_input'
+                className={`inline-block max-w-full truncate px-2 py-0.5 rounded-full text-[11px] font-medium ${
+                  globalKikiStatus === 'waiting_input'
                     ? 'bg-amber-200/80 text-amber-900'
-                    : globalKikiStatus === 'running'
+                    : isDelivering || globalKikiStatus === 'running'
                       ? 'bg-[#5B7A95]/15 text-[#3B5972]'
                       : globalKikiStatus === 'thinking'
                         ? 'bg-[#EAE4DC] text-[#4E4842]'
-                        : 'bg-[#ECE6DD] text-[#5A534C]'
-                  }`}
+                        : companionMoodLabel
+                          ? 'bg-[#E7EFF5] text-[#3B5972]'
+                          : 'bg-[#ECE6DD] text-[#5A534C]'
+                }`}
+                title={statusBadgeText}
               >
-                {KIKI_STATUS_LABELS[globalKikiStatus]}
+                {statusBadgeText}
               </span>
             </div>
             <div className="mt-1 text-[10px] text-[#8C8378] truncate">
-              拖拽消息可快速改绑话题
+              {globalKikiStatus === 'idle' && !isDelivering
+                ? '点点 Kiki 可逗她 · 拖拽消息改绑'
+                : '拖拽消息可快速改绑话题'}
             </div>
           </div>
         </div>

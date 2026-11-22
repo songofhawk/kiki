@@ -697,6 +697,7 @@ class Database:
         target_topic_id: str,
         *,
         backtracked: bool = False,
+        extra_metadata: Optional[dict[str, Any]] = None,
     ) -> list[dict[str, Any]]:
         """Reassign multiple messages atomically to target_topic_id in chronological order."""
         if not message_ids:
@@ -728,6 +729,8 @@ class Database:
                     meta["backtracked"] = True
                     if old_topic_id != target_topic_id:
                         meta["reassigned_from"] = old_topic_id
+                if extra_metadata:
+                    meta.update(extra_metadata)
 
                 conn.execute(
                     "UPDATE messages SET topic_id = ?, metadata = ? WHERE id = ?",
@@ -757,3 +760,64 @@ class Database:
     ) -> Optional[dict[str, Any]]:
         updated = self.reassign_messages_topic([message_id], target_topic_id)
         return updated[0] if updated else None
+
+    def get_messages_by_ids(self, message_ids: list[str]) -> list[dict[str, Any]]:
+        if not message_ids:
+            return []
+        unique_ids = list(dict.fromkeys(message_ids))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY rowid ASC",
+                unique_ids,
+            ).fetchall()
+            return [self._hydrate_message_row(conn, r) for r in rows]
+
+    def list_general_messages_for_dream(
+        self,
+        *,
+        limit: int = 24,
+        include_checked: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return chronological 日常闲聊 messages eligible for background dream consolidation."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE topic_id = ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (GENERAL_TOPIC_ID, max(limit * 3, limit)),
+            ).fetchall()
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                meta = _parse_metadata(row["metadata"])
+                if meta.get("streaming"):
+                    continue
+                if not include_checked and meta.get("dream_checked_at"):
+                    continue
+                candidates.append(self._hydrate_message_row(conn, row))
+                if len(candidates) >= limit:
+                    break
+            candidates.reverse()
+            return candidates
+
+    def mark_messages_dream_checked(self, message_ids: list[str], checked_at: str) -> None:
+        if not message_ids:
+            return
+        unique_ids = list(dict.fromkeys(message_ids))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, metadata FROM messages WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            for row in rows:
+                meta = _parse_metadata(row["metadata"])
+                meta["dream_checked_at"] = checked_at
+                conn.execute(
+                    "UPDATE messages SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=False), row["id"]),
+                )
+            conn.commit()

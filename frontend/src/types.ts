@@ -164,6 +164,18 @@ export interface ReassignTopicResponse {
   topic: Topic;
 }
 
+export interface BatchReassignTopicPayload {
+  message_ids: string[];
+  action: 'move' | 'split';
+  target_topic_id?: string;
+  new_topic_title?: string;
+}
+
+export interface BatchReassignTopicResponse {
+  messages: Message[];
+  topic: Topic;
+}
+
 export interface ResumeRunPayload {
   decision: string;
   approved: boolean;

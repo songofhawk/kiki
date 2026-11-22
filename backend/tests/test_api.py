@@ -14,7 +14,13 @@ import pytest
 from app.config import Settings
 from app.db import Database
 from app.main import create_app
-from app.schemas import BacktrackDecision, RouteDecision
+from app.schemas import (
+    BacktrackDecision,
+    DreamConsolidationPlan,
+    DreamMigrationGroup,
+    DreamTopicSummaryUpdate,
+    RouteDecision,
+)
 from app.sse import EventBus
 
 
@@ -28,6 +34,8 @@ class FakeLLMClient:
         self.last_fast_history: list[dict[str, Any]] = []
         self.backtrack_calls: list[dict[str, Any]] = []
         self.backtrack_handler: Optional[Any] = None
+        self.dream_calls: list[dict[str, Any]] = []
+        self.dream_handler: Optional[Any] = None
         self.agent_script: list[Any] = []
         self._agent_turn = 0
 
@@ -76,6 +84,31 @@ class FakeLLMClient:
                 already_matched_messages=already_matched_messages or [],
             )
         return BacktrackDecision(matched_message_ids=[], reasoning="测试默认不回溯")
+
+    async def consolidate_dream(
+        self,
+        *,
+        active_topics: list[dict[str, Any]],
+        general_messages: list[dict[str, Any]],
+        topics_to_summarize: Optional[list[dict[str, Any]]] = None,
+    ) -> DreamConsolidationPlan:
+        self.dream_calls.append(
+            {
+                "active_topic_ids": [t["id"] for t in active_topics],
+                "general_message_ids": [m["id"] for m in general_messages],
+                "summarize_topic_ids": [t["id"] for t in (topics_to_summarize or [])],
+            }
+        )
+        if self.dream_handler is not None:
+            result = self.dream_handler(
+                active_topics=active_topics,
+                general_messages=general_messages,
+                topics_to_summarize=topics_to_summarize or [],
+            )
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        return DreamConsolidationPlan(reasoning="测试默认做梦无变更")
 
     async def stream_fast_reply(
         self,
@@ -578,3 +611,161 @@ async def test_upward_backtrack_stops_when_older_batch_unrelated_and_handles_reu
         assert res2.status_code == 200
         assert res2.json()["reassigned_messages"] == []
         assert len(fake_llm.backtrack_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_dream_consolidation_quietly_organizes_general_and_summaries(tmp_path: Path):
+    app, db, bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    dream = app.state.dream_consolidator
+
+    db.ensure_general_topic()
+    existing_topic = db.create_topic(title="社保办理")
+    db.create_message(existing_topic["id"], "user", "北京社保怎么查缴费记录？")
+    db.create_message(existing_topic["id"], "assistant", "可以在北京人社 App 查询。")
+
+    # Pure chitchat (should stay in topic-general and get marked dream_checked_at)
+    u_chat = db.create_message("topic-general", "user", "早安 Kiki")
+    a_chat = db.create_message("topic-general", "assistant", "早安喵~", metadata={"reply_to": u_chat["id"]})
+
+    # Stray messages belonging to existing_topic
+    u_stray = db.create_message("topic-general", "user", "对了，社保基数每年几月调整来着？")
+    a_stray = db.create_message("topic-general", "assistant", "通常在每年 7 月调整。", metadata={"reply_to": u_stray["id"]})
+
+    # Cohesive 2-turn cluster for a brand-new topic in general
+    u_trip1 = db.create_message("topic-general", "user", "下个月想去成都玩三天")
+    a_trip1 = db.create_message("topic-general", "assistant", "成都三天很合适！", metadata={"reply_to": u_trip1["id"]})
+    u_trip2 = db.create_message("topic-general", "user", "帮我推荐下宽窄巷子和熊猫基地的路线")
+    a_trip2 = db.create_message("topic-general", "assistant", "可以上午先去熊猫基地...", metadata={"reply_to": u_trip2["id"]})
+
+    def _dream_plan(**_kwargs: Any) -> DreamConsolidationPlan:
+        return DreamConsolidationPlan(
+            migrations=[
+                DreamMigrationGroup(
+                    action="move_to_existing",
+                    target_topic_id=existing_topic["id"],
+                    message_ids=[u_stray["id"]],  # pair expansion should pull a_stray too
+                    confidence=0.91,
+                    reasoning="属于已有社保话题",
+                ),
+                DreamMigrationGroup(
+                    action="create_topic",
+                    new_topic_title="成都三日游规划",
+                    new_topic_summary="成都三日游行程与景点路线安排",
+                    message_ids=[u_trip1["id"], a_trip1["id"], u_trip2["id"], a_trip2["id"]],
+                    confidence=0.89,
+                    reasoning="连续两轮聚焦成都旅游路线",
+                ),
+            ],
+            topic_summaries=[
+                DreamTopicSummaryUpdate(
+                    topic_id=existing_topic["id"],
+                    summary="北京社保缴费查询与基数调整咨询",
+                )
+            ],
+            reasoning="整理日常闲聊并补全话题摘要",
+        )
+
+    fake_llm.dream_handler = _dream_plan
+    sse_events: list[tuple[str, dict[str, Any]]] = []
+    original_publish = bus.publish
+    bus.publish = lambda et, payload: (sse_events.append((et, payload)), original_publish(et, payload))  # type: ignore[method-assign]
+
+    res = await dream.run_once(force=True)
+    assert res["ran"] is True
+    assert res["migrated_count"] == 6
+    assert len(res["created_topics"]) == 1
+    assert existing_topic["id"] in res["updated_summaries"]
+
+    # Pure chitchat remains in topic-general and is stamped dream_checked_at
+    general_msgs = db.list_messages(topic_id="topic-general")
+    assert [m["id"] for m in general_msgs] == [u_chat["id"], a_chat["id"]]
+    assert all(m["metadata"].get("dream_checked_at") for m in general_msgs)
+
+    # Summary updated on existing_topic and stray pair moved in
+    refreshed_existing = db.get_topic(existing_topic["id"])
+    assert refreshed_existing is not None
+    assert refreshed_existing["summary"] == "北京社保缴费查询与基数调整咨询"
+    assert refreshed_existing["message_count"] == 4
+    # Quietly consolidated without unread/toast
+    assert refreshed_existing["unread"] is False
+    assert not any(et == "toast_notification" for et, _ in sse_events)
+
+    # Running again without new messages or new topics sees nothing left to scan
+    res_again = await dream.run_once(force=True)
+    assert res_again["ran"] is False
+    assert res_again["reason"] == "nothing_to_consolidate"
+    assert len(fake_llm.dream_calls) == 1
+
+    # Activity interruption check (non-forced run aborts if user interrupts mid-dream)
+    u_new = db.create_message("topic-general", "user", "再问个新问题")
+    dream._last_activity_at -= 1000.0
+    dream._last_dream_at = 0.0
+
+    async def _interrupted_plan(**_kwargs: Any) -> DreamConsolidationPlan:
+        dream.notify_activity()
+        return DreamConsolidationPlan(
+            migrations=[
+                DreamMigrationGroup(
+                    action="move_to_existing",
+                    target_topic_id=existing_topic["id"],
+                    message_ids=[u_new["id"]],
+                    confidence=0.95,
+                )
+            ]
+        )
+
+    fake_llm.dream_handler = _interrupted_plan
+    aborted = await dream.run_once(force=False)
+    assert aborted["ran"] is False
+    assert aborted["reason"] == "interrupted_by_activity"
+    assert db.get_message(u_new["id"])["topic_id"] == "topic-general"
+
+
+@pytest.mark.asyncio
+async def test_batch_multi_select_message_topic_split_and_move(tmp_path: Path):
+    app, db, bus, _fake_llm, _db_path = _build_test_app(tmp_path)
+    db.ensure_general_topic()
+    m1 = db.create_message("topic-general", "user", "先聊聊基金定投")
+    m2 = db.create_message("topic-general", "assistant", "定投适合长期坚持喵", metadata={"reply_to": m1["id"]})
+    m3 = db.create_message("topic-general", "user", "每月投多少合适？")
+    m4 = db.create_message("topic-general", "assistant", "建议按闲钱比例安排", metadata={"reply_to": m3["id"]})
+
+    sse_events: list[tuple[str, dict[str, Any]]] = []
+    original_publish = bus.publish
+    bus.publish = lambda et, payload: (sse_events.append((et, payload)), original_publish(et, payload))  # type: ignore[method-assign]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. Batch split selected messages into a new topic
+        split_res = await client.post(
+            "/api/messages/batch-topic",
+            json={
+                "message_ids": [m1["id"], m2["id"], m3["id"]],
+                "action": "split",
+                "new_topic_title": "基金定投计划",
+            },
+        )
+        assert split_res.status_code == 200
+        split_body = split_res.json()
+        new_tid = split_body["topic"]["id"]
+        assert split_body["topic"]["title"] == "基金定投计划"
+        assert [m["id"] for m in split_body["messages"]] == [m1["id"], m2["id"], m3["id"]]
+        assert all(m["topic_id"] == new_tid for m in split_body["messages"])
+        assert db.get_message(m4["id"])["topic_id"] == "topic-general"
+
+        # 2. Batch move remaining m4 into that topic
+        move_res = await client.post(
+            "/api/messages/batch-topic",
+            json={
+                "message_ids": [m4["id"]],
+                "action": "move",
+                "target_topic_id": new_tid,
+            },
+        )
+        assert move_res.status_code == 200
+        assert move_res.json()["messages"][0]["topic_id"] == new_tid
+        assert move_res.json()["topic"]["message_count"] == 4
+
+        updated_msg_ids = [p["message"]["id"] for et, p in sse_events if et == "message_updated"]
+        assert updated_msg_ids == [m1["id"], m2["id"], m3["id"], m4["id"]]

@@ -56,8 +56,8 @@ function getArtifactIcon(fileType: string) {
 }
 
 const DEFAULT_STEP_TEXT: Record<SessionRun['status'], string> = {
-  queued: '正在排队等待后台 Agent 接单...',
-  running: 'Kiki 正在后台执行任务...',
+  queued: 'Kiki 正在叼信派单给后台 Agent...',
+  running: 'Kiki 正在后台敲键盘专注干活...',
   waiting_input: '等待你的拍板确认...',
   completed: '后台任务已完成',
   failed: '后台任务执行失败',
@@ -126,8 +126,9 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   const renderStatusIcon = () => {
     switch (sessionRun.status) {
       case 'queued':
+        return <KikiAvatar status="running" pose="delivering" size="sm" />;
       case 'running':
-        return <KikiAvatar status="running" size="sm" />;
+        return <KikiAvatar status="running" pose="working" size="sm" />;
       case 'waiting_input':
         return <KikiAvatar status="waiting_input" size="sm" />;
       case 'completed':

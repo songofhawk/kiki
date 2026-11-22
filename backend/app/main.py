@@ -12,10 +12,13 @@ from fastapi.responses import StreamingResponse
 from .adapters import AdapterRegistry, create_default_registry
 from .config import Settings, get_settings
 from .db import Database
+from .dream import DreamConsolidator
 from .llm import KikiLLMClient
 from .router import DecisionRouter, FastPathService
 from .schemas import (
     AdapterInfoResponse,
+    BatchMessageTopicReassignRequest,
+    BatchMessageTopicReassignResponse,
     ChatRequest,
     ChatResponse,
     HealthResponse,
@@ -78,12 +81,22 @@ def create_app(
         event_bus=bus,
         idle_status_provider=task_manager.compute_kiki_status,
     )
+    dream_consolidator = DreamConsolidator(
+        db=database,
+        llm=llm_client,
+        event_bus=bus,
+        is_busy_provider=lambda: (
+            fast_path.is_busy or task_manager.compute_kiki_status() != "idle"
+        ),
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         database.init_db()
         cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        dream_consolidator.start()
         yield
+        await dream_consolidator.shutdown()
         await fast_path.shutdown()
         await task_manager.shutdown()
 
@@ -102,6 +115,7 @@ def create_app(
     app.state.task_manager = task_manager
     app.state.decision_router = decision_router
     app.state.fast_path = fast_path
+    app.state.dream_consolidator = dream_consolidator
 
     app.add_middleware(
         CORSMiddleware,
@@ -138,6 +152,7 @@ def create_app(
     @app.post("/api/topics", response_model=TopicSummary, status_code=201)
     async def create_topic(req: TopicCreateRequest) -> TopicSummary:
         topic = database.create_topic(title=req.title, summary=req.summary)
+        dream_consolidator.notify_activity(topic_created=True)
         bus.publish("topic_created", {"topic": topic})
         return TopicSummary.model_validate(topic)
 
@@ -194,6 +209,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid action")
 
         source_topic_id = existing_msg["topic_id"]
+        dream_consolidator.notify_activity(topic_created=(req.action == "split"))
         updated_msg = database.reassign_message_topic(message_id, target_topic["id"])
         if updated_msg is None:
             raise HTTPException(status_code=404, detail="Message not found")
@@ -211,19 +227,70 @@ def create_app(
             topic=TopicSummary.model_validate(refreshed_topic),
         )
 
+    @app.post("/api/messages/batch-topic", response_model=BatchMessageTopicReassignResponse)
+    async def batch_reassign_message_topics(
+        req: BatchMessageTopicReassignRequest,
+    ) -> BatchMessageTopicReassignResponse:
+        existing_msgs = database.get_messages_by_ids(req.message_ids)
+        if not existing_msgs:
+            raise HTTPException(status_code=404, detail="Messages not found")
+
+        if req.action == "split":
+            title = (req.new_topic_title or "").strip()
+            if not title:
+                first_user = next((m for m in existing_msgs if m["role"] == "user"), existing_msgs[0])
+                snippet = " ".join(first_user["content"].strip().split())
+                title = snippet[:18] + ("…" if len(snippet) > 18 else "") or "拆分话题"
+            target_topic = database.create_topic(title=title)
+            bus.publish("topic_created", {"topic": target_topic})
+        elif req.action == "move":
+            if not req.target_topic_id:
+                raise HTTPException(
+                    status_code=400, detail="target_topic_id is required for action='move'"
+                )
+            target_topic = database.get_topic(req.target_topic_id)
+            if target_topic is None:
+                raise HTTPException(status_code=404, detail="Target topic not found")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid action")
+
+        source_topic_ids = {m["topic_id"] for m in existing_msgs if m["topic_id"] != target_topic["id"]}
+        dream_consolidator.notify_activity(topic_created=(req.action == "split"))
+        updated_msgs = database.reassign_messages_topic(
+            [m["id"] for m in existing_msgs],
+            target_topic["id"],
+        )
+        enriched_msgs = [_enrich_message(m, bus) for m in updated_msgs]
+        for em in enriched_msgs:
+            bus.publish("message_updated", {"message": em})
+
+        for src_id in source_topic_ids:
+            src_topic = database.get_topic(src_id)
+            if src_topic:
+                bus.publish("topic_updated", {"topic": src_topic})
+        refreshed_topic = database.get_topic(target_topic["id"]) or target_topic
+        bus.publish("topic_updated", {"topic": refreshed_topic})
+
+        return BatchMessageTopicReassignResponse(
+            messages=[MessageItem.model_validate(m) for m in enriched_msgs],
+            topic=TopicSummary.model_validate(refreshed_topic),
+        )
+
     # ------------------------------------------------------------------
     # Chat (Dual-Path Entry)
     # ------------------------------------------------------------------
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> ChatResponse:
+        dream_consolidator.notify_activity()
         try:
-            decision, topic, _created, reassigned_messages = await decision_router.route(
+            decision, topic, created, reassigned_messages = await decision_router.route(
                 content=req.content,
                 focus_topic_id=req.focus_topic_id,
                 force_path=req.force_path,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        dream_consolidator.notify_activity(topic_created=created)
 
         user_meta = {
             "path": decision.path,
