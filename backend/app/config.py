@@ -24,6 +24,7 @@ class Settings:
     database_path: Path
     artifacts_dir: Path
     gemini_fallback_model: str = "gemini-3.1-flash-lite"
+    default_heavy_agent: str = "gemini_agent"
 
     @property
     def api_key_configured(self) -> bool:
@@ -51,6 +52,7 @@ def load_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         gemini_fallback_model=os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
+        default_heavy_agent=os.getenv("KIKI_DEFAULT_HEAVY_AGENT", "gemini_agent"),
         workspace_root=workspace_root,
         database_path=db_path,
         artifacts_dir=artifacts_dir,

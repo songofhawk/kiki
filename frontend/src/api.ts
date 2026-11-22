@@ -1,4 +1,5 @@
 import type {
+  AdapterInfo,
   Artifact,
   ChatRequest,
   ChatResponse,
@@ -42,6 +43,10 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function fetchHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>('/health');
+}
+
+export async function fetchAdapters(): Promise<AdapterInfo[]> {
+  return requestJson<AdapterInfo[]>('/adapters');
 }
 
 export async function fetchTopics(): Promise<Topic[]> {

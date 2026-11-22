@@ -182,6 +182,9 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
 
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-md bg-[#EFEAE2] text-[#575049] shrink-0">
+                {sessionRun.agent_type}
+              </span>
               <span className="text-xs font-medium text-[#262422] truncate">
                 {sessionRun.current_step || DEFAULT_STEP_TEXT[sessionRun.status]}
               </span>

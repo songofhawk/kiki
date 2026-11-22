@@ -9,11 +9,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from .adapters import AdapterRegistry, create_default_registry
 from .config import Settings, get_settings
 from .db import Database
 from .llm import KikiLLMClient
 from .router import DecisionRouter, FastPathService
 from .schemas import (
+    AdapterInfoResponse,
     ChatRequest,
     ChatResponse,
     HealthResponse,
@@ -45,11 +47,16 @@ def create_app(
     db: Optional[Database] = None,
     llm: Optional[KikiLLMClient] = None,
     event_bus: Optional[EventBus] = None,
+    adapter_registry: Optional[AdapterRegistry] = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
     database = db or Database(cfg.database_path)
     bus = event_bus or EventBus()
     llm_client = llm or KikiLLMClient(cfg)
+    registry = adapter_registry or create_default_registry(
+        gemini_model=cfg.gemini_model,
+        gemini_api_key_configured=cfg.api_key_configured,
+    )
     tool_executor = WorkspaceToolExecutor(
         workspace_root=cfg.workspace_root,
         artifacts_dir=cfg.artifacts_dir,
@@ -61,6 +68,8 @@ def create_app(
         llm=llm_client,
         event_bus=bus,
         tool_executor=tool_executor,
+        adapter_registry=registry,
+        settings=cfg,
     )
     decision_router = DecisionRouter(db=database, llm=llm_client, event_bus=bus)
     fast_path = FastPathService(
@@ -89,6 +98,7 @@ def create_app(
     app.state.db = database
     app.state.llm = llm_client
     app.state.event_bus = bus
+    app.state.adapter_registry = registry
     app.state.task_manager = task_manager
     app.state.decision_router = decision_router
     app.state.fast_path = fast_path
@@ -102,7 +112,7 @@ def create_app(
     )
 
     # ------------------------------------------------------------------
-    # Health
+    # Health & Heavy-Path Adapters
     # ------------------------------------------------------------------
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -112,6 +122,10 @@ def create_app(
             database_path=str(cfg.database_path),
             api_key_configured=cfg.api_key_configured,
         )
+
+    @app.get("/api/adapters", response_model=list[AdapterInfoResponse])
+    async def list_adapters() -> list[AdapterInfoResponse]:
+        return [AdapterInfoResponse.model_validate(info.to_dict()) for info in registry.list_infos()]
 
     # ------------------------------------------------------------------
     # Topics
@@ -224,12 +238,17 @@ def create_app(
         session_run: Optional[dict[str, Any]] = None
 
         if decision.path == "heavy":
-            session_run = task_manager.enqueue_run(
-                topic_id=topic["id"],
-                trigger_message_id=user_msg["id"],
-                user_content=req.content,
-                agent_type="gemini_agent",
-            )
+            try:
+                session_run = task_manager.enqueue_run(
+                    topic_id=topic["id"],
+                    trigger_message_id=user_msg["id"],
+                    user_content=req.content,
+                    agent_type=req.agent_type,
+                    model_override=req.model,
+                    thinking_override=req.thinking_level,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             # Re-fetch user message so it includes linked session_run
             refreshed_user_msg = database.get_message(user_msg["id"])
             if refreshed_user_msg:

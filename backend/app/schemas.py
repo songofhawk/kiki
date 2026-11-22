@@ -138,10 +138,30 @@ class MessageItem(BaseModel):
     session_run: Optional[SessionRunDetail] = None
 
 
+class AdapterInfoResponse(BaseModel):
+    id: str
+    name: str
+    vendor: str
+    description: str
+    category: Literal["builtin", "cli", "hybrid"]
+    available: bool
+    binary_path: Optional[str] = None
+    install_hint: str
+    default_model: str
+    models: dict[str, str] = Field(default_factory=dict)
+    supports_resume: bool = True
+    supports_streaming: bool = True
+    supports_hitl: bool = True
+    aliases: list[str] = Field(default_factory=list)
+
+
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1)
     focus_topic_id: Optional[str] = None
     force_path: Optional[Literal["fast", "heavy"]] = None
+    agent_type: Optional[str] = None
+    model: Optional[str] = None
+    thinking_level: Optional[Literal["low", "medium", "high"]] = None
 
 
 class ChatResponse(BaseModel):

@@ -76,9 +76,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </h1>
               <span
                 title={sseConnected ? '实时事件流已连接' : '事件流重连中'}
-                className={`w-2 h-2 rounded-full ${
-                  sseConnected ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'
-                }`}
+                className={`w-2 h-2 rounded-full ${sseConnected ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'
+                  }`}
               />
             </div>
             <p className="text-[11px] text-[#7D756C] truncate">Personal Agent</p>
@@ -91,17 +90,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={onSelectAllStream}
-          className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${
-            focusTopicId === null
+          className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${focusTopicId === null
               ? 'bg-white text-[#262422] shadow-sm border border-[#E5DED4]'
               : 'text-[#5A534C] hover:bg-[#ECE6DD] border border-transparent'
-          }`}
+            }`}
         >
           <span className="flex items-center gap-2.5">
             <Layers
-              className={`w-4 h-4 ${
-                focusTopicId === null ? 'text-[#5B7A95]' : 'text-[#8C8378]'
-              }`}
+              className={`w-4 h-4 ${focusTopicId === null ? 'text-[#5B7A95]' : 'text-[#8C8378]'
+                }`}
             />
             <span>All Stream</span>
             <span className="text-[11px] text-[#8C8378] font-normal">全局流</span>
@@ -169,19 +166,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   }
                 }}
                 onDrop={(e) => handleDrop(e, topic.id)}
-                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border ${
-                  isDragTarget
+                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border ${isDragTarget
                     ? 'bg-amber-50 border-amber-400 ring-2 ring-amber-300/60 scale-[1.01]'
                     : isSelected
-                    ? 'bg-white text-[#262422] font-semibold border-[#E5DED4] shadow-sm'
-                    : 'text-[#4E4842] hover:bg-[#ECE6DD] border-transparent'
-                }`}
+                      ? 'bg-white text-[#262422] font-semibold border-[#E5DED4] shadow-sm'
+                      : 'text-[#4E4842] hover:bg-[#ECE6DD] border-transparent'
+                  }`}
               >
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <Hash
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      isSelected ? 'text-[#5B7A95]' : 'text-[#9A9187]'
-                    }`}
+                    className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-[#5B7A95]' : 'text-[#9A9187]'
+                      }`}
                   />
                   <span className="truncate">{topic.title}</span>
                 </div>
@@ -214,20 +209,38 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* Bottom Pinned Kiki Status Card */}
+      {/* Bottom Pinned Kiki Sprite Stage */}
       <div className="p-3 border-t border-[#E8E2D9]">
-        <div className="rounded-2xl bg-[#FAF8F5] border border-[#E6DFD5] p-3 flex items-center gap-3">
-          <KikiAvatar status={globalKikiStatus} size="lg" />
-          <div className="min-w-0 flex-1">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-[#8C8378]">
-              Kiki 状态
-            </div>
-            <div className="mt-0.5 text-xs font-semibold text-[#262422] leading-snug">
+        <div
+          className={`rounded-2xl border p-3 flex flex-col items-center text-center transition-colors ${globalKikiStatus === 'waiting_input'
+              ? 'bg-amber-50/70 border-amber-300'
+              : globalKikiStatus === 'running'
+                ? 'bg-[#EEF4F8] border-[#C9DAE8]'
+                : 'bg-[#FAF8F5] border-[#E6DFD5]'
+            }`}
+        >
+          <div className="w-full flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-[#8C8378] mb-1">
+            <span>Kiki 精灵</span>
+            <span
+              className={`px-2 py-0.5 rounded-full font-medium normal-case tracking-normal ${globalKikiStatus === 'waiting_input'
+                  ? 'bg-amber-200/80 text-amber-900'
+                  : globalKikiStatus === 'running'
+                    ? 'bg-[#5B7A95]/15 text-[#3B5972]'
+                    : globalKikiStatus === 'thinking'
+                      ? 'bg-[#EAE4DC] text-[#4E4842]'
+                      : 'bg-[#ECE6DD] text-[#6F6860]'
+                }`}
+            >
               {KIKI_STATUS_LABELS[globalKikiStatus]}
-            </div>
-            <div className="mt-1 text-[10px] text-[#8C8378]">
-              拖拽气泡可快速改绑话题
-            </div>
+            </span>
+          </div>
+
+          <div className="my-1 flex items-center justify-center">
+            <KikiAvatar status={globalKikiStatus} size="hero" />
+          </div>
+
+          <div className="text-[10px] text-[#8C8378] mt-0.5">
+            拖拽消息气泡可快速改绑话题
           </div>
         </div>
       </div>

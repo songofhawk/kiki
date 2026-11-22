@@ -118,10 +118,30 @@ export interface Message {
   streaming?: boolean;
 }
 
+export interface AdapterInfo {
+  id: string;
+  name: string;
+  vendor: string;
+  description: string;
+  category: 'builtin' | 'cli' | 'hybrid';
+  available: boolean;
+  binary_path?: string | null;
+  install_hint: string;
+  default_model: string;
+  models: Record<string, string>;
+  supports_resume: boolean;
+  supports_streaming: boolean;
+  supports_hitl: boolean;
+  aliases: string[];
+}
+
 export interface ChatRequest {
   content: string;
   focus_topic_id?: string | null;
   force_path?: 'fast' | 'heavy' | null;
+  agent_type?: string | null;
+  model?: string | null;
+  thinking_level?: 'low' | 'medium' | 'high' | null;
 }
 
 export interface ChatResponse {

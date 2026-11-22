@@ -120,10 +120,8 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
     return (
       <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-10 flex flex-col items-center justify-center">
         <div className="max-w-xl w-full text-center space-y-6 animate-kiki-fade-up">
-          <div className="flex flex-col items-center gap-3">
-            <div className="w-24 h-24 rounded-3xl bg-white border border-[#E8E2D9] shadow-sm flex items-center justify-center">
-              <KikiAvatar status="idle" size="xl" />
-            </div>
+          <div className="flex flex-col items-center gap-2">
+            <KikiAvatar status="idle" size="hero" />
             <div>
               <h2 className="text-xl font-semibold text-[#262422] tracking-tight">
                 {focusTopicId ? '这个话题还没有消息' : '你好，我是 Kiki'}

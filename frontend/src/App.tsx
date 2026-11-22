@@ -14,6 +14,7 @@ import {
   cancelRun,
   connectEventStream,
   createTopic,
+  fetchAdapters,
   fetchHealth,
   fetchMessages,
   fetchRun,
@@ -24,6 +25,7 @@ import {
   updateTopic,
 } from './api';
 import type {
+  AdapterInfo,
   HealthResponse,
   KikiStatus,
   Message,
@@ -57,11 +59,11 @@ function upsertMessage(list: Message[], incoming: Message): Message[] {
     return list.map((m, i) =>
       i === idx
         ? {
-            ...m,
-            ...incoming,
-            session_run: incoming.session_run ?? m.session_run,
-            topic: incoming.topic ?? m.topic,
-          }
+          ...m,
+          ...incoming,
+          session_run: incoming.session_run ?? m.session_run,
+          topic: incoming.topic ?? m.topic,
+        }
         : m
     );
   }
@@ -94,6 +96,8 @@ function mergeRun(prev: SessionRun | undefined, incoming: SessionRun): SessionRu
 
 export const App: React.FC = () => {
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
+  const [selectedAgentType, setSelectedAgentType] = useState<string>('gemini_agent');
   const [topics, setTopics] = useState<Topic[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [runsById, setRunsById] = useState<Record<string, SessionRun>>({});
@@ -144,12 +148,14 @@ export const App: React.FC = () => {
   // Hydrate initial state
   const loadInitialData = useCallback(async () => {
     try {
-      const [healthRes, topicsRes, messagesRes] = await Promise.all([
+      const [healthRes, adaptersRes, topicsRes, messagesRes] = await Promise.all([
         fetchHealth().catch(() => null),
+        fetchAdapters().catch(() => []),
         fetchTopics(),
         fetchMessages(),
       ]);
       if (healthRes) setHealth(healthRes);
+      if (adaptersRes.length > 0) setAdapters(adaptersRes);
       setTopics(topicsRes);
       setMessages(messagesRes);
 
@@ -247,7 +253,7 @@ export const App: React.FC = () => {
         }
         fetchTopics()
           .then((list) => setTopics(list))
-          .catch(() => {});
+          .catch(() => { });
       },
       onRunUpdated: ({ run }) => {
         setRunsById((prev) => ({
@@ -261,7 +267,7 @@ export const App: React.FC = () => {
         ) {
           fetchTopics()
             .then((list) => setTopics(list))
-            .catch(() => {});
+            .catch(() => { });
         }
       },
       onStepLog: ({ run_id, step_log }) => {
@@ -387,7 +393,7 @@ export const App: React.FC = () => {
         setTopics((prev) =>
           prev.map((t) => (t.id === topicId ? { ...t, unread: false } : t))
         );
-        updateTopic(topicId, { unread: false }).catch(() => {});
+        updateTopic(topicId, { unread: false }).catch(() => { });
       }
     },
     [topics]
@@ -427,6 +433,7 @@ export const App: React.FC = () => {
           content,
           focus_topic_id: focusTopicId,
           force_path: pathOption === 'auto' ? null : pathOption,
+          agent_type: selectedAgentType,
         });
 
         if (res.topic) {
@@ -471,7 +478,7 @@ export const App: React.FC = () => {
         setSending(false);
       }
     },
-    [inputText, sending, focusTopicId, pathOption]
+    [inputText, sending, focusTopicId, pathOption, selectedAgentType]
   );
 
   const handleReassignMessage = useCallback(
@@ -492,7 +499,7 @@ export const App: React.FC = () => {
         // Refresh topics to keep counts accurate
         fetchTopics()
           .then((list) => setTopics(list))
-          .catch(() => {});
+          .catch(() => { });
       } catch (err) {
         setErrorBanner(
           err instanceof Error ? err.message : '调整话题归属失败'
@@ -698,37 +705,57 @@ export const App: React.FC = () => {
         <div className="shrink-0 px-4 sm:px-6 lg:px-8 pb-4 pt-2 bg-gradient-to-t from-[#FAF8F5] via-[#FAF8F5] to-transparent">
           <div className="max-w-3xl mx-auto">
             {/* Subtle Path Toggle Row */}
-            <div className="flex items-center justify-between mb-1.5 px-1">
-              <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-[#F1ECE5] border border-[#E5DED4]">
-                {(
-                  [
-                    { id: 'auto', label: '自动路由', icon: Compass },
-                    { id: 'fast', label: '轻量', icon: Zap },
-                    { id: 'heavy', label: '重型', icon: Cpu },
-                  ] as const
-                ).map((opt) => {
-                  const Icon = opt.icon;
-                  const active = pathOption === opt.id;
-                  return (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setPathOption(opt.id)}
-                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all ${
-                        active
-                          ? 'bg-white text-[#262422] shadow-sm'
-                          : 'text-[#7A7269] hover:text-[#262422]'
-                      }`}
-                    >
-                      <Icon
-                        className={`w-3 h-3 ${
-                          active ? 'text-[#5B7A95]' : 'text-[#9A9187]'
-                        }`}
-                      />
-                      {opt.label}
-                    </button>
-                  );
-                })}
+            <div className="flex items-center justify-between gap-2 mb-1.5 px-1 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-[#F1ECE5] border border-[#E5DED4]">
+                  {(
+                    [
+                      { id: 'auto', label: '自动路由', icon: Compass },
+                      { id: 'fast', label: '轻量', icon: Zap },
+                      { id: 'heavy', label: '重型', icon: Cpu },
+                    ] as const
+                  ).map((opt) => {
+                    const Icon = opt.icon;
+                    const active = pathOption === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setPathOption(opt.id)}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all ${active
+                            ? 'bg-white text-[#262422] shadow-sm'
+                            : 'text-[#7A7269] hover:text-[#262422]'
+                          }`}
+                      >
+                        <Icon
+                          className={`w-3 h-3 ${active ? 'text-[#5B7A95]' : 'text-[#9A9187]'
+                            }`}
+                        />
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {adapters.length > 0 && pathOption !== 'fast' && (
+                  <select
+                    aria-label="选择重型任务执行器"
+                    value={selectedAgentType}
+                    onChange={(e) => setSelectedAgentType(e.target.value)}
+                    title={
+                      adapters.find((a) => a.id === selectedAgentType)?.install_hint ??
+                      '选择重型任务 Adapter'
+                    }
+                    className="h-7 px-2 rounded-xl text-[11px] font-medium bg-white text-[#4E4740] border border-[#E5DED4] focus:outline-none focus:border-[#5B7A95] cursor-pointer"
+                  >
+                    {adapters.map((adapter) => (
+                      <option key={adapter.id} value={adapter.id}>
+                        {adapter.available ? '● ' : '○ '}
+                        {adapter.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </div>
 
               <span className="text-[11px] text-[#9A9187] hidden sm:inline">
@@ -767,8 +794,8 @@ export const App: React.FC = () => {
               </div>
 
               {/* Kiki sitting right next to the composer */}
-              <div className="hidden sm:flex items-center justify-center pb-0.5 shrink-0">
-                <KikiAvatar status={composerKikiStatus} size="md" />
+              <div className="hidden sm:flex items-center justify-center -mb-1 shrink-0">
+                <KikiAvatar status={composerKikiStatus} size="lg" />
               </div>
             </div>
           </div>
