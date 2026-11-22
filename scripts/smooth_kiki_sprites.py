@@ -13,6 +13,7 @@ Usage: python3 scripts/smooth_kiki_sprites.py
 """
 from __future__ import annotations
 
+import math
 import struct
 from pathlib import Path
 
@@ -23,13 +24,13 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "assets" / "kiki"
 DST = ROOT / "frontend" / "public" / "kiki"
 
-OUT_SIZE = 288  # displayed at <=144px CSS, so 288px is plenty even at 2x
+OUT_SIZE = 256  # displayed at <=144px CSS, so 288px is plenty even at 2x
 STEP_MS = 60  # duration of each in-between frame
 
 # Poses to smooth. working/delivering are intentionally fast cycles and stay as-is.
 POSES = ["idle", "idle_lazy", "idle_playful", "thinking", "waiting_input"]
 
-# Slow the held key poses slightly so the cat feels less twitchy.
+# Slow the held key poses so the cat feels less twitchy.
 HOLD_SCALE = {
     "idle": 1.0,
     "idle_lazy": 1.15,
@@ -37,6 +38,19 @@ HOLD_SCALE = {
     "thinking": 1.2,
     "waiting_input": 1.3,
 }
+
+# Every real pose must be held for a while before the next movement starts: the cat
+# should not be moving all the time. Quick frames (blink halves) are exempt.
+MIN_HOLD_MS = {
+    "idle": 1600,
+    "idle_lazy": 2600,
+    "idle_playful": 2000,
+    "thinking": 2200,
+    "waiting_input": 1800,
+}
+
+META_TS = ROOT / "frontend" / "src" / "components" / "kikiSpriteMeta.ts"
+LOOP_MS: dict[str, int] = {}
 
 
 def read_durations(path: Path) -> list[int]:
@@ -86,11 +100,35 @@ def squash(a: np.ndarray, sx: float, sy: float) -> np.ndarray:
     return np.asarray(canvas, dtype=np.float32) / 255.0
 
 
-# Squash & stretch keyframes used to hide a pose change (sx, sy, ms).
-# Cross-dissolving two *different* poses leaves a ghost, so big changes are cut
-# on the beat of a tiny body squash: anticipate (press down) -> cut -> overshoot -> settle.
-ANTICIPATE = [(1.015, 0.975, 70), (1.035, 0.94, 80)]
-OVERSHOOT = [(0.985, 1.035, 80), (1.005, 0.99, 70)]
+# Squash & stretch pose-change beat. Cross-dissolving two *different* poses leaves a
+# ghost, so big changes are hidden behind a slow, eased body motion instead:
+# settle down (anticipation) -> brief dissolve at the lowest point -> spring back up.
+ANTICIPATE_MS = 480  # slow press-down before the pose changes
+MID_DISSOLVE_STEPS = 2  # very short, only while the body is squashed low
+RECOVER_MS = 620  # damped spring back to normal after the new pose appears
+MAX_SQUASH = 0.075  # how far the body presses down (fraction of height)
+STEP_MS_MOTION = 60
+
+
+def _squash_scale(depth: float) -> tuple[float, float]:
+    """depth>0 = pressed down & wider, depth<0 = stretched up & narrower."""
+    return 1.0 + depth * MAX_SQUASH * 0.55, 1.0 - depth * MAX_SQUASH
+
+
+def anticipate_curve() -> list[tuple[float, float]]:
+    n = round(ANTICIPATE_MS / STEP_MS_MOTION)
+    return [_squash_scale(smoothstep(k / n)) for k in range(1, n + 1)]
+
+
+def recover_curve() -> list[tuple[float, float]]:
+    n = round(RECOVER_MS / STEP_MS_MOTION)
+    out = []
+    for k in range(n):
+        t = k / n
+        depth = math.exp(-3.2 * t) * math.cos(5.0 * t)  # 1 -> overshoot (<0) -> settle
+        out.append(_squash_scale(depth))
+    return out
+
 
 QUICK_HOLD_MS = 150  # blink half-frames etc.: plain cut, they are meant to be fast
 SMALL_DIFF = 0.07  # nearly identical poses: a short dissolve shows no ghost
@@ -99,7 +137,12 @@ SMALL_DIFF = 0.07  # nearly identical poses: a short dissolve shows no ghost
 def build(name: str) -> None:
     src = SRC / f"{name}.webp"
     frames = load_frames(src)
-    holds = [max(1, round(d * HOLD_SCALE[name])) for d in read_durations(src)]
+    holds = []
+    for d in read_durations(src):
+        h = max(1, round(d * HOLD_SCALE[name]))
+        if d >= QUICK_HOLD_MS:
+            h = max(h, MIN_HOLD_MS[name])
+        holds.append(h)
     out_imgs: list[Image.Image] = []
     out_durs: list[int] = []
 
@@ -120,10 +163,15 @@ def build(name: str) -> None:
                 emit(cur * (1 - t) + nxt * t, STEP_MS)
         else:
             emit(cur, holds[i])
-            for sx, sy, ms in ANTICIPATE:
-                emit(squash(cur, sx, sy), ms)
-            for sx, sy, ms in OVERSHOOT:
-                emit(squash(nxt, sx, sy), ms)
+            for sx, sy in anticipate_curve():
+                emit(squash(cur, sx, sy), STEP_MS_MOTION)
+            low_x, low_y = _squash_scale(1.0)
+            low_cur, low_nxt = squash(cur, low_x, low_y), squash(nxt, low_x, low_y)
+            for k in range(1, MID_DISSOLVE_STEPS + 1):
+                t = k / (MID_DISSOLVE_STEPS + 1)
+                emit(low_cur * (1 - t) + low_nxt * t, STEP_MS_MOTION)
+            for sx, sy in recover_curve():
+                emit(squash(nxt, sx, sy), STEP_MS_MOTION)
     DST.mkdir(parents=True, exist_ok=True)
     dst = DST / f"{name}.webp"
     out_imgs[0].save(
@@ -132,13 +180,20 @@ def build(name: str) -> None:
         append_images=out_imgs[1:],
         duration=out_durs,
         loop=0,
-        quality=75,
+        quality=70,
         alpha_quality=85,
         method=4,
     )
+    LOOP_MS[name] = sum(out_durs)
     print(f"{name}: {n} key poses -> {len(out_imgs)} frames, {sum(out_durs)}ms loop, {dst.stat().st_size // 1024}KB")
 
 
 if __name__ == "__main__":
     for p in POSES:
         build(p)
+    body = "\n".join(f"  {k}: {v}," for k, v in LOOP_MS.items())
+    META_TS.write_text(
+        "// Generated by scripts/smooth_kiki_sprites.py - do not edit by hand.\n"
+        "/** One full loop of each smoothed animated WebP, in ms. */\n"
+        f"export const KIKI_LOOP_MS = {{\n{body}\n}} as const;\n"
+    )

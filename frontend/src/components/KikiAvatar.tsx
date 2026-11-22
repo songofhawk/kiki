@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { KikiStatus } from '../types';
+import { KIKI_LOOP_MS } from './kikiSpriteMeta';
 
 export type KikiPose =
   | 'idle'
@@ -38,7 +39,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261123b';
+const ASSET_VER = 'v=20261123d';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
@@ -74,13 +75,13 @@ const FADE_MS = 220;
  * smoothed WebP (see scripts/smooth_kiki_sprites.py), so the routine is never cut mid-motion.
  */
 const BURST_MS: Record<'idle_lazy' | 'idle_playful', number> = {
-  idle_lazy: 7700,
-  idle_playful: 6400,
+  idle_lazy: KIKI_LOOP_MS.idle_lazy,
+  idle_playful: KIKI_LOOP_MS.idle_playful,
 };
 
 /** Quiet rest between one ambient routine ending and the next one starting. */
-const REST_MIN_MS = 14000;
-const REST_JITTER_MS = 9000;
+const REST_MIN_MS = 20000;
+const REST_JITTER_MS = 15000;
 
 const POSE_MOTION_CLASS: Record<KikiPose, string> = {
   idle: 'animate-kiki-breathe origin-bottom',
