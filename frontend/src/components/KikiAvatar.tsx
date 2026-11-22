@@ -60,6 +60,15 @@ const STATIC_PNG_SRC: Record<KikiPose, string> = {
   waiting_input: `/kiki/waiting_input.png?${ASSET_VER}`,
 };
 
+interface SpriteLayer {
+  key: string;
+  src: string;
+  motion: string;
+}
+
+/** Keep in sync with `kikiFadeIn` / `kikiFadeOut` duration in tailwind.config.js */
+const FADE_MS = 520;
+
 const POSE_MOTION_CLASS: Record<KikiPose, string> = {
   idle: 'animate-kiki-breathe origin-bottom',
   idle_lazy: 'origin-bottom',
@@ -209,6 +218,38 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
     setUsePngFallback(false);
   }, [resolvedPose, effectiveAnimated]);
 
+  const imgSrc =
+    !effectiveAnimated || usePngFallback
+      ? STATIC_PNG_SRC[resolvedPose]
+      : ANIMATED_WEBP_SRC[resolvedPose];
+  const motionClass = effectiveAnimated ? POSE_MOTION_CLASS[resolvedPose] : '';
+  const layerKey = `${resolvedPose}-${effectiveAnimated ? 'anim' : 'static'}`;
+
+  // Cross-fade between poses instead of hard-cutting the <img>, so pose changes feel organic.
+  const currentLayerRef = useRef<SpriteLayer>({ key: layerKey, src: imgSrc, motion: motionClass });
+  const [outgoing, setOutgoing] = useState<SpriteLayer | null>(null);
+  const fadeTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const prev = currentLayerRef.current;
+    currentLayerRef.current = { key: layerKey, src: imgSrc, motion: motionClass };
+    if (prev.key === layerKey) return;
+    setOutgoing(prev);
+    if (fadeTimerRef.current !== null) window.clearTimeout(fadeTimerRef.current);
+    fadeTimerRef.current = window.setTimeout(() => {
+      setOutgoing(null);
+      fadeTimerRef.current = null;
+    }, FADE_MS + 40);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layerKey]);
+
+  useEffect(
+    () => () => {
+      if (fadeTimerRef.current !== null) window.clearTimeout(fadeTimerRef.current);
+    },
+    []
+  );
+
   const labelText =
     (isCompanionIdle && ambientQuip) || KIKI_POSE_LABELS[resolvedPose] || KIKI_STATUS_LABELS[status];
 
@@ -224,13 +265,6 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
       triggerMoodBurst('idle_lazy', '呼噜呼噜…揉脑门好犯困呀 zZ');
     }
   };
-
-  const imgSrc =
-    !effectiveAnimated || usePngFallback
-      ? STATIC_PNG_SRC[resolvedPose]
-      : ANIMATED_WEBP_SRC[resolvedPose];
-
-  const motionClass = effectiveAnimated ? POSE_MOTION_CLASS[resolvedPose] : '';
 
   const sprite = (
     <div
@@ -271,16 +305,33 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
         <span className="absolute top-0.5 left-1/2 -translate-x-1/2 w-5 h-5 rounded-full bg-amber-400/30 animate-ping pointer-events-none" />
       )}
 
-      <img
-        key={`${resolvedPose}-${effectiveAnimated ? 'anim' : 'static'}`}
-        src={imgSrc}
-        alt={`Kiki ${resolvedPose}`}
-        draggable={false}
-        onError={() => {
-          if (!usePngFallback) setUsePngFallback(true);
-        }}
-        className={`relative z-10 w-full h-full object-contain drop-shadow-[0_2px_4px_rgba(38,36,34,0.09)] ${motionClass}`}
-      />
+      {outgoing && (
+        <div
+          key={`out-${outgoing.key}`}
+          className="absolute inset-0 z-10 pointer-events-none animate-kiki-fade-out"
+        >
+          <img
+            src={outgoing.src}
+            alt=""
+            draggable={false}
+            className={`w-full h-full object-contain drop-shadow-[0_2px_4px_rgba(38,36,34,0.09)] ${outgoing.motion}`}
+          />
+        </div>
+      )}
+      <div
+        key={`in-${layerKey}`}
+        className={`relative z-10 w-full h-full ${outgoing ? 'animate-kiki-fade-in' : ''}`}
+      >
+        <img
+          src={imgSrc}
+          alt={`Kiki ${resolvedPose}`}
+          draggable={false}
+          onError={() => {
+            if (!usePngFallback) setUsePngFallback(true);
+          }}
+          className={`w-full h-full object-contain drop-shadow-[0_2px_4px_rgba(38,36,34,0.09)] ${motionClass}`}
+        />
+      </div>
     </div>
   );
 
