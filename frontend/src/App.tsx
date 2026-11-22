@@ -36,7 +36,6 @@ import type {
   ToastNotification,
   Topic,
 } from './types';
-import KikiAvatar from './components/KikiAvatar';
 import Sidebar from './components/Sidebar';
 import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
@@ -60,6 +59,36 @@ function upsertMessage(list: Message[], incoming: Message): Message[] {
       i === idx
         ? {
           ...m,
+          ...incoming,
+          session_run: incoming.session_run ?? m.session_run,
+          topic: incoming.topic ?? m.topic,
+        }
+        : m
+    );
+  }
+  return [...list, incoming];
+}
+
+function replaceOptimisticOrUpsert(
+  list: Message[],
+  tempId: string | undefined,
+  incoming: Message
+): Message[] {
+  if (!tempId) {
+    return upsertMessage(list, incoming);
+  }
+  const hasReal = list.some((m) => m.id === incoming.id);
+  if (hasReal) {
+    return upsertMessage(
+      list.filter((m) => m.id !== tempId),
+      incoming
+    );
+  }
+  const tempIdx = list.findIndex((m) => m.id === tempId);
+  if (tempIdx >= 0) {
+    return list.map((m, i) =>
+      i === tempIdx
+        ? {
           ...incoming,
           session_run: incoming.session_run ?? m.session_run,
           topic: incoming.topic ?? m.topic,
@@ -119,6 +148,8 @@ export const App: React.FC = () => {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const pendingOptimisticRef = useRef<Array<{ tempId: string; content: string }>>([]);
+  const resolvedOptimisticMapRef = useRef<Map<string, string>>(new Map());
 
   const pushToast = useCallback(
     (payload: {
@@ -197,7 +228,22 @@ export const App: React.FC = () => {
         setTopics((prev) => upsertTopic(prev, topic));
       },
       onMessageCreated: ({ message }) => {
-        setMessages((prev) => upsertMessage(prev, message));
+        if (message.role === 'user') {
+          const matchIdx = pendingOptimisticRef.current.findIndex(
+            (item) => item.content === message.content
+          );
+          if (matchIdx >= 0) {
+            const [matched] = pendingOptimisticRef.current.splice(matchIdx, 1);
+            resolvedOptimisticMapRef.current.set(matched.tempId, message.id);
+            setMessages((prev) =>
+              replaceOptimisticOrUpsert(prev, matched.tempId, message)
+            );
+          } else {
+            setMessages((prev) => upsertMessage(prev, message));
+          }
+        } else {
+          setMessages((prev) => upsertMessage(prev, message));
+        }
         if (message.session_run) {
           setRunsById((prev) => ({
             ...prev,
@@ -235,6 +281,9 @@ export const App: React.FC = () => {
         setMessages((prev) =>
           upsertMessage(prev, { ...message, streaming: false })
         );
+      },
+      onMessageUpdated: ({ message }) => {
+        setMessages((prev) => upsertMessage(prev, message));
       },
       onRunCreated: ({ run }) => {
         setRunsById((prev) => ({
@@ -378,12 +427,6 @@ export const App: React.FC = () => {
     return serverKikiStatus;
   }, [runsById, sending, hasStreamingMessage, serverKikiStatus]);
 
-  const composerKikiStatus: KikiStatus = useMemo(() => {
-    if (sending || hasStreamingMessage) return 'thinking';
-    if (globalKikiStatus === 'waiting_input') return 'waiting_input';
-    return 'idle';
-  }, [sending, hasStreamingMessage, globalKikiStatus]);
-
   const handleSelectTopic = useCallback(
     async (topicId: string) => {
       setFocusTopicId(topicId);
@@ -428,6 +471,22 @@ export const App: React.FC = () => {
         }
       }
 
+      const tempId = `temp-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const optimisticUser: Message = {
+        id: tempId,
+        topic_id: focusTopicId ?? '__routing__',
+        role: 'user',
+        content,
+        created_at: new Date().toISOString(),
+        metadata: {
+          optimistic: true,
+          routing: !focusTopicId,
+        },
+        topic: focusTopicId ? topicsById[focusTopicId] ?? null : null,
+      };
+      pendingOptimisticRef.current.push({ tempId, content });
+      setMessages((prev) => [...prev, optimisticUser]);
+
       try {
         const res = await sendChat({
           content,
@@ -439,7 +498,23 @@ export const App: React.FC = () => {
         if (res.topic) {
           setTopics((prev) => upsertTopic(prev, res.topic));
         }
+        if (res.reassigned_messages && res.reassigned_messages.length > 0) {
+          setMessages((prev) =>
+            res.reassigned_messages!.reduce(
+              (acc, msg) =>
+                upsertMessage(acc, {
+                  ...msg,
+                  topic: res.topic ?? msg.topic,
+                }),
+              prev
+            )
+          );
+        }
         if (res.user_message) {
+          pendingOptimisticRef.current = pendingOptimisticRef.current.filter(
+            (item) => item.tempId !== tempId
+          );
+          resolvedOptimisticMapRef.current.delete(tempId);
           const enrichedUser: Message = {
             ...res.user_message,
             topic: res.topic ?? res.user_message.topic,
@@ -448,7 +523,9 @@ export const App: React.FC = () => {
                 ? res.session_run
                 : res.user_message.session_run,
           };
-          setMessages((prev) => upsertMessage(prev, enrichedUser));
+          setMessages((prev) =>
+            replaceOptimisticOrUpsert(prev, tempId, enrichedUser)
+          );
         }
         if (res.assistant_message) {
           const enrichedAssistant: Message = {
@@ -468,6 +545,11 @@ export const App: React.FC = () => {
           }));
         }
       } catch (err) {
+        pendingOptimisticRef.current = pendingOptimisticRef.current.filter(
+          (item) => item.tempId !== tempId
+        );
+        resolvedOptimisticMapRef.current.delete(tempId);
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
         setErrorBanner(
           err instanceof Error ? err.message : '发送消息失败，请稍后重试'
         );
@@ -478,7 +560,7 @@ export const App: React.FC = () => {
         setSending(false);
       }
     },
-    [inputText, sending, focusTopicId, pathOption, selectedAgentType]
+    [inputText, sending, focusTopicId, pathOption, selectedAgentType, topicsById]
   );
 
   const handleReassignMessage = useCallback(
@@ -693,6 +775,7 @@ export const App: React.FC = () => {
           allTopics={topics}
           runsById={runsById}
           focusTopicId={focusTopicId}
+          sending={sending}
           onSelectTopic={handleSelectTopic}
           onReassignMessage={handleReassignMessage}
           onOpenLogDrawer={handleOpenLogDrawer}
@@ -763,40 +846,33 @@ export const App: React.FC = () => {
               </span>
             </div>
 
-            {/* Input Container + Kiki Companion */}
-            <div className="flex items-end gap-2.5">
-              <div className="flex-1 rounded-2xl bg-white border border-[#E4DDD2] focus-within:border-[#5B7A95] focus-within:ring-2 focus-within:ring-[#5B7A95]/15 shadow-sm transition-all flex items-end gap-2 px-3.5 py-2.5">
-                <textarea
-                  id="kiki-chat-input"
-                  name="message"
-                  ref={textareaRef}
-                  rows={1}
-                  value={inputText}
-                  onChange={handleTextareaChange}
-                  onKeyDown={handleKeyDown}
-                  placeholder={
-                    focusedTopic
-                      ? `在 #${focusedTopic.title} 中继续对话...`
-                      : '和 Kiki 聊点什么，或直接交办一个后台任务...'
-                  }
-                  className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
-                />
+            {/* Input Container */}
+            <div className="rounded-2xl bg-white border border-[#E4DDD2] focus-within:border-[#5B7A95] focus-within:ring-2 focus-within:ring-[#5B7A95]/15 shadow-sm transition-all flex items-end gap-2 px-3.5 py-2.5">
+              <textarea
+                id="kiki-chat-input"
+                name="message"
+                ref={textareaRef}
+                rows={1}
+                value={inputText}
+                onChange={handleTextareaChange}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  focusedTopic
+                    ? `在 #${focusedTopic.title} 中继续对话...`
+                    : '和 Kiki 聊点什么，或直接交办一个后台任务...'
+                }
+                className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
+              />
 
-                <button
-                  type="button"
-                  disabled={!inputText.trim() || sending}
-                  onClick={() => handleSend()}
-                  aria-label="发送消息"
-                  className="w-9 h-9 rounded-xl bg-[#5B7A95] hover:bg-[#4B6882] text-white flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40 disabled:hover:bg-[#5B7A95]"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Kiki sitting right next to the composer */}
-              <div className="hidden sm:flex items-center justify-center -mb-1 shrink-0">
-                <KikiAvatar status={composerKikiStatus} size="lg" />
-              </div>
+              <button
+                type="button"
+                disabled={!inputText.trim() || sending}
+                onClick={() => handleSend()}
+                aria-label="发送消息"
+                className="w-9 h-9 rounded-xl bg-[#5B7A95] hover:bg-[#4B6882] text-white flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40 disabled:hover:bg-[#5B7A95]"
+              >
+                <Send className="w-4 h-4" />
+              </button>
             </div>
           </div>
         </div>

@@ -11,15 +11,18 @@ from typing import Any, AsyncIterator, Optional
 from google import genai
 
 from .config import Settings
-from .schemas import RouteDecision
+from .schemas import BacktrackDecision, RouteDecision
 
 logger = logging.getLogger(__name__)
 
 DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判定引擎。
-你的职责：分析用户的新消息，决定它是属于现有的某个 Topic、需要新建一个 Topic，还是仅为前台轻量闲聊。
+你的职责：分析用户的新消息（结合最近对话上下文），决定它是属于现有的某个 Topic、需要新建一个 Topic，还是仅为前台轻量闲聊。
 
 现有活跃 Topic 列表：
 {active_topics_json}
+
+最近对话上下文（按时间从早到晚）：
+{recent_context_text}
 
 请输出以下格式的 JSON，切勿包含其他多余字符：
 {{
@@ -32,9 +35,37 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 }}
 
 判定规则：
-1. 若输入为简单的问候、感叹、前台对话交互，path 为 'fast'，topic_action 为 'none'。
-2. 若输入涉及代码重构、长文生成、数据分析、多步骤操作、文件读写或命令行排查，path 为 'heavy'。
-3. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
+1. 若输入仅为简单的问候、感叹或毫无延续主题的一次性闲聊，path 为 'fast'，topic_action 为 'none'。
+2. 注意：`topic-general`（日常闲聊）仅用于 `topic_action='none'` 的兜底，切勿对 `topic-general` 返回 `topic_action='reuse'`。若结合最近上下文发现对话已经围绕某个具体主题展开（例如社保、就医、理财、旅行、技术排查等），应选择 `create` 新建简短话题（若已有对应非闲聊话题则 `reuse`）。
+3. 若输入涉及代码重构、长文生成、数据分析、多步骤操作、文件读写或命令行排查，path 为 'heavy'。
+4. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
+"""
+
+BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手。
+刚刚从全局对话流中新识别/确立了目标话题，请从“日常闲聊（topic-general）”的候选历史消息中，找出实际上属于该目标话题的前置铺垫、提问或对应的回复。
+
+目标话题：
+{target_topic_json}
+
+当前触发该话题的最新消息：
+{trigger_content}
+
+已确认归属该话题的较新消息（若为空表示刚开始回溯）：
+{already_matched_text}
+
+待检查的“日常闲聊”历史候选消息（按时间从早到晚排列）：
+{candidates_text}
+
+请输出 JSON，切勿包含其他多余字符：
+{{
+  "matched_message_ids": ["属于目标话题的候选消息 ID"],
+  "reasoning": "简短说明判断依据"
+}}
+
+判定规则：
+1. 仔细判断候选消息中哪些与目标话题属于同一件事/同一主题的延续（包括前面铺垫背景、追问以及紧随其后的 Kiki 回复）。
+2. 纯粹无关的寒暄问候（如“早安”“哈哈”）或明显属于其他无关事件的闲聊不要选入。
+3. 只能返回上述候选消息列表中真实存在的 `id`；若本批候选消息均不属于目标话题，请返回空数组 `[]`。
 """
 
 KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点傲娇小性格的手绘风蓝灰虎斑小猫个人智能体（Personal Agent）。
@@ -100,10 +131,59 @@ class KikiLLMClient:
                 self.fallback_model,
             )
 
+    async def _run_structured_json(
+        self,
+        *,
+        input_text: str,
+        system_instruction: str,
+        schema_cls: type[Any],
+        call_label: str,
+    ) -> tuple[Optional[Any], Optional[Exception]]:
+        last_exc: Optional[Exception] = None
+        for model_name in self._candidate_models():
+            try:
+                client = self._get_client()
+                interaction = await client.aio.interactions.create(
+                    model=model_name,
+                    input=input_text,
+                    system_instruction=system_instruction,
+                    response_format={
+                        "type": "text",
+                        "mime_type": "application/json",
+                        "schema": schema_cls.model_json_schema(),
+                    },
+                    generation_config={"thinking_level": "low"},
+                    store=False,
+                )
+                raw_text = interaction.output_text or ""
+                return schema_cls.model_validate_json(_extract_json_block(raw_text)), None
+            except Exception as exc:
+                last_exc = exc
+                self._mark_primary_cooldown(model_name, exc)
+                logger.warning("%s (%s) call failed: %s", call_label, model_name, exc)
+        return None, last_exc
+
+    @staticmethod
+    def _format_context_lines(messages: Optional[list[dict[str, Any]]], *, include_id: bool = False) -> str:
+        if not messages:
+            return "（无）"
+        lines: list[str] = []
+        for msg in messages:
+            role_label = "用户" if msg.get("role") == "user" else "Kiki"
+            topic_title = msg.get("topic_title")
+            prefix = f"[{msg['id']}] " if include_id and msg.get("id") else ""
+            topic_tag = f"(#{topic_title}) " if topic_title else ""
+            content = " ".join(str(msg.get("content") or "").split())
+            if len(content) > 240:
+                content = content[:239] + "…"
+            lines.append(f"- {prefix}{topic_tag}{role_label}: {content}")
+        return "\n".join(lines) if lines else "（无）"
+
     async def route_message(
         self,
         content: str,
         active_topics: list[dict[str, Any]],
+        recent_messages: Optional[list[dict[str, Any]]] = None,
     ) -> RouteDecision:
         compact_topics = [
             {
@@ -114,30 +194,17 @@ class KikiLLMClient:
             for t in active_topics
         ]
         system_instruction = DECISION_SYSTEM_PROMPT_TEMPLATE.format(
-            active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2)
+            active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2),
+            recent_context_text=self._format_context_lines(recent_messages),
         )
-        last_exc: Optional[Exception] = None
-        for model_name in self._candidate_models():
-            try:
-                client = self._get_client()
-                interaction = await client.aio.interactions.create(
-                    model=model_name,
-                    input=content,
-                    system_instruction=system_instruction,
-                    response_format={
-                        "type": "text",
-                        "mime_type": "application/json",
-                        "schema": RouteDecision.model_json_schema(),
-                    },
-                    generation_config={"thinking_level": "low"},
-                    store=False,
-                )
-                raw_text = interaction.output_text or ""
-                return RouteDecision.model_validate_json(_extract_json_block(raw_text))
-            except Exception as exc:
-                last_exc = exc
-                self._mark_primary_cooldown(model_name, exc)
-                logger.warning("Decision Model (%s) call failed: %s", model_name, exc)
+        parsed, last_exc = await self._run_structured_json(
+            input_text=content,
+            system_instruction=system_instruction,
+            schema_cls=RouteDecision,
+            call_label="Decision Model",
+        )
+        if parsed is not None:
+            return parsed
 
         return RouteDecision(
             path="fast",
@@ -146,6 +213,44 @@ class KikiLLMClient:
             new_topic_title=None,
             confidence=0.5,
             reasoning=f"路由模型暂不可用，降级为前台轻聊 ({type(last_exc).__name__ if last_exc else 'Error'})",
+        )
+
+    async def select_backtrack_messages(
+        self,
+        *,
+        target_topic: dict[str, Any],
+        trigger_content: str,
+        candidate_messages: list[dict[str, Any]],
+        already_matched_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> BacktrackDecision:
+        if not candidate_messages:
+            return BacktrackDecision(matched_message_ids=[], reasoning="无候选历史消息")
+
+        compact_target = {
+            "id": target_topic["id"],
+            "title": target_topic["title"],
+            "summary": target_topic.get("summary") or "",
+        }
+        system_instruction = BACKTRACK_SYSTEM_PROMPT_TEMPLATE.format(
+            target_topic_json=json.dumps(compact_target, ensure_ascii=False, indent=2),
+            trigger_content=trigger_content,
+            already_matched_text=self._format_context_lines(
+                already_matched_messages[-6:] if already_matched_messages else None
+            ),
+            candidates_text=self._format_context_lines(candidate_messages, include_id=True),
+        )
+        parsed, last_exc = await self._run_structured_json(
+            input_text="请选出候选消息中属于目标话题的消息 ID。",
+            system_instruction=system_instruction,
+            schema_cls=BacktrackDecision,
+            call_label="Backtrack Model",
+        )
+        if parsed is not None:
+            return parsed
+
+        return BacktrackDecision(
+            matched_message_ids=[],
+            reasoning=f"回溯模型暂不可用 ({type(last_exc).__name__ if last_exc else 'Error'})",
         )
 
     async def stream_fast_reply(

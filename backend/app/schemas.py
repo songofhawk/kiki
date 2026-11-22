@@ -32,6 +32,17 @@ class RouteDecision(BaseModel):
     )
 
 
+class BacktrackDecision(BaseModel):
+    matched_message_ids: list[str] = Field(
+        default_factory=list,
+        description="IDs of candidate messages from 日常闲聊 that belong to the target topic",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief Chinese explanation for which earlier messages belong to the topic",
+    )
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     model: str
@@ -170,6 +181,7 @@ class ChatResponse(BaseModel):
     topic: TopicSummary
     assistant_message: Optional[MessageItem] = None
     session_run: Optional[SessionRunDetail] = None
+    reassigned_messages: list[MessageItem] = Field(default_factory=list)
 
 
 class MessageTopicReassignRequest(BaseModel):

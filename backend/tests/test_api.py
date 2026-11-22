@@ -14,7 +14,7 @@ import pytest
 from app.config import Settings
 from app.db import Database
 from app.main import create_app
-from app.schemas import RouteDecision
+from app.schemas import BacktrackDecision, RouteDecision
 from app.sse import EventBus
 
 
@@ -24,6 +24,10 @@ class FakeLLMClient:
     def __init__(self) -> None:
         self.route_calls = 0
         self.next_decision: Optional[RouteDecision] = None
+        self.last_recent_messages: list[dict[str, Any]] = []
+        self.last_fast_history: list[dict[str, Any]] = []
+        self.backtrack_calls: list[dict[str, Any]] = []
+        self.backtrack_handler: Optional[Any] = None
         self.agent_script: list[Any] = []
         self._agent_turn = 0
 
@@ -31,8 +35,10 @@ class FakeLLMClient:
         self,
         content: str,
         active_topics: list[dict[str, Any]],
+        recent_messages: Optional[list[dict[str, Any]]] = None,
     ) -> RouteDecision:
         self.route_calls += 1
+        self.last_recent_messages = list(recent_messages or [])
         if self.next_decision is not None:
             decision = self.next_decision
             self.next_decision = None
@@ -46,12 +52,38 @@ class FakeLLMClient:
             reasoning="测试默认轻量闲聊",
         )
 
+    async def select_backtrack_messages(
+        self,
+        *,
+        target_topic: dict[str, Any],
+        trigger_content: str,
+        candidate_messages: list[dict[str, Any]],
+        already_matched_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> BacktrackDecision:
+        self.backtrack_calls.append(
+            {
+                "target_topic": target_topic,
+                "trigger_content": trigger_content,
+                "candidate_ids": [m["id"] for m in candidate_messages],
+                "already_matched_ids": [m["id"] for m in (already_matched_messages or [])],
+            }
+        )
+        if self.backtrack_handler is not None:
+            return self.backtrack_handler(
+                target_topic=target_topic,
+                trigger_content=trigger_content,
+                candidate_messages=candidate_messages,
+                already_matched_messages=already_matched_messages or [],
+            )
+        return BacktrackDecision(matched_message_ids=[], reasoning="测试默认不回溯")
+
     async def stream_fast_reply(
         self,
         content: str,
         history: list[dict[str, Any]],
         topic_title: str,
     ) -> AsyncIterator[str]:
+        self.last_fast_history = list(history)
         for chunk in ["喵~ ", "收到你的消息：", content[:20]]:
             await asyncio.sleep(0.01)
             yield chunk
@@ -382,3 +414,167 @@ async def test_heavy_path_hitl_pause_resume_and_cancel(tmp_path: Path):
         cancel_res = await client.post(f"/api/runs/{run2_id}/cancel")
         assert cancel_res.status_code == 200
         assert cancel_res.json()["run"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_recursive_upward_backtrack_on_topic_create_and_pair_integrity(tmp_path: Path):
+    app, db, bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    # Use small batch size (4 messages = 2 turns) to verify multi-round upward backtracking
+    app.state.decision_router.backtrack_batch_size = 4
+    app.state.decision_router.max_backtrack_batches = 6
+
+    db.ensure_general_topic()
+    # Unrelated casual messages (oldest, should stay in topic-general)
+    u0 = db.create_message("topic-general", "user", "早安 Kiki")
+    a0 = db.create_message("topic-general", "assistant", "早安喵~", metadata={"reply_to": u0["id"]})
+
+    # Older 社保 messages across 2+ batches (should all be pulled into new topic)
+    u1 = db.create_message("topic-general", "user", "下个月准备离职了")
+    a1 = db.create_message("topic-general", "assistant", "离职要注意社保衔接哦", metadata={"reply_to": u1["id"]})
+    u2 = db.create_message("topic-general", "user", "担心五险一金断缴影响医保")
+    a2 = db.create_message("topic-general", "assistant", "断缴次月医保就不能报销了", metadata={"reply_to": u2["id"]})
+    u3 = db.create_message("topic-general", "user", "北京可以自己交灵活就业吗？")
+    a3 = db.create_message("topic-general", "assistant", "可以的，线上就能办理", metadata={"reply_to": u3["id"]})
+
+    # Extra unrelated middle/boundary test: notice batch 1 sees [u2, a2, u3, a3],
+    # batch 2 sees [u0, a0, u1, a1] -> matches u1/a1 -> continues to batch 3? No more msgs -> stops!
+    # Also test pair expansion: suppose model only returns assistant IDs [a2, a3] in batch 1 and [a1] in batch 2!
+    def _select_backtrack(**kwargs: Any) -> BacktrackDecision:
+        candidates = kwargs["candidate_messages"]
+        matched = [
+            m["id"]
+            for m in candidates
+            if m["id"] in {a1["id"], a2["id"], a3["id"]}
+        ]
+        # Verify batch 2 receives already_matched_messages from batch 1
+        if any(m["id"] == a1["id"] for m in candidates):
+            already_ids = {m["id"] for m in kwargs["already_matched_messages"]}
+            assert {u2["id"], a2["id"], u3["id"], a3["id"]}.issubset(already_ids)
+        return BacktrackDecision(matched_message_ids=matched, reasoning="社保前置上下文")
+
+    fake_llm.backtrack_handler = _select_backtrack
+    fake_llm.next_decision = RouteDecision(
+        path="fast",
+        topic_action="create",
+        topic_id=None,
+        new_topic_title="北京离职社保指南",
+        confidence=0.94,
+        reasoning="明确讨论北京离职社保",
+    )
+
+    sse_events: list[tuple[str, dict[str, Any]]] = []
+    original_publish = bus.publish
+
+    def _capture_publish(event_type: str, payload: dict[str, Any]) -> None:
+        sse_events.append((event_type, payload))
+        original_publish(event_type, payload)
+
+    bus.publish = _capture_publish  # type: ignore[method-assign]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post("/api/chat", json={"content": "帮我总结北京社保不断缴步骤"})
+        assert res.status_code == 200
+        body = res.json()
+        new_topic_id = body["topic"]["id"]
+        assert body["topic"]["title"] == "北京离职社保指南"
+
+        # 1. Decision model received recent context from topic-general
+        assert len(fake_llm.last_recent_messages) == 8
+        assert fake_llm.last_recent_messages[-1]["id"] == a3["id"]
+
+        # 2. Upward backtracking ran 2 batches (since batch 2 hit the top of topic-general, batch 3 had 0 rows)
+        assert len(fake_llm.backtrack_calls) == 2
+
+        # 3. Pair expansion pulled in u1, u2, u3 alongside a1, a2, a3; u0/a0 stayed in topic-general
+        reassigned_ids = [m["id"] for m in body["reassigned_messages"]]
+        assert reassigned_ids == [u1["id"], a1["id"], u2["id"], a2["id"], u3["id"], a3["id"]]
+        for m in body["reassigned_messages"]:
+            assert m["topic_id"] == new_topic_id
+            assert m["metadata"]["backtracked"] is True
+            assert m["metadata"]["reassigned_from"] == "topic-general"
+
+        general_msgs = (await client.get("/api/messages?topic_id=topic-general")).json()
+        assert [m["id"] for m in general_msgs] == [u0["id"], a0["id"]]
+
+        # Wait briefly for fast reply streaming to complete and verify FastPath received backtracked history
+        await asyncio.sleep(0.15)
+        history_contents = [m["content"] for m in fake_llm.last_fast_history]
+        assert "下个月准备离职了" in history_contents
+        assert "北京可以自己交灵活就业吗？" in history_contents
+
+        topic_msgs = (await client.get(f"/api/messages?topic_id={new_topic_id}")).json()
+        # 6 backtracked + 1 new user + 1 new assistant = 8
+        assert len(topic_msgs) == 8
+
+        # 4. SSE emitted message_updated for all 6 reassigned messages and topic_updated for both topics
+        updated_msg_events = [p["message"]["id"] for et, p in sse_events if et == "message_updated"]
+        assert updated_msg_events == reassigned_ids
+        updated_topic_ids = {p["topic"]["id"] for et, p in sse_events if et == "topic_updated"}
+        assert {"topic-general", new_topic_id}.issubset(updated_topic_ids)
+
+
+@pytest.mark.asyncio
+async def test_upward_backtrack_stops_when_older_batch_unrelated_and_handles_reuse(tmp_path: Path):
+    app, db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    app.state.decision_router.backtrack_batch_size = 2
+    app.state.decision_router.max_backtrack_batches = 6
+
+    db.ensure_general_topic()
+    # Oldest batch (should never be reached once middle batch returns empty)
+    u_old = db.create_message("topic-general", "user", "上个月聊过一次社保")
+    a_old = db.create_message("topic-general", "assistant", "好的喵", metadata={"reply_to": u_old["id"]})
+    # Middle unrelated batch -> stops upward traversal here!
+    u_mid = db.create_message("topic-general", "user", "今天中午吃什么")
+    a_mid = db.create_message("topic-general", "assistant", "吃牛肉面吧", metadata={"reply_to": u_mid["id"]})
+    # Latest batch in general (misclassified start of existing topic)
+    u_new = db.create_message("topic-general", "user", "对了帮我看下报销进度")
+    a_new = db.create_message("topic-general", "assistant", "哪个报销呀？", metadata={"reply_to": u_new["id"]})
+
+    # Pre-existing topic
+    existing_topic = db.create_topic(title="差旅报销")
+
+    def _select_only_reimbursement(**kwargs: Any) -> BacktrackDecision:
+        matched = [
+            m["id"]
+            for m in kwargs["candidate_messages"]
+            if "报销" in m["content"]
+        ]
+        return BacktrackDecision(matched_message_ids=matched, reasoning="仅匹配报销相关")
+
+    fake_llm.backtrack_handler = _select_only_reimbursement
+    fake_llm.next_decision = RouteDecision(
+        path="fast",
+        topic_action="reuse",
+        topic_id=existing_topic["id"],
+        new_topic_title=None,
+        confidence=0.95,
+        reasoning="延续差旅报销话题",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post("/api/chat", json={"content": "就是上周上海出差的差旅报销"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["topic"]["id"] == existing_topic["id"]
+        assert [m["id"] for m in body["reassigned_messages"]] == [u_new["id"], a_new["id"]]
+        # Batch 1 matched [u_new, a_new] -> continued upwards to Batch 2 [u_mid, a_mid] -> returned [] -> stopped before Batch 3!
+        assert len(fake_llm.backtrack_calls) == 2
+
+        await asyncio.sleep(0.15)
+        # Now latest message is in existing_topic (NOT topic-general), so another reuse must NOT trigger backtrack
+        fake_llm.next_decision = RouteDecision(
+            path="fast",
+            topic_action="reuse",
+            topic_id=existing_topic["id"],
+            new_topic_title=None,
+            confidence=0.98,
+            reasoning="继续差旅报销",
+        )
+        res2 = await client.post("/api/chat", json={"content": "发票我待会发你"})
+        assert res2.status_code == 200
+        assert res2.json()["reassigned_messages"] == []
+        assert len(fake_llm.backtrack_calls) == 2

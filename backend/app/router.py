@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Callable, Literal, Optional
 
-from .db import Database
+from .db import GENERAL_TOPIC_ID, Database
 from .llm import KikiLLMClient
 from .schemas import RouteDecision
 from .sse import EventBus
@@ -17,18 +18,126 @@ logger = logging.getLogger(__name__)
 class DecisionRouter:
     """Routes incoming messages to Fast-Path or Heavy-Path and resolves Topic assignment."""
 
-    def __init__(self, db: Database, llm: KikiLLMClient, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        db: Database,
+        llm: KikiLLMClient,
+        event_bus: EventBus,
+        *,
+        backtrack_batch_size: int = 6,
+        max_backtrack_batches: int = 6,
+        recent_context_limit: int = 10,
+    ) -> None:
         self.db = db
         self.llm = llm
         self.event_bus = event_bus
+        self.backtrack_batch_size = backtrack_batch_size
+        self.max_backtrack_batches = max_backtrack_batches
+        self.recent_context_limit = recent_context_limit
+
+    async def _call_route_message(
+        self,
+        content: str,
+        active_topics: list[dict[str, Any]],
+        recent_messages: list[dict[str, Any]],
+    ) -> RouteDecision:
+        sig = inspect.signature(self.llm.route_message)
+        if "recent_messages" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return await self.llm.route_message(
+                content, active_topics, recent_messages=recent_messages
+            )
+        return await self.llm.route_message(content, active_topics)
+
+    async def _backtrack_general_messages(
+        self,
+        *,
+        target_topic: dict[str, Any],
+        trigger_content: str,
+    ) -> list[dict[str, Any]]:
+        """Iteratively scan 日常闲聊 upwards and pull older messages belonging to target_topic."""
+        if not hasattr(self.llm, "select_backtrack_messages"):
+            return []
+
+        cursor_rowid: Optional[int] = None
+        reassigned_all: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        for _batch_idx in range(self.max_backtrack_batches):
+            candidates, min_candidate_rowid = self.db.list_topic_messages_page_before(
+                GENERAL_TOPIC_ID,
+                before_rowid=cursor_rowid,
+                limit=self.backtrack_batch_size,
+            )
+            if not candidates or min_candidate_rowid is None:
+                break
+
+            decision = await self.llm.select_backtrack_messages(
+                target_topic=target_topic,
+                trigger_content=trigger_content,
+                candidate_messages=candidates,
+                already_matched_messages=reassigned_all,
+            )
+            candidate_ids = {m["id"] for m in candidates}
+            matched_ids = [
+                mid
+                for mid in dict.fromkeys(decision.matched_message_ids)
+                if mid in candidate_ids and mid not in seen_ids
+            ]
+            if not matched_ids:
+                break
+
+            expanded_ids, min_expanded_rowid = self.db.expand_paired_topic_messages(
+                GENERAL_TOPIC_ID, matched_ids
+            )
+            to_reassign = [mid for mid in expanded_ids if mid not in seen_ids]
+            if not to_reassign:
+                break
+
+            updated_batch = self.db.reassign_messages_topic(
+                to_reassign, target_topic["id"], backtracked=True
+            )
+            if not updated_batch:
+                break
+
+            for msg in updated_batch:
+                seen_ids.add(msg["id"])
+            # Prepend older batch before newer batches to maintain chronological order
+            reassigned_all = updated_batch + reassigned_all
+
+            # Continue backtracking upwards strictly older than this batch (and any expanded pair)
+            next_cursor = min_candidate_rowid
+            if min_expanded_rowid is not None and min_expanded_rowid < next_cursor:
+                next_cursor = min_expanded_rowid
+            cursor_rowid = next_cursor
+
+        if reassigned_all:
+            enriched_out: list[dict[str, Any]] = []
+            for msg in reassigned_all:
+                if msg.get("session_run"):
+                    msg = dict(msg)
+                    msg["session_run"] = self.event_bus.enrich_run(msg["session_run"])
+                enriched_out.append(msg)
+                self.event_bus.publish("message_updated", {"message": msg})
+
+            general_topic = self.db.get_topic(GENERAL_TOPIC_ID)
+            if general_topic:
+                self.event_bus.publish("topic_updated", {"topic": general_topic})
+            refreshed_target = self.db.get_topic(target_topic["id"])
+            if refreshed_target:
+                self.event_bus.publish("topic_updated", {"topic": refreshed_target})
+            return enriched_out
+
+        return []
 
     async def route(
         self,
         content: str,
         focus_topic_id: Optional[str] = None,
         force_path: Optional[Literal["fast", "heavy"]] = None,
-    ) -> tuple[RouteDecision, dict[str, Any], bool]:
-        """Return (RouteDecision, resolved_topic_dict, topic_created)."""
+    ) -> tuple[RouteDecision, dict[str, Any], bool, list[dict[str, Any]]]:
+        """Return (RouteDecision, resolved_topic_dict, topic_created, reassigned_messages)."""
         # 1. Topic Focus Mode bypasses Decision Model
         if focus_topic_id:
             topic = self.db.get_topic(focus_topic_id)
@@ -42,12 +151,16 @@ class DecisionRouter:
                 confidence=1.0,
                 reasoning="Topic Focus Mode 锁定当前话题",
             )
-            return decision, topic, False
+            return decision, topic, False, []
 
-        # 2. All Stream mode: invoke Decision Model
+        # 2. All Stream mode: invoke Decision Model with recent context
         self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在判断意图与话题...")
         active_topics = self.db.list_topics(include_archived=False)
-        decision = await self.llm.route_message(content, active_topics)
+        recent_messages = self.db.get_recent_messages_with_topic(
+            limit=self.recent_context_limit
+        )
+        latest_msg = self.db.get_latest_message()
+        decision = await self._call_route_message(content, active_topics, recent_messages)
 
         if force_path is not None:
             decision = decision.model_copy(update={"path": force_path})
@@ -79,7 +192,26 @@ class DecisionRouter:
         if topic_created:
             self.event_bus.publish("topic_created", {"topic": topic})
 
-        return decision, topic, topic_created
+        # 4. Backtrack 日常闲聊 upwards if a real topic was created or resumed right after casual chat
+        reassigned_messages: list[dict[str, Any]] = []
+        should_backtrack = topic["id"] != GENERAL_TOPIC_ID and (
+            topic_created
+            or (
+                decision.topic_action == "reuse"
+                and latest_msg is not None
+                and latest_msg["topic_id"] == GENERAL_TOPIC_ID
+            )
+        )
+        if should_backtrack:
+            self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在整理话题上下文...")
+            reassigned_messages = await self._backtrack_general_messages(
+                target_topic=topic,
+                trigger_content=content,
+            )
+            if reassigned_messages:
+                topic = self.db.get_topic(topic["id"]) or topic
+
+        return decision, topic, topic_created, reassigned_messages
 
     @staticmethod
     def _fallback_title(content: str) -> str:

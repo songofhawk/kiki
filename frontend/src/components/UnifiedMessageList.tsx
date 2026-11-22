@@ -17,6 +17,7 @@ export interface UnifiedMessageListProps {
   allTopics: Topic[];
   runsById: Record<string, SessionRun>;
   focusTopicId: string | null;
+  sending?: boolean;
   onSelectTopic: (topicId: string) => void;
   onReassignMessage: (
     messageId: string,
@@ -103,6 +104,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   allTopics,
   runsById,
   focusTopicId,
+  sending = false,
   onSelectTopic,
   onReassignMessage,
   onOpenLogDrawer,
@@ -233,7 +235,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                   <span className="text-[11px] text-[#9A9187]">
                     {formatTime(msg.created_at)}
                   </span>
-                  {topic && (
+                  {topic ? (
                     <TopicBadge
                       topic={topic}
                       messageId={msg.id}
@@ -243,7 +245,12 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       onReassign={onReassignMessage}
                       compact
                     />
-                  )}
+                  ) : msg.metadata?.optimistic ? (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
+                      <KikiAvatar status="thinking" size="xs" />
+                      <span>Kiki 归类中...</span>
+                    </span>
+                  ) : null}
                 </div>
 
                 <div className="max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words">
@@ -271,12 +278,12 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
               key={msg.id}
               draggable
               onDragStart={handleDragStart}
-              className="group flex items-start gap-3 animate-kiki-fade-up"
+              className="group flex items-start gap-2.5 animate-kiki-fade-up"
             >
-              <div className="w-9 h-9 rounded-2xl bg-white border border-[#E8E2D9] shadow-sm flex items-center justify-center shrink-0 mt-1 overflow-hidden">
+              <div className="shrink-0 mt-0.5">
                 <KikiAvatar
                   status={msg.streaming ? 'thinking' : 'idle'}
-                  size="sm"
+                  size="md"
                 />
               </div>
 
@@ -297,7 +304,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     </span>
                   </div>
 
-                  {topic && (
+                  {topic ? (
                     <TopicBadge
                       topic={topic}
                       messageId={msg.id}
@@ -307,7 +314,12 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       onReassign={onReassignMessage}
                       compact
                     />
-                  )}
+                  ) : msg.metadata?.optimistic ? (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269] animate-pulse">
+                      <KikiAvatar status="thinking" size="xs" />
+                      <span>Kiki 归类中...</span>
+                    </span>
+                  ) : null}
                 </div>
 
                 <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
@@ -333,6 +345,22 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             </div>
           );
         })}
+
+        {sending && (
+          <div className="flex items-start gap-2.5 animate-kiki-fade-up">
+            <div className="shrink-0 mt-0.5">
+              <KikiAvatar status="thinking" size="md" />
+            </div>
+            <div className="mt-2 rounded-2xl rounded-tl-sm bg-white/80 border border-[#E8E2D9] px-4 py-2.5 text-xs text-[#7A7269] inline-flex items-center gap-2 shadow-sm">
+              <span>Kiki 正在思考并分流话题</span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:150ms]" />
+                <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:300ms]" />
+              </span>
+            </div>
+          </div>
+        )}
 
         <div ref={bottomRef} className="h-2" />
       </div>

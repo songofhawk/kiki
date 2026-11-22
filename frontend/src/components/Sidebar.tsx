@@ -209,38 +209,38 @@ export const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
-      {/* Bottom Pinned Kiki Sprite Stage */}
+      {/* Bottom Pinned Kiki Status Card */}
       <div className="p-3 border-t border-[#E8E2D9]">
         <div
-          className={`rounded-2xl border p-3 flex flex-col items-center text-center transition-colors ${globalKikiStatus === 'waiting_input'
+          className={`rounded-2xl border px-3 py-2.5 flex items-center gap-3 transition-colors ${globalKikiStatus === 'waiting_input'
               ? 'bg-amber-50/70 border-amber-300'
               : globalKikiStatus === 'running'
                 ? 'bg-[#EEF4F8] border-[#C9DAE8]'
                 : 'bg-[#FAF8F5] border-[#E6DFD5]'
             }`}
         >
-          <div className="w-full flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-[#8C8378] mb-1">
-            <span>Kiki 精灵</span>
-            <span
-              className={`px-2 py-0.5 rounded-full font-medium normal-case tracking-normal ${globalKikiStatus === 'waiting_input'
-                  ? 'bg-amber-200/80 text-amber-900'
-                  : globalKikiStatus === 'running'
-                    ? 'bg-[#5B7A95]/15 text-[#3B5972]'
-                    : globalKikiStatus === 'thinking'
-                      ? 'bg-[#EAE4DC] text-[#4E4842]'
-                      : 'bg-[#ECE6DD] text-[#6F6860]'
-                }`}
-            >
-              {KIKI_STATUS_LABELS[globalKikiStatus]}
-            </span>
-          </div>
-
-          <div className="my-1 flex items-center justify-center">
-            <KikiAvatar status={globalKikiStatus} size="hero" />
-          </div>
-
-          <div className="text-[10px] text-[#8C8378] mt-0.5">
-            拖拽消息气泡可快速改绑话题
+          <KikiAvatar status={globalKikiStatus} size="lg" className="-my-1" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-[#8C8378]">
+              Kiki 状态
+            </div>
+            <div className="mt-1">
+              <span
+                className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-medium ${globalKikiStatus === 'waiting_input'
+                    ? 'bg-amber-200/80 text-amber-900'
+                    : globalKikiStatus === 'running'
+                      ? 'bg-[#5B7A95]/15 text-[#3B5972]'
+                      : globalKikiStatus === 'thinking'
+                        ? 'bg-[#EAE4DC] text-[#4E4842]'
+                        : 'bg-[#ECE6DD] text-[#5A534C]'
+                  }`}
+              >
+                {KIKI_STATUS_LABELS[globalKikiStatus]}
+              </span>
+            </div>
+            <div className="mt-1 text-[10px] text-[#8C8378] truncate">
+              拖拽消息可快速改绑话题
+            </div>
           </div>
         </div>
       </div>

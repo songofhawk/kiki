@@ -193,12 +193,18 @@ def create_app(
         else:
             raise HTTPException(status_code=400, detail="Invalid action")
 
+        source_topic_id = existing_msg["topic_id"]
         updated_msg = database.reassign_message_topic(message_id, target_topic["id"])
         if updated_msg is None:
             raise HTTPException(status_code=404, detail="Message not found")
 
         refreshed_topic = database.get_topic(target_topic["id"]) or target_topic
         enriched_msg = _enrich_message(updated_msg, bus)
+        bus.publish("message_updated", {"message": enriched_msg})
+        if source_topic_id != target_topic["id"]:
+            source_topic = database.get_topic(source_topic_id)
+            if source_topic:
+                bus.publish("topic_updated", {"topic": source_topic})
         bus.publish("topic_updated", {"topic": refreshed_topic})
         return MessageTopicReassignResponse(
             message=MessageItem.model_validate(enriched_msg),
@@ -211,7 +217,7 @@ def create_app(
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> ChatResponse:
         try:
-            decision, topic, _created = await decision_router.route(
+            decision, topic, _created, reassigned_messages = await decision_router.route(
                 content=req.content,
                 focus_topic_id=req.focus_topic_id,
                 force_path=req.force_path,
@@ -269,6 +275,7 @@ def create_app(
             topic=TopicSummary.model_validate(refreshed_topic),
             assistant_message=MessageItem.model_validate(assistant_msg) if assistant_msg else None,
             session_run=SessionRunDetail.model_validate(session_run) if session_run else None,
+            reassigned_messages=[MessageItem.model_validate(m) for m in reassigned_messages],
         )
 
     # ------------------------------------------------------------------

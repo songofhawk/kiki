@@ -150,6 +150,7 @@ export interface ChatResponse {
   topic: Topic;
   assistant_message?: Message | null;
   session_run?: SessionRun | null;
+  reassigned_messages?: Message[];
 }
 
 export interface ReassignTopicPayload {

@@ -145,6 +145,7 @@ export interface SseEventHandlers {
   onTopicCreated?: (payload: { topic: Topic }) => void;
   onTopicUpdated?: (payload: { topic: Topic }) => void;
   onMessageCreated?: (payload: { message: Message }) => void;
+  onMessageUpdated?: (payload: { message: Message }) => void;
   onMessageDelta?: (payload: {
     message_id: string;
     topic_id: string;
@@ -218,6 +219,9 @@ export function connectEventStream(handlers: SseEventHandlers): () => void {
     );
     eventSource.addEventListener('message_created', (e) =>
       parseAndDispatch(e as MessageEvent, handlers.onMessageCreated)
+    );
+    eventSource.addEventListener('message_updated', (e) =>
+      parseAndDispatch(e as MessageEvent, handlers.onMessageUpdated)
     );
     eventSource.addEventListener('message_delta', (e) =>
       parseAndDispatch(e as MessageEvent, handlers.onMessageDelta)

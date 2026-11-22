@@ -569,41 +569,191 @@ class Database:
                 """
                 SELECT role, content FROM messages
                 WHERE topic_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (topic_id, limit),
             ).fetchall()
             return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
+    def get_recent_messages_with_topic(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.*, t.title AS topic_title
+                FROM messages m
+                LEFT JOIN topics t ON m.topic_id = t.id
+                ORDER BY m.rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in reversed(rows):
+                result.append(
+                    {
+                        "id": row["id"],
+                        "topic_id": row["topic_id"],
+                        "topic_title": row["topic_title"] or GENERAL_TOPIC_TITLE,
+                        "role": row["role"],
+                        "content": row["content"],
+                        "created_at": row["created_at"],
+                    }
+                )
+            return result
+
+    def get_latest_message(self) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM messages ORDER BY rowid DESC LIMIT 1").fetchone()
+            if not row:
+                return None
+            return self._hydrate_message_row(conn, row)
+
+    def list_topic_messages_page_before(
+        self,
+        topic_id: str,
+        *,
+        before_rowid: Optional[int] = None,
+        limit: int = 6,
+    ) -> tuple[list[dict[str, Any]], Optional[int]]:
+        """Return (chronological_messages, min_rowid) for a topic page older than before_rowid."""
+        with self._connect() as conn:
+            if before_rowid is None:
+                rows = conn.execute(
+                    """
+                    SELECT rowid AS _rowid, * FROM messages
+                    WHERE topic_id = ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (topic_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT rowid AS _rowid, * FROM messages
+                    WHERE topic_id = ? AND rowid < ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (topic_id, before_rowid, limit),
+                ).fetchall()
+            if not rows:
+                return [], None
+            chronological = list(reversed(rows))
+            min_rowid = min(int(r["_rowid"]) for r in chronological)
+            return [self._hydrate_message_row(conn, r) for r in chronological], min_rowid
+
+    def expand_paired_topic_messages(
+        self,
+        topic_id: str,
+        message_ids: list[str],
+    ) -> tuple[list[str], Optional[int]]:
+        """Expand selected message IDs within topic_id to include paired user/assistant turns."""
+        if not message_ids:
+            return [], None
+        seed_set = set(message_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT rowid AS _rowid, id, metadata
+                FROM messages
+                WHERE topic_id = ?
+                ORDER BY rowid ASC
+                """,
+                (topic_id,),
+            ).fetchall()
+            if not rows:
+                return [], None
+
+            parsed_meta: dict[str, dict[str, Any]] = {
+                r["id"]: _parse_metadata(r["metadata"]) for r in rows
+            }
+            expanded = set(seed_set)
+            # If an assistant message is selected, pull in its reply_to user message
+            for mid in list(expanded):
+                reply_to = parsed_meta.get(mid, {}).get("reply_to")
+                if isinstance(reply_to, str) and reply_to in parsed_meta:
+                    expanded.add(reply_to)
+            # If a user message is selected, pull in any assistant replies referencing it
+            for r in rows:
+                reply_to = parsed_meta.get(r["id"], {}).get("reply_to")
+                if isinstance(reply_to, str) and reply_to in expanded:
+                    expanded.add(r["id"])
+
+            ordered_ids: list[str] = []
+            min_rowid: Optional[int] = None
+            for r in rows:
+                if r["id"] in expanded:
+                    ordered_ids.append(r["id"])
+                    rid = int(r["_rowid"])
+                    if min_rowid is None or rid < min_rowid:
+                        min_rowid = rid
+            return ordered_ids, min_rowid
+
+    def reassign_messages_topic(
+        self,
+        message_ids: list[str],
+        target_topic_id: str,
+        *,
+        backtracked: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Reassign multiple messages atomically to target_topic_id in chronological order."""
+        if not message_ids:
+            return []
+        now = utc_now_iso()
+        unique_ids = list(dict.fromkeys(message_ids))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as conn:
+            target_row = conn.execute(
+                "SELECT * FROM topics WHERE id = ?", (target_topic_id,)
+            ).fetchone()
+            if not target_row:
+                return []
+
+            msg_rows = conn.execute(
+                f"SELECT * FROM messages WHERE id IN ({placeholders}) ORDER BY rowid ASC",
+                unique_ids,
+            ).fetchall()
+            if not msg_rows:
+                return []
+
+            updated_ids: list[str] = []
+            for msg_row in msg_rows:
+                meta = _parse_metadata(msg_row["metadata"])
+                old_topic_id = msg_row["topic_id"]
+                meta["reassigned"] = True
+                meta["confidence"] = 1.0
+                if backtracked:
+                    meta["backtracked"] = True
+                    if old_topic_id != target_topic_id:
+                        meta["reassigned_from"] = old_topic_id
+
+                conn.execute(
+                    "UPDATE messages SET topic_id = ?, metadata = ? WHERE id = ?",
+                    (target_topic_id, json.dumps(meta, ensure_ascii=False), msg_row["id"]),
+                )
+                conn.execute(
+                    "UPDATE session_runs SET topic_id = ?, updated_at = ? WHERE trigger_message_id = ?",
+                    (target_topic_id, now, msg_row["id"]),
+                )
+                updated_ids.append(msg_row["id"])
+
+            conn.execute(
+                "UPDATE topics SET updated_at = ? WHERE id = ?", (now, target_topic_id)
+            )
+            conn.commit()
+            out_placeholders = ", ".join("?" for _ in updated_ids)
+            updated_rows = conn.execute(
+                f"SELECT * FROM messages WHERE id IN ({out_placeholders}) ORDER BY rowid ASC",
+                updated_ids,
+            ).fetchall()
+            return [self._hydrate_message_row(conn, r) for r in updated_rows]
+
     def reassign_message_topic(
         self,
         message_id: str,
         target_topic_id: str,
     ) -> Optional[dict[str, Any]]:
-        now = utc_now_iso()
-        with self._connect() as conn:
-            msg_row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-            if not msg_row:
-                return None
-            target_row = conn.execute("SELECT * FROM topics WHERE id = ?", (target_topic_id,)).fetchone()
-            if not target_row:
-                return None
-
-            meta = _parse_metadata(msg_row["metadata"])
-            meta["reassigned"] = True
-            meta["confidence"] = 1.0
-
-            conn.execute(
-                "UPDATE messages SET topic_id = ?, metadata = ? WHERE id = ?",
-                (target_topic_id, json.dumps(meta, ensure_ascii=False), message_id),
-            )
-            # Keep any SessionRun triggered by this message aligned with the new topic
-            conn.execute(
-                "UPDATE session_runs SET topic_id = ?, updated_at = ? WHERE trigger_message_id = ?",
-                (target_topic_id, now, message_id),
-            )
-            conn.execute("UPDATE topics SET updated_at = ? WHERE id = ?", (now, target_topic_id))
-            conn.commit()
-            updated = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-            return self._hydrate_message_row(conn, updated)
+        updated = self.reassign_messages_topic([message_id], target_topic_id)
+        return updated[0] if updated else None
