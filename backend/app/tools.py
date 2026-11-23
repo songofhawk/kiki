@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+from .config import load_settings
 from .db import Database
+from .search import WebSearchService
 from .sse import EventBus
 
 IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"}
@@ -104,6 +106,53 @@ AGENT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "web_search",
+        "description": "Search the public web for up-to-date facts, docs, news, or references across configured search engines (with automatic failover).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search keywords or question.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (1-10, default 5).",
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional engine override: 'auto' (default), 'tavily', 'serper', 'exa', 'brave', 'bocha', 'jina', or 'serpapi'.",
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                    "description": "Search depth ('basic' or 'advanced', default 'basic').",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "fetch_webpage",
+        "description": "Fetch and extract readable text content from a public http/https webpage URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Public http:// or https:// URL to fetch.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return (500-20000, default 6000).",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "type": "function",
         "name": "request_human_approval",
         "description": "Pause execution and ask the human user to approve or choose an option before proceeding with a risky, destructive, or ambiguous action.",
         "parameters": {
@@ -146,11 +195,13 @@ class WorkspaceToolExecutor:
         artifacts_dir: Path,
         db: Database,
         event_bus: EventBus,
+        search_service: Optional[WebSearchService] = None,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.artifacts_dir = artifacts_dir.resolve()
         self.db = db
         self.event_bus = event_bus
+        self.search_service = search_service or WebSearchService(load_settings())
 
     def _resolve_safe_path(self, rel_path: str) -> Path:
         candidate = (self.workspace_root / (rel_path or ".")).resolve()
@@ -307,6 +358,20 @@ class WorkspaceToolExecutor:
             if name == "run_shell":
                 out = await self.run_shell(run_id=run_id, command=str(arguments.get("command", "")))
                 return out, False
+            if name == "web_search":
+                resp = await self.search_service.search(
+                    query=str(arguments.get("query", "")),
+                    max_results=int(arguments.get("max_results", 5) or 5),
+                    provider=str(arguments.get("provider", "auto") or "auto"),
+                    search_depth=str(arguments.get("search_depth", "basic") or "basic"),
+                )
+                return resp.format_markdown(), False
+            if name == "fetch_webpage":
+                content = await self.search_service.fetch_webpage(
+                    url=str(arguments.get("url", "")),
+                    max_chars=int(arguments.get("max_chars", 6000) or 6000),
+                )
+                return content, False
             return f"Unknown tool: {name}", True
         except Exception as exc:
             return f"Tool '{name}' failed: {exc}", True

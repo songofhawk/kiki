@@ -37,7 +37,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 判定规则：
 1. 若输入仅为简单的问候、感叹或毫无延续主题的一次性闲聊，path 为 'fast'，topic_action 为 'none'。
 2. 注意：`topic-general`（日常闲聊）仅用于 `topic_action='none'` 的兜底，切勿对 `topic-general` 返回 `topic_action='reuse'`。若结合最近上下文发现对话已经围绕某个具体主题展开（例如社保、就医、理财、旅行、技术排查等），应选择 `create` 新建简短话题（若已有对应非闲聊话题则 `reuse`）。
-3. 若输入涉及代码重构、长文生成、数据分析、多步骤操作、文件读写或命令行排查，path 为 'heavy'。
+3. 若输入涉及代码重构、长文生成、数据分析、多步骤操作、文件读写、命令行排查，或需要联网搜索/实时信息查询/网页资料检索，path 为 'heavy'。
 4. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
 """
 

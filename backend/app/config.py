@@ -25,6 +25,14 @@ class Settings:
     artifacts_dir: Path
     gemini_fallback_model: str = "gemini-3.1-flash-lite"
     default_heavy_agent: str = "gemini_agent"
+    tavily_api_key: str = ""
+    serper_api_key: str = ""
+    exa_api_key: str = ""
+    brave_search_api_key: str = ""
+    bocha_api_key: str = ""
+    jina_api_key: str = ""
+    serpapi_api_key: str = ""
+    search_provider_order: str = "tavily,serper,exa,jina,brave,bocha,serpapi"
 
     @property
     def api_key_configured(self) -> bool:
@@ -56,6 +64,17 @@ def load_settings() -> Settings:
         workspace_root=workspace_root,
         database_path=db_path,
         artifacts_dir=artifacts_dir,
+        tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
+        serper_api_key=os.getenv("SERPER_API_KEY", ""),
+        exa_api_key=os.getenv("EXA_API_KEY", ""),
+        brave_search_api_key=os.getenv("BRAVE_SEARCH_API_KEY", ""),
+        bocha_api_key=os.getenv("BOCHA_API_KEY", ""),
+        jina_api_key=os.getenv("JINA_API_KEY", ""),
+        serpapi_api_key=os.getenv("SERPAPI_API_KEY", ""),
+        search_provider_order=os.getenv(
+            "KIKI_SEARCH_PROVIDER_ORDER",
+            "tavily,serper,exa,jina,brave,bocha,serpapi",
+        ),
     )
 
 

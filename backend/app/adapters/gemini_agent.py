@@ -16,10 +16,10 @@ from .base import (
 )
 
 AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (gemini_agent)。
-你可以使用工作区工具（list_files, read_file, write_artifact, run_shell, request_human_approval）来完成用户的复杂任务。
+你可以使用工作区与联网工具（list_files, read_file, write_artifact, run_shell, web_search, fetch_webpage, request_human_approval）来完成用户的复杂任务。
 
 执行规范：
-1. 先探索再操作，合理调用工具获取真实信息。
+1. 先探索再操作，合理调用工具获取真实信息；需要最新资讯、文档或外部资料时，优先调用 `web_search` 与 `fetch_webpage`。
 2. 若需要产出报告、分析文档或代码，使用 `write_artifact` 保存为产物文件。
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
 4. 任务完成时，用简洁、信息密度高的中文给出最终总结（**严格控制在 200 字以内**），直接说明结论与产出物。
@@ -47,6 +47,14 @@ def _step_label_for_tool(tool_name: str, args: dict[str, Any]) -> str:
         cmd = str(args.get("command", ""))
         short_cmd = cmd if len(cmd) <= 45 else cmd[:45] + "…"
         return f"正在执行命令 `{short_cmd}`..."
+    if tool_name == "web_search":
+        q = str(args.get("query", ""))
+        short_q = q if len(q) <= 36 else q[:36] + "…"
+        return f"正在联网搜索「{short_q}」..."
+    if tool_name == "fetch_webpage":
+        u = str(args.get("url", ""))
+        short_u = u if len(u) <= 42 else u[:42] + "…"
+        return f"正在读取网页 {short_u}..."
     if tool_name == "request_human_approval":
         prompt = str(args.get("prompt", "等待人工确认"))
         return f"等待主人拍板：{prompt[:50]}"

@@ -15,6 +15,7 @@ from .db import Database
 from .dream import DreamConsolidator
 from .llm import KikiLLMClient
 from .router import DecisionRouter, FastPathService
+from .search import WebSearchService
 from .schemas import (
     AdapterInfoResponse,
     BatchMessageTopicReassignRequest,
@@ -60,11 +61,13 @@ def create_app(
         gemini_model=cfg.gemini_model,
         gemini_api_key_configured=cfg.api_key_configured,
     )
+    search_service = WebSearchService(cfg)
     tool_executor = WorkspaceToolExecutor(
         workspace_root=cfg.workspace_root,
         artifacts_dir=cfg.artifacts_dir,
         db=database,
         event_bus=bus,
+        search_service=search_service,
     )
     task_manager = TaskManager(
         db=database,
@@ -112,6 +115,7 @@ def create_app(
     app.state.llm = llm_client
     app.state.event_bus = bus
     app.state.adapter_registry = registry
+    app.state.search_service = search_service
     app.state.task_manager = task_manager
     app.state.decision_router = decision_router
     app.state.fast_path = fast_path
@@ -140,6 +144,10 @@ def create_app(
     @app.get("/api/adapters", response_model=list[AdapterInfoResponse])
     async def list_adapters() -> list[AdapterInfoResponse]:
         return [AdapterInfoResponse.model_validate(info.to_dict()) for info in registry.list_infos()]
+
+    @app.get("/api/search/status")
+    async def get_search_status() -> dict[str, Any]:
+        return search_service.status()
 
     # ------------------------------------------------------------------
     # Topics
