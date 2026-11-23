@@ -24,6 +24,7 @@ from .schemas import (
     ChatResponse,
     HealthResponse,
     MessageItem,
+    MessagePageResponse,
     MessageTopicReassignRequest,
     MessageTopicReassignResponse,
     RunActionResponse,
@@ -181,13 +182,25 @@ def create_app(
     # ------------------------------------------------------------------
     # Messages
     # ------------------------------------------------------------------
-    @app.get("/api/messages", response_model=list[MessageItem])
+    @app.get("/api/messages", response_model=MessagePageResponse)
     async def list_messages(
         topic_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=200, ge=1, le=500),
-    ) -> list[MessageItem]:
-        rows = database.list_messages(topic_id=topic_id, limit=limit)
-        return [MessageItem.model_validate(_enrich_message(r, bus)) for r in rows]
+        before_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=40, ge=1, le=200),
+    ) -> MessagePageResponse:
+        page = database.list_messages_page(
+            topic_id=topic_id,
+            before_id=before_id,
+            limit=limit,
+        )
+        return MessagePageResponse(
+            messages=[
+                MessageItem.model_validate(_enrich_message(r, bus))
+                for r in page["messages"]
+            ],
+            has_more=page["has_more"],
+            next_cursor=page["next_cursor"],
+        )
 
     @app.patch("/api/messages/{message_id}/topic", response_model=MessageTopicReassignResponse)
     async def reassign_message_topic(
@@ -356,6 +369,18 @@ def create_app(
     # ------------------------------------------------------------------
     # SessionRuns (Heavy-Path + HITL)
     # ------------------------------------------------------------------
+    @app.get("/api/runs", response_model=list[SessionRunDetail])
+    async def list_runs(
+        active_only: bool = Query(default=True),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[SessionRunDetail]:
+        rows = (
+            database.list_active_session_runs()
+            if active_only
+            else database.list_session_runs(limit=limit)
+        )
+        return [SessionRunDetail.model_validate(bus.enrich_run(r)) for r in rows]
+
     @app.get("/api/runs/{run_id}", response_model=SessionRunDetail)
     async def get_run(run_id: str) -> SessionRunDetail:
         run = database.get_session_run(run_id)

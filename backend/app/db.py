@@ -367,6 +367,29 @@ class Database:
                 return None
             return self._hydrate_run_row(conn, row)
 
+    def list_active_session_runs(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM session_runs
+                WHERE status IN ('queued', 'running', 'waiting_input')
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            return [self._hydrate_run_row(conn, r) for r in rows]
+
+    def list_session_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM session_runs
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [self._hydrate_run_row(conn, r) for r in rows]
+
     def add_step_log(
         self,
         run_id: str,
@@ -440,13 +463,25 @@ class Database:
     # ------------------------------------------------------------------
     # Messages
     # ------------------------------------------------------------------
-    def _hydrate_message_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    def _hydrate_message_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        topic_cache: Optional[dict[str, Optional[dict[str, Any]]]] = None,
+    ) -> dict[str, Any]:
         metadata = _parse_metadata(row["metadata"])
-        topic_row = conn.execute(
-            "SELECT * FROM topics WHERE id = ?",
-            (row["topic_id"],),
-        ).fetchone()
-        topic = self._hydrate_topic_row(conn, topic_row) if topic_row else None
+        tid = row["topic_id"]
+        if topic_cache is not None and tid in topic_cache:
+            topic = topic_cache[tid]
+        else:
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            topic = self._hydrate_topic_row(conn, topic_row) if topic_row else None
+            if topic_cache is not None:
+                topic_cache[tid] = topic
 
         run_dict: Optional[dict[str, Any]] = None
         run_id = metadata.get("session_run_id")
@@ -464,7 +499,7 @@ class Database:
 
         return {
             "id": row["id"],
-            "topic_id": row["topic_id"],
+            "topic_id": tid,
             "role": row["role"],
             "content": row["content"],
             "metadata": metadata,
@@ -536,32 +571,86 @@ class Database:
                 return None
             return self._hydrate_message_row(conn, row)
 
-    def list_messages(
+    def list_messages_page(
         self,
         topic_id: Optional[str] = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
+        *,
+        before_id: Optional[str] = None,
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        """Return a chronological page of the latest messages (or older than before_id)."""
+        fetch_limit = max(1, int(limit)) + 1
         with self._connect() as conn:
-            if topic_id:
+            before_rowid: Optional[int] = None
+            if before_id:
+                cursor_row = conn.execute(
+                    "SELECT rowid AS _rowid FROM messages WHERE id = ?",
+                    (before_id,),
+                ).fetchone()
+                if not cursor_row:
+                    return {"messages": [], "has_more": False, "next_cursor": None}
+                before_rowid = int(cursor_row["_rowid"])
+
+            if topic_id and before_rowid is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE topic_id = ? AND rowid < ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (topic_id, before_rowid, fetch_limit),
+                ).fetchall()
+            elif topic_id:
                 rows = conn.execute(
                     """
                     SELECT * FROM messages
                     WHERE topic_id = ?
-                    ORDER BY created_at ASC
+                    ORDER BY rowid DESC
                     LIMIT ?
                     """,
-                    (topic_id, limit),
+                    (topic_id, fetch_limit),
+                ).fetchall()
+            elif before_rowid is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE rowid < ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (before_rowid, fetch_limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """
                     SELECT * FROM messages
-                    ORDER BY created_at ASC
+                    ORDER BY rowid DESC
                     LIMIT ?
                     """,
-                    (limit,),
+                    (fetch_limit,),
                 ).fetchall()
-            return [self._hydrate_message_row(conn, r) for r in rows]
+
+            has_more = len(rows) > limit
+            page_rows = list(reversed(rows[:limit]))
+            topic_cache: dict[str, Optional[dict[str, Any]]] = {}
+            messages = [
+                self._hydrate_message_row(conn, r, topic_cache=topic_cache)
+                for r in page_rows
+            ]
+            next_cursor = page_rows[0]["id"] if (has_more and page_rows) else None
+            return {
+                "messages": messages,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
+
+    def list_messages(
+        self,
+        topic_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return self.list_messages_page(topic_id=topic_id, limit=limit)["messages"]
 
     def get_topic_history(self, topic_id: str, limit: int = 20) -> list[dict[str, str]]:
         with self._connect() as conn:

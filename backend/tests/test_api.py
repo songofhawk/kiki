@@ -219,7 +219,7 @@ async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path):
 
         # Wait briefly for background streaming to finish
         await asyncio.sleep(0.15)
-        msgs = (await client.get("/api/messages")).json()
+        msgs = (await client.get("/api/messages")).json()["messages"]
         assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         assert "喵~" in assistant_msgs[0]["content"]
@@ -351,7 +351,7 @@ async def test_heavy_path_tools_artifacts_and_toast(tmp_path: Path):
         topic = next(t for t in topics if t["id"] == topic_id)
         assert topic["unread"] is True
 
-        msgs = (await client.get(f"/api/messages?topic_id={topic_id}")).json()
+        msgs = (await client.get(f"/api/messages?topic_id={topic_id}")).json()["messages"]
         assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         assert len(assistant_msgs[0]["content"]) <= 200
@@ -528,7 +528,7 @@ async def test_recursive_upward_backtrack_on_topic_create_and_pair_integrity(tmp
             assert m["metadata"]["backtracked"] is True
             assert m["metadata"]["reassigned_from"] == "topic-general"
 
-        general_msgs = (await client.get("/api/messages?topic_id=topic-general")).json()
+        general_msgs = (await client.get("/api/messages?topic_id=topic-general")).json()["messages"]
         assert [m["id"] for m in general_msgs] == [u0["id"], a0["id"]]
 
         # Wait briefly for fast reply streaming to complete and verify FastPath received backtracked history
@@ -537,7 +537,7 @@ async def test_recursive_upward_backtrack_on_topic_create_and_pair_integrity(tmp
         assert "下个月准备离职了" in history_contents
         assert "北京可以自己交灵活就业吗？" in history_contents
 
-        topic_msgs = (await client.get(f"/api/messages?topic_id={new_topic_id}")).json()
+        topic_msgs = (await client.get(f"/api/messages?topic_id={new_topic_id}")).json()["messages"]
         # 6 backtracked + 1 new user + 1 new assistant = 8
         assert len(topic_msgs) == 8
 
@@ -769,3 +769,87 @@ async def test_batch_multi_select_message_topic_split_and_move(tmp_path: Path):
 
         updated_msg_ids = [p["message"]["id"] for et, p in sse_events if et == "message_updated"]
         assert updated_msg_ids == [m1["id"], m2["id"], m3["id"], m4["id"]]
+
+
+@pytest.mark.asyncio
+async def test_messages_cursor_pagination_and_active_runs(tmp_path: Path):
+    app, db, _bus, _fake_llm, _db_path = _build_test_app(tmp_path)
+    db.ensure_general_topic()
+    topic_a = db.create_topic(title="话题A")
+    topic_b = db.create_topic(title="话题B")
+
+    # Insert 10 messages across two topics so global stream & topic stream both paginate cleanly
+    created_all: list[dict[str, Any]] = []
+    created_a: list[dict[str, Any]] = []
+    for i in range(1, 11):
+        tid = topic_a["id"] if i % 2 == 1 else topic_b["id"]
+        msg = db.create_message(tid, "user", f"msg-{i}")
+        created_all.append(msg)
+        if tid == topic_a["id"]:
+            created_a.append(msg)
+
+    # Create an active run attached to the OLDEST message (outside latest page!)
+    old_active_run = db.create_session_run(
+        topic_id=topic_a["id"],
+        trigger_message_id=created_all[0]["id"],
+        agent_type="gemini_agent",
+        status="running",
+        current_step="正在处理旧任务",
+    )
+    # Create a completed run (should NOT be returned when active_only=true)
+    db.create_session_run(
+        topic_id=topic_b["id"],
+        trigger_message_id=created_all[-1]["id"],
+        agent_type="gemini_agent",
+        status="completed",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. Global stream first page returns LATEST 4 messages in chronological order
+        p1 = (await client.get("/api/messages?limit=4")).json()
+        assert [m["content"] for m in p1["messages"]] == ["msg-7", "msg-8", "msg-9", "msg-10"]
+        assert p1["has_more"] is True
+        assert p1["next_cursor"] == created_all[6]["id"]
+
+        # Simulate a brand-new message arriving while user is scrolling up
+        db.create_message(topic_b["id"], "assistant", "msg-11-live")
+
+        # 2. Global stream second page using before_id must NOT duplicate or skip due to msg-11-live
+        p2 = (
+            await client.get(f"/api/messages?limit=4&before_id={p1['next_cursor']}")
+        ).json()
+        assert [m["content"] for m in p2["messages"]] == ["msg-3", "msg-4", "msg-5", "msg-6"]
+        assert p2["has_more"] is True
+        assert p2["next_cursor"] == created_all[2]["id"]
+
+        # 3. Global stream final page reaches beginning
+        p3 = (
+            await client.get(f"/api/messages?limit=4&before_id={p2['next_cursor']}")
+        ).json()
+        assert [m["content"] for m in p3["messages"]] == ["msg-1", "msg-2"]
+        assert p3["has_more"] is False
+        assert p3["next_cursor"] is None
+
+        # 4. Topic-scoped pagination independently pages only topic_a messages (msg-1,3,5,7,9)
+        tp1 = (await client.get(f"/api/messages?topic_id={topic_a['id']}&limit=3")).json()
+        assert [m["content"] for m in tp1["messages"]] == ["msg-5", "msg-7", "msg-9"]
+        assert tp1["has_more"] is True
+        assert tp1["next_cursor"] == created_a[2]["id"]
+
+        tp2 = (
+            await client.get(
+                f"/api/messages?topic_id={topic_a['id']}&limit=3&before_id={tp1['next_cursor']}"
+            )
+        ).json()
+        assert [m["content"] for m in tp2["messages"]] == ["msg-1", "msg-3"]
+        assert tp2["has_more"] is False
+        assert tp2["next_cursor"] is None
+
+        # 5. Active runs endpoint surfaces active runs even when their trigger message is on an older page
+        active_runs = (await client.get("/api/runs?active_only=true")).json()
+        assert [r["id"] for r in active_runs] == [old_active_run["id"]]
+
+        all_runs = (await client.get("/api/runs?active_only=false")).json()
+        assert len(all_runs) == 2

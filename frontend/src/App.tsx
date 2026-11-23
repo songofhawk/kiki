@@ -18,9 +18,10 @@ import {
   cancelRun,
   connectEventStream,
   createTopic,
+  fetchActiveRuns,
   fetchAdapters,
   fetchHealth,
-  fetchMessages,
+  fetchMessagesPage,
   fetchRun,
   fetchTopics,
   reassignMessageTopic,
@@ -49,6 +50,27 @@ import ToastContainer from './components/ToastContainer';
 
 type PathOption = 'auto' | 'fast' | 'heavy';
 
+const ALL_STREAM_KEY = '__all__';
+const MESSAGE_PAGE_SIZE = 40;
+
+interface StreamPageState {
+  messages: Message[];
+  hasMore: boolean;
+  nextCursor: string | null;
+  loaded: boolean;
+  loadingInitial: boolean;
+  loadingOlder: boolean;
+}
+
+const EMPTY_STREAM: StreamPageState = {
+  messages: [],
+  hasMore: false,
+  nextCursor: null,
+  loaded: false,
+  loadingInitial: false,
+  loadingOlder: false,
+};
+
 function upsertTopic(list: Topic[], incoming: Topic): Topic[] {
   const idx = list.findIndex((t) => t.id === incoming.id);
   const next =
@@ -73,6 +95,30 @@ function upsertMessage(list: Message[], incoming: Message): Message[] {
     );
   }
   return [...list, incoming];
+}
+
+function upsertMessageChronological(list: Message[], incoming: Message): Message[] {
+  const idx = list.findIndex((m) => m.id === incoming.id);
+  if (idx >= 0) {
+    return list.map((m, i) =>
+      i === idx
+        ? {
+          ...m,
+          ...incoming,
+          session_run: incoming.session_run ?? m.session_run,
+          topic: incoming.topic ?? m.topic,
+        }
+        : m
+    );
+  }
+  const incomingTs = incoming.created_at || '';
+  const insertAt = list.findIndex((m) => (m.created_at || '') > incomingTs);
+  if (insertAt < 0) {
+    return [...list, incoming];
+  }
+  const next = list.slice();
+  next.splice(insertAt, 0, incoming);
+  return next;
 }
 
 function replaceOptimisticOrUpsert(
@@ -105,27 +151,148 @@ function replaceOptimisticOrUpsert(
   return [...list, incoming];
 }
 
+function applyMessageCreatedToStreams(
+  prev: Record<string, StreamPageState>,
+  incoming: Message,
+  tempId?: string
+): Record<string, StreamPageState> {
+  const next: Record<string, StreamPageState> = { ...prev };
+  const targetKeys = new Set<string>([ALL_STREAM_KEY, incoming.topic_id]);
+
+  for (const [key, stream] of Object.entries(prev)) {
+    if (targetKeys.has(key)) {
+      if (stream.loaded || stream.messages.length > 0) {
+        next[key] = {
+          ...stream,
+          messages: replaceOptimisticOrUpsert(stream.messages, tempId, incoming),
+        };
+      }
+    } else if (tempId && stream.messages.some((m) => m.id === tempId)) {
+      next[key] = {
+        ...stream,
+        messages: stream.messages.filter((m) => m.id !== tempId),
+      };
+    }
+  }
+  return next;
+}
+
+function applyMessageUpdatedToStreams(
+  prev: Record<string, StreamPageState>,
+  incoming: Message
+): Record<string, StreamPageState> {
+  let changed = false;
+  const next: Record<string, StreamPageState> = { ...prev };
+
+  for (const [key, stream] of Object.entries(prev)) {
+    if (!stream.loaded && stream.messages.length === 0) continue;
+
+    if (key === ALL_STREAM_KEY) {
+      if (stream.messages.some((m) => m.id === incoming.id)) {
+        next[key] = {
+          ...stream,
+          messages: upsertMessage(stream.messages, incoming),
+        };
+        changed = true;
+      }
+      continue;
+    }
+
+    if (key === incoming.topic_id) {
+      const exists = stream.messages.some((m) => m.id === incoming.id);
+      if (exists) {
+        next[key] = {
+          ...stream,
+          messages: upsertMessage(stream.messages, incoming),
+        };
+        changed = true;
+      } else {
+        const oldestTs = stream.messages[0]?.created_at || '';
+        const incomingTs = incoming.created_at || '';
+        if (!stream.hasMore || stream.messages.length === 0 || incomingTs >= oldestTs) {
+          next[key] = {
+            ...stream,
+            messages: upsertMessageChronological(stream.messages, incoming),
+          };
+          changed = true;
+        }
+      }
+    } else if (stream.messages.some((m) => m.id === incoming.id)) {
+      next[key] = {
+        ...stream,
+        messages: stream.messages.filter((m) => m.id !== incoming.id),
+      };
+      changed = true;
+    }
+  }
+
+  return changed ? next : prev;
+}
+
+function applyMessageDeltaToStreams(
+  prev: Record<string, StreamPageState>,
+  messageId: string,
+  topicId: string,
+  delta: string
+): Record<string, StreamPageState> {
+  const next: Record<string, StreamPageState> = { ...prev };
+  const targetKeys = [ALL_STREAM_KEY, topicId];
+  let changed = false;
+
+  for (const key of targetKeys) {
+    const stream = prev[key];
+    if (!stream || (!stream.loaded && stream.messages.length === 0)) continue;
+    const exists = stream.messages.some((m) => m.id === messageId);
+    const updatedMessages = exists
+      ? stream.messages.map((m) =>
+        m.id === messageId
+          ? { ...m, content: (m.content || '') + delta, streaming: true }
+          : m
+      )
+      : [
+        ...stream.messages,
+        {
+          id: messageId,
+          topic_id: topicId,
+          role: 'assistant' as const,
+          content: delta,
+          created_at: new Date().toISOString(),
+          streaming: true,
+        },
+      ];
+    next[key] = { ...stream, messages: updatedMessages };
+    changed = true;
+  }
+
+  return changed ? next : prev;
+}
+
 function mergeRun(prev: SessionRun | undefined, incoming: SessionRun): SessionRun {
   if (!prev) return incoming;
+  const incomingIsOlder =
+    Boolean(incoming.updated_at && prev.updated_at) &&
+    incoming.updated_at < prev.updated_at;
+  const primary = incomingIsOlder ? prev : incoming;
+  const secondary = incomingIsOlder ? incoming : prev;
   return {
-    ...prev,
-    ...incoming,
+    ...secondary,
+    ...primary,
     step_logs:
-      incoming.step_logs && incoming.step_logs.length > 0
-        ? incoming.step_logs
-        : prev.step_logs,
+      primary.step_logs && primary.step_logs.length > 0
+        ? primary.step_logs
+        : secondary.step_logs,
     artifacts:
-      incoming.artifacts && incoming.artifacts.length > 0
-        ? incoming.artifacts
-        : prev.artifacts,
+      primary.artifacts && primary.artifacts.length > 0
+        ? primary.artifacts
+        : secondary.artifacts,
     raw_logs:
-      incoming.raw_logs && incoming.raw_logs.length > 0
-        ? incoming.raw_logs
-        : prev.raw_logs,
+      primary.raw_logs && primary.raw_logs.length > 0
+        ? primary.raw_logs
+        : secondary.raw_logs,
     hitl_request:
-      incoming.status === 'waiting_input'
-        ? incoming.hitl_request ?? prev.hitl_request
-        : incoming.hitl_request ?? null,
+      primary.status === 'waiting_input'
+        ? primary.hitl_request ?? secondary.hitl_request
+        : primary.hitl_request ?? null,
   };
 }
 
@@ -134,7 +301,11 @@ export const App: React.FC = () => {
   const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
   const [selectedAgentType, setSelectedAgentType] = useState<string>('gemini_agent');
   const [topics, setTopics] = useState<Topic[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [streamsByKey, setStreamsByKey] = useState<Record<string, StreamPageState>>({
+    [ALL_STREAM_KEY]: { ...EMPTY_STREAM, loadingInitial: true },
+  });
+  const streamsByKeyRef = useRef<Record<string, StreamPageState>>(streamsByKey);
+  streamsByKeyRef.current = streamsByKey;
   const [runsById, setRunsById] = useState<Record<string, SessionRun>>({});
   const [rawLogsByRunId, setRawLogsByRunId] = useState<Record<string, RawLogLine[]>>({});
 
@@ -163,6 +334,152 @@ export const App: React.FC = () => {
   const lastSelectedMsgIdRef = useRef<string | null>(null);
   const pendingOptimisticRef = useRef<Array<{ tempId: string; content: string }>>([]);
   const resolvedOptimisticMapRef = useRef<Map<string, string>>(new Map());
+  const loadingInitialKeysRef = useRef<Set<string>>(new Set());
+  const loadingOlderKeysRef = useRef<Set<string>>(new Set());
+
+  const hydrateRunsFromMessages = useCallback((msgs: Message[]) => {
+    const found: SessionRun[] = [];
+    for (const msg of msgs) {
+      if (msg.session_run) {
+        found.push(msg.session_run);
+      }
+    }
+    if (found.length === 0) return;
+    setRunsById((prev) => {
+      const next = { ...prev };
+      for (const run of found) {
+        next[run.id] = mergeRun(prev[run.id], run);
+      }
+      return next;
+    });
+  }, []);
+
+  const loadStreamFirstPage = useCallback(
+    async (topicId: string | null) => {
+      const viewKey = topicId ?? ALL_STREAM_KEY;
+      if (loadingInitialKeysRef.current.has(viewKey)) return;
+      loadingInitialKeysRef.current.add(viewKey);
+
+      setStreamsByKey((prev) => ({
+        ...prev,
+        [viewKey]: {
+          ...(prev[viewKey] ?? EMPTY_STREAM),
+          loadingInitial: true,
+        },
+      }));
+
+      try {
+        const page = await fetchMessagesPage({
+          topicId,
+          limit: MESSAGE_PAGE_SIZE,
+        });
+        hydrateRunsFromMessages(page.messages);
+        setStreamsByKey((prev) => {
+          const current = prev[viewKey];
+          let merged = page.messages;
+          if (current && current.messages.length > 0) {
+            const fetchedIds = new Set(page.messages.map((m) => m.id));
+            const liveTail = current.messages.filter(
+              (m) => !fetchedIds.has(m.id) && (m.streaming || m.metadata?.optimistic)
+            );
+            if (liveTail.length > 0) {
+              merged = [...page.messages, ...liveTail];
+            }
+          }
+          return {
+            ...prev,
+            [viewKey]: {
+              messages: merged,
+              hasMore: page.has_more,
+              nextCursor: page.next_cursor,
+              loaded: true,
+              loadingInitial: false,
+              loadingOlder: false,
+            },
+          };
+        });
+      } catch (err) {
+        setStreamsByKey((prev) => ({
+          ...prev,
+          [viewKey]: {
+            ...(prev[viewKey] ?? EMPTY_STREAM),
+            loadingInitial: false,
+          },
+        }));
+        setErrorBanner(
+          err instanceof Error ? err.message : '加载消息历史失败，请检查后端服务是否已启动'
+        );
+      } finally {
+        loadingInitialKeysRef.current.delete(viewKey);
+      }
+    },
+    [hydrateRunsFromMessages]
+  );
+
+  const handleLoadOlder = useCallback(async () => {
+    const topicId = focusTopicIdRef.current;
+    const viewKey = topicId ?? ALL_STREAM_KEY;
+    const current = streamsByKeyRef.current[viewKey];
+    if (
+      !current ||
+      !current.loaded ||
+      !current.hasMore ||
+      !current.nextCursor ||
+      loadingOlderKeysRef.current.has(viewKey)
+    ) {
+      return;
+    }
+
+    const cursor = current.nextCursor;
+    loadingOlderKeysRef.current.add(viewKey);
+    setStreamsByKey((prev) => {
+      const existing = prev[viewKey];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        [viewKey]: { ...existing, loadingOlder: true },
+      };
+    });
+
+    try {
+      const page = await fetchMessagesPage({
+        topicId,
+        beforeId: cursor,
+        limit: MESSAGE_PAGE_SIZE,
+      });
+      hydrateRunsFromMessages(page.messages);
+      setStreamsByKey((prev) => {
+        const existing = prev[viewKey];
+        if (!existing) return prev;
+        const existingIds = new Set(existing.messages.map((m) => m.id));
+        const uniqueOlder = page.messages.filter((m) => !existingIds.has(m.id));
+        return {
+          ...prev,
+          [viewKey]: {
+            ...existing,
+            messages: [...uniqueOlder, ...existing.messages],
+            hasMore: page.has_more,
+            nextCursor: page.next_cursor,
+            loadingOlder: false,
+          },
+        };
+      });
+    } catch (err) {
+      setStreamsByKey((prev) => {
+        const existing = prev[viewKey];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          [viewKey]: { ...existing, loadingOlder: false },
+        };
+      });
+      setErrorBanner(
+        err instanceof Error ? err.message : '加载更早的消息失败，请重试'
+      );
+    } finally {
+      loadingOlderKeysRef.current.delete(viewKey);
+    }
+  }, [hydrateRunsFromMessages]);
 
   const pushToast = useCallback(
     (payload: {
@@ -189,31 +506,72 @@ export const App: React.FC = () => {
     setToasts((prev) => prev.filter((t) => t.id !== toastId));
   }, []);
 
-  // Hydrate initial state
+  // Hydrate initial state (latest page of All Stream + active runs)
   const loadInitialData = useCallback(async () => {
+    loadingInitialKeysRef.current.add(ALL_STREAM_KEY);
     try {
-      const [healthRes, adaptersRes, topicsRes, messagesRes] = await Promise.all([
-        fetchHealth().catch(() => null),
-        fetchAdapters().catch(() => []),
-        fetchTopics(),
-        fetchMessages(),
-      ]);
+      const [healthRes, adaptersRes, topicsRes, activeRunsRes, messagesPage] =
+        await Promise.all([
+          fetchHealth().catch(() => null),
+          fetchAdapters().catch(() => []),
+          fetchTopics(),
+          fetchActiveRuns().catch(() => []),
+          fetchMessagesPage({ limit: MESSAGE_PAGE_SIZE }),
+        ]);
       if (healthRes) setHealth(healthRes);
       if (adaptersRes.length > 0) setAdapters(adaptersRes);
       setTopics(topicsRes);
-      setMessages(messagesRes);
 
-      const initialRuns: Record<string, SessionRun> = {};
-      for (const msg of messagesRes) {
-        if (msg.session_run) {
-          initialRuns[msg.session_run.id] = msg.session_run;
+      setStreamsByKey((prev) => {
+        const current = prev[ALL_STREAM_KEY];
+        let merged = messagesPage.messages;
+        if (current && current.messages.length > 0) {
+          const fetchedIds = new Set(messagesPage.messages.map((m) => m.id));
+          const liveTail = current.messages.filter(
+            (m) => !fetchedIds.has(m.id) && (m.streaming || m.metadata?.optimistic)
+          );
+          if (liveTail.length > 0) {
+            merged = [...messagesPage.messages, ...liveTail];
+          }
         }
-      }
-      setRunsById((prev) => ({ ...prev, ...initialRuns }));
+        return {
+          ...prev,
+          [ALL_STREAM_KEY]: {
+            messages: merged,
+            hasMore: messagesPage.has_more,
+            nextCursor: messagesPage.next_cursor,
+            loaded: true,
+            loadingInitial: false,
+            loadingOlder: false,
+          },
+        };
+      });
+
+      setRunsById((prev) => {
+        const next = { ...prev };
+        for (const msg of messagesPage.messages) {
+          if (msg.session_run) {
+            next[msg.session_run.id] = mergeRun(next[msg.session_run.id], msg.session_run);
+          }
+        }
+        for (const run of activeRunsRes) {
+          next[run.id] = mergeRun(next[run.id], run);
+        }
+        return next;
+      });
     } catch (err) {
+      setStreamsByKey((prev) => ({
+        ...prev,
+        [ALL_STREAM_KEY]: {
+          ...(prev[ALL_STREAM_KEY] ?? EMPTY_STREAM),
+          loadingInitial: false,
+        },
+      }));
       setErrorBanner(
         err instanceof Error ? err.message : '加载初始数据失败，请检查后端服务是否已启动'
       );
+    } finally {
+      loadingInitialKeysRef.current.delete(ALL_STREAM_KEY);
     }
   }, []);
 
@@ -248,14 +606,14 @@ export const App: React.FC = () => {
           if (matchIdx >= 0) {
             const [matched] = pendingOptimisticRef.current.splice(matchIdx, 1);
             resolvedOptimisticMapRef.current.set(matched.tempId, message.id);
-            setMessages((prev) =>
-              replaceOptimisticOrUpsert(prev, matched.tempId, message)
+            setStreamsByKey((prev) =>
+              applyMessageCreatedToStreams(prev, message, matched.tempId)
             );
           } else {
-            setMessages((prev) => upsertMessage(prev, message));
+            setStreamsByKey((prev) => applyMessageCreatedToStreams(prev, message));
           }
         } else {
-          setMessages((prev) => upsertMessage(prev, message));
+          setStreamsByKey((prev) => applyMessageCreatedToStreams(prev, message));
         }
         if (message.session_run) {
           setRunsById((prev) => ({
@@ -268,50 +626,47 @@ export const App: React.FC = () => {
         }
       },
       onMessageDelta: ({ message_id, topic_id, delta }) => {
-        setMessages((prev) => {
-          const exists = prev.some((m) => m.id === message_id);
-          if (!exists) {
-            return [
-              ...prev,
-              {
-                id: message_id,
-                topic_id,
-                role: 'assistant',
-                content: delta,
-                created_at: new Date().toISOString(),
-                streaming: true,
-              },
-            ];
-          }
-          return prev.map((m) =>
-            m.id === message_id
-              ? { ...m, content: (m.content || '') + delta, streaming: true }
-              : m
-          );
-        });
+        setStreamsByKey((prev) =>
+          applyMessageDeltaToStreams(prev, message_id, topic_id, delta)
+        );
       },
       onMessageCompleted: ({ message }) => {
-        setMessages((prev) =>
-          upsertMessage(prev, { ...message, streaming: false })
+        setStreamsByKey((prev) =>
+          applyMessageCreatedToStreams(prev, { ...message, streaming: false })
         );
       },
       onMessageUpdated: ({ message }) => {
-        setMessages((prev) => upsertMessage(prev, message));
+        setStreamsByKey((prev) => applyMessageUpdatedToStreams(prev, message));
       },
       onRunCreated: ({ run }) => {
         setRunsById((prev) => ({
           ...prev,
           [run.id]: mergeRun(prev[run.id], run),
         }));
-        // Ensure trigger message points to this run
+        // Ensure trigger message points to this run across all loaded streams
         if (run.trigger_message_id) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === run.trigger_message_id && !m.session_run
-                ? { ...m, session_run: run }
-                : m
-            )
-          );
+          setStreamsByKey((prev) => {
+            let changed = false;
+            const next: Record<string, StreamPageState> = { ...prev };
+            for (const [key, stream] of Object.entries(prev)) {
+              if (
+                stream.messages.some(
+                  (m) => m.id === run.trigger_message_id && !m.session_run
+                )
+              ) {
+                next[key] = {
+                  ...stream,
+                  messages: stream.messages.map((m) =>
+                    m.id === run.trigger_message_id && !m.session_run
+                      ? { ...m, session_run: run }
+                      : m
+                  ),
+                };
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
         }
         fetchTopics()
           .then((list) => setTopics(list))
@@ -414,16 +769,18 @@ export const App: React.FC = () => {
     return map;
   }, [topics]);
 
-  const visibleMessages = useMemo(() => {
-    if (!focusTopicId) return messages;
-    return messages.filter((m) => m.topic_id === focusTopicId);
-  }, [messages, focusTopicId]);
+  const currentViewKey = focusTopicId ?? ALL_STREAM_KEY;
+  const currentStream = streamsByKey[currentViewKey] ?? EMPTY_STREAM;
+  const visibleMessages = currentStream.messages;
 
   const focusedTopic = focusTopicId ? topicsById[focusTopicId] ?? null : null;
 
   const hasStreamingMessage = useMemo(
-    () => messages.some((m) => m.streaming),
-    [messages]
+    () =>
+      Object.values(streamsByKey).some((stream) =>
+        stream.messages.some((m) => m.streaming)
+      ),
+    [streamsByKey]
   );
 
   const globalKikiStatus: KikiStatus = useMemo(() => {
@@ -524,19 +881,36 @@ export const App: React.FC = () => {
         );
         updateTopic(topicId, { unread: false }).catch(() => { });
       }
+      if (!streamsByKeyRef.current[topicId]?.loaded) {
+        void loadStreamFirstPage(topicId);
+      }
     },
-    [topics]
+    [topics, loadStreamFirstPage]
   );
 
   const handleSelectAllStream = useCallback(() => {
     setFocusTopicId(null);
     setMobileSidebarOpen(false);
-  }, []);
+    if (!streamsByKeyRef.current[ALL_STREAM_KEY]?.loaded) {
+      void loadStreamFirstPage(null);
+    }
+  }, [loadStreamFirstPage]);
 
   const handleCreateTopic = useCallback(async (title: string) => {
     try {
       const created = await createTopic({ title });
       setTopics((prev) => upsertTopic(prev, created));
+      setStreamsByKey((prev) => ({
+        ...prev,
+        [created.id]: {
+          messages: [],
+          hasMore: false,
+          nextCursor: null,
+          loaded: true,
+          loadingInitial: false,
+          loadingOlder: false,
+        },
+      }));
       setFocusTopicId(created.id);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : '创建话题失败');
@@ -571,7 +945,22 @@ export const App: React.FC = () => {
         topic: focusTopicId ? topicsById[focusTopicId] ?? null : null,
       };
       pendingOptimisticRef.current.push({ tempId, content });
-      setMessages((prev) => [...prev, optimisticUser]);
+      setStreamsByKey((prev) => {
+        const next: Record<string, StreamPageState> = { ...prev };
+        const activeKey = focusTopicId ?? ALL_STREAM_KEY;
+        const activeStream = prev[activeKey] ?? { ...EMPTY_STREAM, loaded: true };
+        next[activeKey] = {
+          ...activeStream,
+          messages: [...activeStream.messages, optimisticUser],
+        };
+        if (activeKey !== ALL_STREAM_KEY && prev[ALL_STREAM_KEY]?.loaded) {
+          next[ALL_STREAM_KEY] = {
+            ...prev[ALL_STREAM_KEY],
+            messages: [...prev[ALL_STREAM_KEY].messages, optimisticUser],
+          };
+        }
+        return next;
+      });
 
       try {
         const res = await sendChat({
@@ -585,10 +974,10 @@ export const App: React.FC = () => {
           setTopics((prev) => upsertTopic(prev, res.topic));
         }
         if (res.reassigned_messages && res.reassigned_messages.length > 0) {
-          setMessages((prev) =>
+          setStreamsByKey((prev) =>
             res.reassigned_messages!.reduce(
               (acc, msg) =>
-                upsertMessage(acc, {
+                applyMessageUpdatedToStreams(acc, {
                   ...msg,
                   topic: res.topic ?? msg.topic,
                 }),
@@ -609,8 +998,8 @@ export const App: React.FC = () => {
                 ? res.session_run
                 : res.user_message.session_run,
           };
-          setMessages((prev) =>
-            replaceOptimisticOrUpsert(prev, tempId, enrichedUser)
+          setStreamsByKey((prev) =>
+            applyMessageCreatedToStreams(prev, enrichedUser, tempId)
           );
         }
         if (res.assistant_message) {
@@ -619,7 +1008,9 @@ export const App: React.FC = () => {
             topic: res.topic ?? res.assistant_message.topic,
             session_run: res.session_run ?? res.assistant_message.session_run,
           };
-          setMessages((prev) => upsertMessage(prev, enrichedAssistant));
+          setStreamsByKey((prev) =>
+            applyMessageCreatedToStreams(prev, enrichedAssistant)
+          );
         }
         if (res.session_run) {
           setRunsById((prev) => ({
@@ -635,7 +1026,16 @@ export const App: React.FC = () => {
           (item) => item.tempId !== tempId
         );
         resolvedOptimisticMapRef.current.delete(tempId);
-        setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        setStreamsByKey((prev) => {
+          const next: Record<string, StreamPageState> = {};
+          for (const [key, stream] of Object.entries(prev)) {
+            next[key] = {
+              ...stream,
+              messages: stream.messages.filter((m) => m.id !== tempId),
+            };
+          }
+          return next;
+        });
         setErrorBanner(
           err instanceof Error ? err.message : '发送消息失败，请稍后重试'
         );
@@ -657,8 +1057,8 @@ export const App: React.FC = () => {
           setTopics((prev) => upsertTopic(prev, res.topic));
         }
         if (res.message) {
-          setMessages((prev) =>
-            upsertMessage(prev, {
+          setStreamsByKey((prev) =>
+            applyMessageUpdatedToStreams(prev, {
               ...res.message,
               topic: res.topic ?? res.message.topic,
             })
@@ -751,10 +1151,10 @@ export const App: React.FC = () => {
           setTopics((prev) => upsertTopic(prev, res.topic));
         }
         if (res.messages?.length) {
-          setMessages((prev) =>
+          setStreamsByKey((prev) =>
             res.messages.reduce(
               (acc, msg) =>
-                upsertMessage(acc, {
+                applyMessageUpdatedToStreams(acc, {
                   ...msg,
                   topic: res.topic ?? msg.topic,
                 }),
@@ -965,6 +1365,10 @@ export const App: React.FC = () => {
           allTopics={topics}
           runsById={runsById}
           focusTopicId={focusTopicId}
+          hasMore={currentStream.hasMore}
+          loadingInitial={currentStream.loadingInitial}
+          loadingOlder={currentStream.loadingOlder}
+          onLoadOlder={handleLoadOlder}
           sending={sending}
           selectionMode={selectionMode}
           selectedMessageIds={selectedMessageIds}

@@ -9,6 +9,7 @@ import type {
   HitlRequest,
   KikiStatus,
   Message,
+  MessagePage,
   RawLogLine,
   ReassignTopicPayload,
   ReassignTopicResponse,
@@ -81,12 +82,41 @@ export async function updateTopic(
   return 'topic' in data ? data.topic : data;
 }
 
-export async function fetchMessages(topicId?: string | null): Promise<Message[]> {
-  const query = topicId ? `?topic_id=${encodeURIComponent(topicId)}` : '';
-  const data = await requestJson<Message[] | { messages: Message[] }>(
-    `/messages${query}`
+export interface FetchMessagesOptions {
+  topicId?: string | null;
+  beforeId?: string | null;
+  limit?: number;
+}
+
+export async function fetchMessagesPage(
+  options: FetchMessagesOptions = {}
+): Promise<MessagePage> {
+  const params = new URLSearchParams();
+  if (options.topicId) {
+    params.set('topic_id', options.topicId);
+  }
+  if (options.beforeId) {
+    params.set('before_id', options.beforeId);
+  }
+  if (typeof options.limit === 'number') {
+    params.set('limit', String(options.limit));
+  }
+  const qs = params.toString();
+  const data = await requestJson<Message[] | MessagePage>(
+    `/messages${qs ? `?${qs}` : ''}`
   );
-  return Array.isArray(data) ? data : data.messages ?? [];
+  if (Array.isArray(data)) {
+    return { messages: data, has_more: false, next_cursor: null };
+  }
+  return {
+    messages: data.messages ?? [],
+    has_more: Boolean(data.has_more),
+    next_cursor: data.next_cursor ?? null,
+  };
+}
+
+export async function fetchActiveRuns(): Promise<SessionRun[]> {
+  return requestJson<SessionRun[]>('/runs?active_only=true');
 }
 
 export async function sendChat(payload: ChatRequest): Promise<ChatResponse> {

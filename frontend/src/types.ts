@@ -118,6 +118,12 @@ export interface Message {
   streaming?: boolean;
 }
 
+export interface MessagePage {
+  messages: Message[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
 export interface AdapterInfo {
   id: string;
   name: string;

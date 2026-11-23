@@ -1,6 +1,8 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import {
+  ArrowDown,
   Check,
+  ChevronUp,
   GripVertical,
   Loader2,
   MessageCircle,
@@ -26,6 +28,10 @@ export interface UnifiedMessageListProps {
   allTopics: Topic[];
   runsById: Record<string, SessionRun>;
   focusTopicId: string | null;
+  hasMore?: boolean;
+  loadingInitial?: boolean;
+  loadingOlder?: boolean;
+  onLoadOlder?: () => void;
   sending?: boolean;
   selectionMode?: boolean;
   selectedMessageIds?: Set<string>;
@@ -117,6 +123,10 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   allTopics,
   runsById,
   focusTopicId,
+  hasMore = false,
+  loadingInitial = false,
+  loadingOlder = false,
+  onLoadOlder,
   sending = false,
   selectionMode = false,
   selectedMessageIds,
@@ -129,12 +139,138 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   onCancelRun,
   onStarterPrompt,
 }) => {
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const [userProfile] = useUserProfile();
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages.length, focusTopicId]);
+  const viewKey = focusTopicId ?? '__all__';
+  const prevViewKeyRef = useRef<string>(viewKey);
+  const prevSnapshotRef = useRef<{
+    firstId: string | null;
+    lastId: string | null;
+    lastContentLen: number;
+    count: number;
+  }>({
+    firstId: null,
+    lastId: null,
+    lastContentLen: 0,
+    count: 0,
+  });
+  const prevScrollHeightRef = useRef<number>(0);
+  const prevScrollTopRef = useRef<number>(0);
+  const isNearBottomRef = useRef<boolean>(true);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    prevScrollTopRef.current = el.scrollTop;
+    prevScrollHeightRef.current = el.scrollHeight;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom < 140;
+    setShowScrollToBottom(distanceFromBottom > 420);
+
+    if (
+      el.scrollTop <= 140 &&
+      hasMore &&
+      !loadingOlder &&
+      !loadingInitial &&
+      onLoadOlder
+    ) {
+      onLoadOlder();
+    }
+  }, [hasMore, loadingOlder, loadingInitial, onLoadOlder]);
+
+  const handleJumpToBottom = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    isNearBottomRef.current = true;
+    setShowScrollToBottom(false);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    const firstMsg = messages[0] ?? null;
+    const lastMsg = messages[messages.length - 1] ?? null;
+    const firstId = firstMsg?.id ?? null;
+    const lastId = lastMsg?.id ?? null;
+    const lastContentLen = lastMsg?.content?.length ?? 0;
+    const count = messages.length;
+
+    const prev = prevSnapshotRef.current;
+    const viewChanged = prevViewKeyRef.current !== viewKey;
+    prevViewKeyRef.current = viewKey;
+
+    if (!el) {
+      prevSnapshotRef.current = { firstId, lastId, lastContentLen, count };
+      if (viewChanged) {
+        isNearBottomRef.current = true;
+        setShowScrollToBottom(false);
+      }
+      return;
+    }
+
+    if (viewChanged) {
+      isNearBottomRef.current = true;
+      setShowScrollToBottom(false);
+      if (count > 0 && !loadingInitial) {
+        el.scrollTop = el.scrollHeight;
+      }
+    } else if (prev.count === 0 && count > 0) {
+      // First hydrated render for this view
+      el.scrollTop = el.scrollHeight;
+      isNearBottomRef.current = true;
+      setShowScrollToBottom(false);
+    } else if (
+      prev.firstId !== null &&
+      count > prev.count &&
+      firstId !== prev.firstId &&
+      messages.some((m) => m.id === prev.firstId)
+    ) {
+      // Older messages were prepended at the top: preserve exact viewport anchor
+      const heightDelta = el.scrollHeight - prevScrollHeightRef.current;
+      if (heightDelta > 0) {
+        el.scrollTop = prevScrollTopRef.current + heightDelta;
+      }
+    } else if (
+      (lastId !== null && lastId !== prev.lastId) ||
+      (sending && isNearBottomRef.current)
+    ) {
+      const isUserOrOptimistic = Boolean(
+        lastMsg && (lastMsg.role === 'user' || lastMsg.metadata?.optimistic)
+      );
+      if (isUserOrOptimistic || isNearBottomRef.current) {
+        el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+        isNearBottomRef.current = true;
+        setShowScrollToBottom(false);
+      }
+    } else if (
+      lastId !== null &&
+      lastId === prev.lastId &&
+      lastContentLen > prev.lastContentLen &&
+      isNearBottomRef.current
+    ) {
+      // Streaming delta grew the bottom message while user is following along
+      el.scrollTop = el.scrollHeight;
+    }
+
+    prevSnapshotRef.current = { firstId, lastId, lastContentLen, count };
+    prevScrollHeightRef.current = el.scrollHeight;
+    prevScrollTopRef.current = el.scrollTop;
+  }, [messages, viewKey, loadingInitial, loadingOlder, sending]);
+
+  if (loadingInitial && messages.length === 0) {
+    return (
+      <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-10 flex flex-col items-center justify-center">
+        <div className="inline-flex items-center gap-2.5 px-4 py-2.5 rounded-2xl bg-white border border-[#E8E2D9] shadow-sm text-xs text-[#6F6860]">
+          <Loader2 className="w-4 h-4 text-[#5B7A95] animate-spin" />
+          <span>{focusTopicId ? '正在加载话题记录...' : '正在加载最近聊天记录...'}</span>
+        </div>
+      </div>
+    );
+  }
 
   if (messages.length === 0) {
     return (
@@ -222,9 +358,38 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   const renderedRunIds = new Set<string>();
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-6">
-      <div className="max-w-3xl mx-auto space-y-5">
-        {messages.map((msg) => {
+    <div className="relative flex-1 min-h-0 flex flex-col">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        style={{ overflowAnchor: 'none' }}
+        className="flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-6"
+      >
+        <div className="max-w-3xl mx-auto space-y-5">
+          {/* Top History Pagination Header (fixed height to prevent layout shift) */}
+          <div className="h-9 flex items-center justify-center">
+            {loadingOlder ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#F3EFE9] border border-[#E6DFD5] text-[11px] text-[#6F6860]">
+                <Loader2 className="w-3 h-3 text-[#5B7A95] animate-spin" />
+                <span>正在加载更早的消息...</span>
+              </span>
+            ) : hasMore ? (
+              <button
+                type="button"
+                onClick={() => onLoadOlder?.()}
+                className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white hover:bg-[#F3EFE9] border border-[#E6DFD5] text-[11px] font-medium text-[#5B7A95] transition-colors shadow-sm shadow-stone-900/[0.02]"
+              >
+                <ChevronUp className="w-3.5 h-3.5" />
+                <span>加载更早的消息</span>
+              </button>
+            ) : (
+              <span className="text-[11px] text-[#ABA298] select-none">
+                — 已加载全部历史消息 —
+              </span>
+            )}
+          </div>
+
+          {messages.map((msg) => {
           const isUser = msg.role === 'user';
           const isSystem = msg.role === 'system';
           const isSelectable = !isSystem && !msg.metadata?.optimistic;
@@ -478,6 +643,19 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
 
         <div ref={bottomRef} className="h-2" />
       </div>
+      </div>
+
+      {showScrollToBottom && (
+        <button
+          type="button"
+          onClick={handleJumpToBottom}
+          aria-label="回到底部最新消息"
+          className="absolute bottom-4 right-5 sm:right-8 z-20 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/95 hover:bg-[#FAF8F5] border border-[#DFD7CB] text-xs font-medium text-[#4A443E] shadow-md shadow-stone-900/10 backdrop-blur-sm transition-all"
+        >
+          <ArrowDown className="w-3.5 h-3.5 text-[#5B7A95]" />
+          <span>回到底部</span>
+        </button>
+      )}
     </div>
   );
 };

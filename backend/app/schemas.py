@@ -181,6 +181,12 @@ class MessageItem(BaseModel):
     session_run: Optional[SessionRunDetail] = None
 
 
+class MessagePageResponse(BaseModel):
+    messages: list[MessageItem]
+    has_more: bool = False
+    next_cursor: Optional[str] = None
+
+
 class AdapterInfoResponse(BaseModel):
     id: str
     name: str
