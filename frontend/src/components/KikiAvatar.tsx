@@ -39,7 +39,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261123f';
+const ASSET_VER = 'v=20261123g';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
@@ -248,15 +248,20 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
   const motionClass = effectiveAnimated ? POSE_MOTION_CLASS[resolvedPose] : '';
   const layerKey = `${resolvedPose}-${effectiveAnimated ? 'anim' : 'static'}`;
 
-  // Preload companion ambient WebPs so the first transition has zero decode hitch
+  // Defer preloading companion ambient WebPs so initial page load stays tiny (<100KB),
+  // while still warming the browser cache before the first ambient burst starts.
   useEffect(() => {
     if (!companion || !animated) return;
-    const imgs = [ANIMATED_WEBP_SRC.idle_lazy, ANIMATED_WEBP_SRC.idle_playful].map((src) => {
-      const img = new Image();
-      img.src = src;
-      return img;
-    });
+    let imgs: HTMLImageElement[] = [];
+    const timer = window.setTimeout(() => {
+      imgs = [ANIMATED_WEBP_SRC.idle_lazy, ANIMATED_WEBP_SRC.idle_playful].map((src) => {
+        const img = new Image();
+        img.src = src;
+        return img;
+      });
+    }, 3000);
     return () => {
+      window.clearTimeout(timer);
       imgs.length = 0;
     };
   }, [companion, animated]);

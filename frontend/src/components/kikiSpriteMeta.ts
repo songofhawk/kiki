@@ -2,8 +2,8 @@
 /** One full loop of each animated WebP, in ms. */
 export const KIKI_LOOP_MS = {
   idle: 6925,
-  idle_lazy: 14515,
-  idle_playful: 10450,
+  idle_lazy: 14075,
+  idle_playful: 10400,
   thinking: 4800,
-  waiting_input: 2310,
+  waiting_input: 2260,
 } as const;

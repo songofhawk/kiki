@@ -19,6 +19,7 @@ Usage: python3 scripts/smooth_kiki_sprites.py
 """
 from __future__ import annotations
 
+import struct
 from collections import deque
 from pathlib import Path
 
@@ -32,7 +33,8 @@ GEN = SRC / "interp" / "gen"
 DST = ROOT / "frontend" / "public" / "kiki"
 META_TS = ROOT / "frontend" / "src" / "components" / "kikiSpriteMeta.ts"
 
-OUT_SIZE = 288  # displayed at <=144px CSS (2x retina crisp while keeping ~18fps WebPs compact)
+OUT_SIZE = 208  # >2x retina crisp for 96px companion while keeping animated WebPs compact
+STATIC_SIZE = 256  # 1.8x-2x crisp for up to 144px hero static PNGs
 
 
 def load_keyframe(webp_name: str, frame_idx: int) -> Image.Image:
@@ -205,7 +207,7 @@ def flow_bridge(
     # Strict ghost-free gate: only synthesize optical-flow frames when flow tracks cleanly
     if p90 < 2.0 or p90 > 26.0 or warp_err > 26.0:
         return []
-    steps = max_steps if (p90 <= 18.0 and warp_err <= 20.0) else min(max_steps, 2)
+    steps = min(max_steps, 2) if (p90 <= 22.0 and warp_err <= 22.0) else 1
 
     out: list[tuple[Image.Image, int]] = []
     for k in range(1, steps + 1):
@@ -245,7 +247,7 @@ def expand_sequence(
     return frames, durs
 
 
-def save_webp(name: str, frames: list[Image.Image], durations: list[int]) -> int:
+def save_webp(name: str, frames: list[Image.Image], durations: list[int], quality: int = 62) -> int:
     DST.mkdir(parents=True, exist_ok=True)
     dst = DST / f"{name}.webp"
     frames[0].save(
@@ -254,13 +256,59 @@ def save_webp(name: str, frames: list[Image.Image], durations: list[int]) -> int
         append_images=frames[1:],
         duration=durations,
         loop=0,
-        quality=76,
-        alpha_quality=85,
-        method=4,
+        quality=quality,
+        alpha_quality=75,
+        method=6,
+        minimize_size=True,
     )
     total = sum(durations)
-    print(f"{name}: {len(frames)} frames, {total}ms loop, {dst.stat().st_size // 1024}KB")
+    print(f"{name}.webp: {len(frames):2d} frames, {total:5d}ms loop, {dst.stat().st_size // 1024:3d}KB")
     return total
+
+
+def _read_webp_durations(path: Path) -> list[int]:
+    b = path.read_bytes()
+    i, out = 12, []
+    while i < len(b):
+        tag = b[i : i + 4]
+        n = struct.unpack("<I", b[i + 4 : i + 8])[0]
+        if tag == b"ANMF":
+            out.append(int.from_bytes(b[i + 20 : i + 23], "little"))
+        i += 8 + n + (n & 1)
+    return out
+
+
+def compress_passthrough_webp(name: str) -> None:
+    """Resize and re-encode fast-cycle source WebPs (`working`, `delivering`) for traffic savings."""
+    src = SRC / f"{name}.webp"
+    im = Image.open(src)
+    durs = _read_webp_durations(src)
+    frames: list[Image.Image] = []
+    for i in range(im.n_frames):
+        im.seek(i)
+        frames.append(im.convert("RGBA").resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS))
+    if len(durs) != len(frames):
+        durs = [120] * len(frames)
+    save_webp(name, frames, durs, quality=66)
+
+
+def compress_static_pngs() -> None:
+    """Compress all static PNG fallbacks from `assets/kiki/*.png` to quantized 256px PNGs."""
+    DST.mkdir(parents=True, exist_ok=True)
+    total_kb = 0
+    for src in sorted(SRC.glob("*.png")):
+        im = Image.open(src).convert("RGBA").resize((STATIC_SIZE, STATIC_SIZE), Image.LANCZOS)
+        qim = im.quantize(
+            colors=256,
+            method=Image.Quantize.FASTOCTREE,
+            dither=Image.Dither.FLOYDSTEINBERG,
+        )
+        dst = DST / src.name
+        qim.save(dst, optimize=True)
+        kb = dst.stat().st_size // 1024
+        total_kb += kb
+        print(f"{src.name:20s}: {kb:3d}KB (256px quantized)")
+    print(f"static PNGs total: {total_kb}KB")
 
 
 def main() -> None:
@@ -392,13 +440,18 @@ def main() -> None:
 
     wait_src = [load_keyframe("waiting_input", i) for i in range(4)]
     wait_spec = [
-        (wait_src[0], 550, 2, 55),
-        (wait_src[1], 480, 2, 55),
-        (wait_src[2], 550, 2, 55),
-        (wait_src[3], 620, 2, 55),
+        (wait_src[0], 550, 2, 60),
+        (wait_src[1], 480, 2, 60),
+        (wait_src[2], 550, 2, 60),
+        (wait_src[3], 620, 2, 60),
     ]
     frames, durs = expand_sequence(wait_spec, close_loop=True)
     loop_ms["waiting_input"] = save_webp("waiting_input", frames, durs)
+
+    # 5. Compress fast-cycle WebPs (`working`, `delivering`) and all 7 static PNGs
+    for fast_name in ("working", "delivering"):
+        compress_passthrough_webp(fast_name)
+    compress_static_pngs()
 
     body = "\n".join(f"  {k}: {v}," for k, v in loop_ms.items())
     META_TS.write_text(
