@@ -39,7 +39,7 @@ const SIZE_CLASSES: Record<NonNullable<KikiAvatarProps['size']>, string> = {
   hero: 'w-36 h-36',
 };
 
-const ASSET_VER = 'v=20261123e';
+const ASSET_VER = 'v=20261123f';
 
 const ANIMATED_WEBP_SRC: Record<KikiPose, string> = {
   idle: `/kiki/idle.webp?${ASSET_VER}`,
@@ -248,7 +248,21 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
   const motionClass = effectiveAnimated ? POSE_MOTION_CLASS[resolvedPose] : '';
   const layerKey = `${resolvedPose}-${effectiveAnimated ? 'anim' : 'static'}`;
 
-  // Cross-fade between poses instead of hard-cutting the <img>, so pose changes feel organic.
+  // Preload companion ambient WebPs so the first transition has zero decode hitch
+  useEffect(() => {
+    if (!companion || !animated) return;
+    const imgs = [ANIMATED_WEBP_SRC.idle_lazy, ANIMATED_WEBP_SRC.idle_playful].map((src) => {
+      const img = new Image();
+      img.src = src;
+      return img;
+    });
+    return () => {
+      imgs.length = 0;
+    };
+  }, [companion, animated]);
+
+  // Cross-fade between different status poses; skip fade on idle <-> idle_lazy/idle_playful
+  // because all three share the exact same sitting start/end anchor frame.
   const currentLayerRef = useRef<SpriteLayer>({ key: layerKey, src: imgSrc, motion: motionClass });
   const [outgoing, setOutgoing] = useState<SpriteLayer | null>(null);
   const fadeTimerRef = useRef<number | null>(null);
@@ -257,6 +271,17 @@ export const KikiAvatar: React.FC<KikiAvatarProps> = ({
     const prev = currentLayerRef.current;
     currentLayerRef.current = { key: layerKey, src: imgSrc, motion: motionClass };
     if (prev.key === layerKey) return;
+    const isSeamlessIdleSwap =
+      (prev.key === 'idle-anim' && (layerKey === 'idle_lazy-anim' || layerKey === 'idle_playful-anim')) ||
+      ((prev.key === 'idle_lazy-anim' || prev.key === 'idle_playful-anim') && layerKey === 'idle-anim');
+    if (isSeamlessIdleSwap) {
+      if (fadeTimerRef.current !== null) {
+        window.clearTimeout(fadeTimerRef.current);
+        fadeTimerRef.current = null;
+      }
+      setOutgoing(null);
+      return;
+    }
     setOutgoing(prev);
     if (fadeTimerRef.current !== null) window.clearTimeout(fadeTimerRef.current);
     fadeTimerRef.current = window.setTimeout(() => {
