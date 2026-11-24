@@ -16,6 +16,28 @@ if ENV_FILE.exists():
     load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+    "gemini-4-hydrogen",
+)
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+
+def _parse_model_list(raw: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in raw.split(","):
+        name = item.strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class Settings:
     gemini_api_key: str
@@ -23,7 +45,12 @@ class Settings:
     workspace_root: Path
     database_path: Path
     artifacts_dir: Path
-    gemini_fallback_model: str = "gemini-3.1-flash-lite"
+    gemini_fallback_model: str = DEFAULT_GEMINI_FALLBACK_MODELS[0]
+    gemini_fallback_models: tuple[str, ...] = DEFAULT_GEMINI_FALLBACK_MODELS
+    gemini_cooldown_seconds: float = 120.0
+    deepseek_api_key: str = ""
+    deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
+    deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     default_heavy_agent: str = "gemini_agent"
     tavily_api_key: str = ""
     serper_api_key: str = ""
@@ -38,6 +65,35 @@ class Settings:
     def api_key_configured(self) -> bool:
         key = self.gemini_api_key.strip()
         return bool(key) and key != "your_ai_studio_api_key"
+
+    @property
+    def deepseek_configured(self) -> bool:
+        key = self.deepseek_api_key.strip()
+        return bool(key) and key != "your_deepseek_api_key"
+
+    @property
+    def any_llm_configured(self) -> bool:
+        return self.api_key_configured or self.deepseek_configured
+
+    @property
+    def resolved_gemini_models(self) -> list[str]:
+        """Ordered, deduplicated list of primary + fallback Gemini models."""
+        candidates: list[str] = []
+        seen: set[str] = set()
+        raw_chain: list[str] = [self.gemini_model]
+        if self.gemini_fallback_model and (
+            not self.gemini_fallback_models
+            or self.gemini_fallback_model not in self.gemini_fallback_models
+        ):
+            raw_chain.append(self.gemini_fallback_model)
+        if self.gemini_fallback_models:
+            raw_chain.extend(self.gemini_fallback_models)
+        for item in raw_chain:
+            name = item.strip()
+            if name and name not in seen:
+                seen.add(name)
+                candidates.append(name)
+        return candidates
 
 
 def load_settings() -> Settings:
@@ -56,10 +112,32 @@ def load_settings() -> Settings:
     if not artifacts_dir.is_absolute():
         artifacts_dir = (workspace_root / artifacts_dir).resolve()
 
+    raw_fallback_models = os.getenv("GEMINI_FALLBACK_MODELS", "").strip()
+    raw_single_fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+    if raw_fallback_models:
+        fallback_models = _parse_model_list(raw_fallback_models)
+    elif raw_single_fallback:
+        fallback_models = _parse_model_list(raw_single_fallback)
+    else:
+        fallback_models = DEFAULT_GEMINI_FALLBACK_MODELS
+
+    primary_fallback = fallback_models[0] if fallback_models else ""
+
+    raw_cooldown = os.getenv("GEMINI_MODEL_COOLDOWN_SECONDS", "120").strip()
+    try:
+        cooldown_seconds = max(0.0, float(raw_cooldown))
+    except ValueError:
+        cooldown_seconds = 120.0
+
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        gemini_fallback_model=os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
+        gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        gemini_fallback_model=primary_fallback,
+        gemini_fallback_models=fallback_models,
+        gemini_cooldown_seconds=cooldown_seconds,
+        deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+        deepseek_model=os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/"),
         default_heavy_agent=os.getenv("KIKI_DEFAULT_HEAVY_AGENT", "gemini_agent"),
         workspace_root=workspace_root,
         database_path=db_path,

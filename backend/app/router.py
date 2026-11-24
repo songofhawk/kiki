@@ -138,18 +138,35 @@ class DecisionRouter:
         force_path: Optional[Literal["fast", "heavy"]] = None,
     ) -> tuple[RouteDecision, dict[str, Any], bool, list[dict[str, Any]]]:
         """Return (RouteDecision, resolved_topic_dict, topic_created, reassigned_messages)."""
-        # 1. Topic Focus Mode bypasses Decision Model
+        # 1. Topic Focus Mode locks topic assignment, while still classifying path when force_path is auto (None)
         if focus_topic_id:
             topic = self.db.get_topic(focus_topic_id)
             if topic is None:
                 raise KeyError(f"Topic not found: {focus_topic_id}")
-            decision = RouteDecision(
-                path=force_path or "fast",
-                topic_action="reuse",
+            if force_path is not None:
+                decision = RouteDecision(
+                    path=force_path,
+                    topic_action="reuse",
+                    topic_id=topic["id"],
+                    new_topic_title=None,
+                    confidence=1.0,
+                    reasoning="Topic Focus Mode 锁定当前话题（手动指定路径）",
+                )
+                return decision, topic, False, []
+
+            self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在判断当前话题内的任务意图...")
+            topic_recent_messages = self.db.get_recent_messages_with_topic(
+                limit=self.recent_context_limit,
                 topic_id=topic["id"],
-                new_topic_title=None,
-                confidence=1.0,
-                reasoning="Topic Focus Mode 锁定当前话题",
+            )
+            raw_decision = await self._call_route_message(content, [topic], topic_recent_messages)
+            decision = raw_decision.model_copy(
+                update={
+                    "topic_action": "reuse",
+                    "topic_id": topic["id"],
+                    "new_topic_title": None,
+                    "confidence": 1.0,
+                }
             )
             return decision, topic, False, []
 
@@ -249,8 +266,8 @@ class FastPathService:
     ) -> dict[str, Any]:
         """Create placeholder assistant message and spawn background streaming task."""
         topic_id = topic["id"]
-        # Capture history before creating the empty placeholder
-        history = self.db.get_topic_history(topic_id, limit=12)
+        # Capture history (including session_run status) before creating the empty placeholder
+        history = self.db.get_recent_messages_with_topic(limit=12, topic_id=topic_id)
         # Remove the current user message from history so it isn't duplicated
         if history and history[-1]["role"] == "user" and history[-1]["content"] == user_content:
             history = history[:-1]

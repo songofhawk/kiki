@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import tomllib
+from pathlib import Path
 from typing import Any, Optional
 
 from .base import (
@@ -100,15 +102,62 @@ class CodexAdapter(SubprocessCLIAdapter):
     vendor = "OpenAI"
     description = "OpenAI Codex CLI 后台编码智能体，支持 headless JSONL 流式执行、沙箱写入与会话恢复。"
     binary_candidates = ("codex",)
+    extra_binary_paths = (
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        "~/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "~/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+        "~/Applications/Codex.app/Contents/Resources/codex",
+    )
     env_bin_var = "KIKI_CODEX_BIN"
     env_model_var = "KIKI_CODEX_MODEL"
-    install_hint = "npm install -g @openai/codex"
+    install_hint = "npm install -g @openai/codex（或安装 ChatGPT / Codex Desktop 应用）"
     aliases = ("openai_codex", "codex_cli")
     model_tiers: dict[ThinkingLevel, str] = {
         "low": "o4-mini",
         "medium": "gpt-5-codex",
         "high": "gpt-5.4-codex",
     }
+
+    @staticmethod
+    def _read_local_config_model() -> Optional[str]:
+        config_path = Path(os.path.expanduser("~/.codex/config.toml"))
+        try:
+            if not config_path.is_file():
+                return None
+            with config_path.open("rb") as f:
+                data = tomllib.load(f)
+            model = data.get("model")
+            if isinstance(model, str) and model.strip():
+                return model.strip()
+        except Exception:
+            return None
+        return None
+
+    def select_profile(
+        self,
+        prompt: str,
+        model_override: Optional[str] = None,
+        thinking_override: Optional[ThinkingLevel] = None,
+    ) -> ExecutionProfile:
+        effective_override = model_override
+        if not (effective_override and effective_override.strip()):
+            env_model = os.getenv(self.env_model_var, "").strip() if self.env_model_var else ""
+            if not env_model:
+                effective_override = self._read_local_config_model()
+        return super().select_profile(
+            prompt,
+            model_override=effective_override,
+            thinking_override=thinking_override,
+        )
+
+    def probe(self) -> AdapterInfo:
+        info = super().probe()
+        local_model = self._read_local_config_model()
+        if local_model:
+            info.default_model = local_model
+        return info
 
     def build_command(
         self,
@@ -117,19 +166,24 @@ class CodexAdapter(SubprocessCLIAdapter):
         profile: ExecutionProfile,
     ) -> list[str]:
         sandbox_mode = os.getenv("KIKI_CODEX_SANDBOX", "workspace-write").strip() or "workspace-write"
-        return [
+        cmd = [
             binary,
             "exec",
             "--json",
             "--sandbox",
             sandbox_mode,
             "--skip-git-repo-check",
-            "--model",
-            profile.model,
+        ]
+        # Respect ~/.codex/config.toml default model unless explicitly overridden via request or env
+        env_model = os.getenv(self.env_model_var, "").strip() if self.env_model_var else ""
+        if ctx.model_override or env_model:
+            cmd.extend(["--model", profile.model])
+        cmd.extend([
             "-c",
             f"model_reasoning_effort={profile.thinking_level}",
             ctx.user_content,
-        ]
+        ])
+        return cmd
 
     def build_resume_command(
         self,

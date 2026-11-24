@@ -139,6 +139,7 @@ class AdapterContext:
     settings: Optional["Settings"] = None
     model_override: Optional[str] = None
     thinking_override: Optional[ThinkingLevel] = None
+    history: list[dict[str, Any]] = field(default_factory=list)
     max_steps: int = 10
     timeout_sec: float = 600.0
     _hitl_handler: Optional[
@@ -301,6 +302,7 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
     """Reusable base adapter for external CLI-driven coding/workspace agents."""
 
     binary_candidates: tuple[str, ...] = ()
+    extra_binary_paths: tuple[str, ...] = ()
     env_bin_var: Optional[str] = None
     npx_package: Optional[str] = None
     category: AdapterCategory = "cli"
@@ -309,19 +311,24 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
 
     def resolve_binary(self) -> Optional[str]:
-        """Locate the CLI binary via env override or PATH lookup."""
+        """Locate the CLI binary via env override, PATH lookup, or known app bundle paths."""
         if self.env_bin_var:
             override = os.getenv(self.env_bin_var, "").strip()
             if override:
                 found = shutil.which(override)
                 if found:
                     return found
-                if Path(override).exists():
-                    return override
+                expanded = os.path.expanduser(override)
+                if Path(expanded).is_file() and os.access(expanded, os.X_OK):
+                    return expanded
         for candidate in self.binary_candidates:
             found = shutil.which(candidate)
             if found:
                 return found
+        for raw_path in self.extra_binary_paths:
+            expanded = os.path.expanduser(raw_path)
+            if Path(expanded).is_file() and os.access(expanded, os.X_OK):
+                return expanded
         return None
 
     def probe(self) -> AdapterInfo:
@@ -553,8 +560,13 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         )
         binary = self.resolve_binary()
         if not binary:
+            label = (
+                self.display_name
+                if self.display_name.upper().endswith("CLI")
+                else f"{self.display_name} CLI"
+            )
             raise RuntimeError(
-                f"未检测到 {self.display_name} CLI（查找命令: {', '.join(self.binary_candidates)}）。"
+                f"未检测到 {label}（查找命令: {', '.join(self.binary_candidates)}）。"
                 f"请先安装：{self.install_hint}"
             )
 

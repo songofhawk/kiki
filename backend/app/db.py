@@ -504,6 +504,7 @@ class Database:
             "content": row["content"],
             "metadata": metadata,
             "created_at": row["created_at"],
+            "streaming": bool(metadata.get("streaming", False)),
             "topic": topic,
             "session_run": run_dict,
         }
@@ -665,30 +666,42 @@ class Database:
             ).fetchall()
             return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
-    def get_recent_messages_with_topic(self, limit: int = 10) -> list[dict[str, Any]]:
+    def get_recent_messages_with_topic(
+        self,
+        limit: int = 10,
+        topic_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT m.*, t.title AS topic_title
-                FROM messages m
-                LEFT JOIN topics t ON m.topic_id = t.id
-                ORDER BY m.rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if topic_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE topic_id = ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (topic_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM messages
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            topic_cache: dict[str, Optional[dict[str, Any]]] = {}
             result: list[dict[str, Any]] = []
             for row in reversed(rows):
-                result.append(
-                    {
-                        "id": row["id"],
-                        "topic_id": row["topic_id"],
-                        "topic_title": row["topic_title"] or GENERAL_TOPIC_TITLE,
-                        "role": row["role"],
-                        "content": row["content"],
-                        "created_at": row["created_at"],
-                    }
+                hydrated = self._hydrate_message_row(conn, row, topic_cache=topic_cache)
+                topic = hydrated.get("topic")
+                hydrated["topic_title"] = (
+                    topic["title"]
+                    if isinstance(topic, dict) and topic.get("title")
+                    else GENERAL_TOPIC_TITLE
                 )
+                result.append(hydrated)
             return result
 
     def get_latest_message(self) -> Optional[dict[str, Any]]:

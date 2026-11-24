@@ -240,6 +240,12 @@ class TaskManager:
 
             topic = self.db.get_topic(topic_id)
             topic_title = topic["title"] if topic else "后台任务"
+            raw_history = self.db.list_messages(topic_id=topic_id, limit=12)
+            topic_history = [
+                m
+                for m in raw_history
+                if not (m.get("session_run") and m["session_run"].get("id") == run_id)
+            ]
 
             ctx = AdapterContext(
                 run_id=run_id,
@@ -255,6 +261,7 @@ class TaskManager:
                 settings=self.settings,
                 model_override=model_override,
                 thinking_override=thinking_override,
+                history=topic_history,
                 max_steps=self.max_steps,
                 _hitl_handler=lambda prompt, opts: self._await_hitl_decision(
                     run_id, topic_id, prompt, opts

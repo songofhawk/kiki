@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+import uuid
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional
 
+import httpx
 from google import genai
+from google.genai.types import HttpOptions, HttpRetryOptions
 
 from .config import Settings
 from .schemas import BacktrackDecision, DreamConsolidationPlan, RouteDecision
@@ -30,6 +35,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
   "topic_action": "reuse" | "create" | "none",
   "topic_id": "Existing Topic ID if reuse, else null",
   "new_topic_title": "Short title if create, else null",
+  "agent_type": "Explicitly requested agent ID (e.g. codex, claude_code, gemini_agent, antigravity, deepseek_harness, zcode, kcode, qoder, workbuddy, doubao_work) if specified by user or continuing that agent's task, else null",
   "confidence": 0.0 - 1.0,
   "reasoning": "简短判定理由"
 }}
@@ -37,8 +43,10 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 判定规则：
 1. 若输入仅为简单的问候、感叹或毫无延续主题的一次性闲聊，path 为 'fast'，topic_action 为 'none'。
 2. 注意：`topic-general`（日常闲聊）仅用于 `topic_action='none'` 的兜底，切勿对 `topic-general` 返回 `topic_action='reuse'`。若结合最近上下文发现对话已经围绕某个具体主题展开（例如社保、就医、理财、旅行、技术排查等），应选择 `create` 新建简短话题（若已有对应非闲聊话题则 `reuse`）。
-3. 若输入涉及代码重构、长文生成、数据分析、多步骤操作、文件读写、命令行排查，或需要联网搜索/实时信息查询/网页资料检索，path 为 'heavy'。
+3. 若输入涉及代码重构、长文生成、图片/文件生成、数据分析、多步骤操作、文件读写、命令行排查、调用外部 Agent/工具，或需要联网搜索/实时信息查询/网页资料检索，path 为 'heavy'。
 4. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
+5. 若最近上下文显示某条用户消息带有 `[后台任务执行失败...]`、`[后台任务已取消...]` 或 `[后台任务等待人工确认...]` 等状态，而用户随后发送“再试一次”“再生成一次”“重试”“继续”等追问，应 `reuse` 该原话题，并在需要重新执行任务时选择 `heavy`。
+6. 若用户在当前消息或紧邻的历史任务中明确点名了某个执行引擎（例如“调用 Codex”→`codex`、“用 Claude Code”→`claude_code`、“用 Gemini”→`gemini_agent` 等），请在 `agent_type` 中输出对应 ID；否则输出 `null`。
 """
 
 BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手。
@@ -114,6 +122,7 @@ KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点�
 - 回答简洁、有温度、自然口语化，偶尔可以带一点点猫咪的可爱语气（但不要过度卖萌或啰嗦）。
 - 优先使用与用户相同的语言（默认中文）。
 - 当前所处话题：{topic_title}
+- 重要约束：你当前处于“前台纯对话（Fast-Path）”模式，**没有**调用 Codex/外部工具、生成图片、读写文件或启动后台任务的能力。如果用户要求执行工具/生图/代码/重试后台任务，**严禁**假装正在执行或说“稍等马上就好”，而应如实说明当前未触发后台任务，并提醒用户切换到“重任务（Heavy）”模式或重新发送明确任务指令。
 """
 
 
@@ -130,48 +139,414 @@ def _extract_json_block(text: str) -> str:
 
 
 class KikiLLMClient:
-    """Async Gemini Interactions API wrapper designed for easy mocking in tests."""
+    """Async Gemini Interactions API wrapper with automatic DeepSeek paid fallback."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.model = settings.gemini_model
-        self.fallback_model = settings.gemini_fallback_model
+        all_models = settings.resolved_gemini_models
+        self.fallback_models: list[str] = [m for m in all_models if m != self.model]
+        self.fallback_model: str = self.fallback_models[0] if self.fallback_models else ""
+        self.deepseek_model: str = settings.deepseek_model
+        self.deepseek_base_url: str = settings.deepseek_base_url.rstrip("/")
         self._client: Optional[genai.Client] = None
-        self._primary_cooldown_until: float = 0.0
+        self._cooldown_seconds: float = max(0.0, float(settings.gemini_cooldown_seconds))
+        self._model_cooldowns: dict[str, float] = {}
+        self._interaction_models: dict[str, str] = {}
+        self._deepseek_sessions: dict[str, list[dict[str, Any]]] = {}
+        self.last_used_provider: Optional[str] = None
+        self.last_used_model: Optional[str] = None
+
+    def _all_models(self) -> list[str]:
+        models: list[str] = []
+        seen: set[str] = set()
+        for name in [self.model, *self.fallback_models]:
+            cleaned = (name or "").strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                models.append(cleaned)
+        return models
 
     def _get_client(self) -> genai.Client:
         if self._client is None:
             if not self.settings.api_key_configured:
                 raise RuntimeError("GEMINI_API_KEY is not configured in .env")
-            self._client = genai.Client(api_key=self.settings.gemini_api_key)
+            # Fail fast on 503/429 when multiple fallback models (or DeepSeek fallback)
+            # are configured, avoiding google-genai's default 5-attempt (~30s+) backoff.
+            has_failover = len(self._all_models()) > 1 or self.settings.deepseek_configured
+            attempts = 1 if has_failover else 2
+            self._client = genai.Client(
+                api_key=self.settings.gemini_api_key,
+                http_options=HttpOptions(
+                    retry_options=HttpRetryOptions(
+                        attempts=attempts,
+                        initial_delay=0.5,
+                        max_delay=2.0,
+                    )
+                ),
+            )
         return self._client
 
-    def _candidate_models(self) -> list[str]:
+    def _candidate_models(self, *, pinned_model: Optional[str] = None) -> list[str]:
+        if pinned_model:
+            return [pinned_model]
+        if not self.settings.api_key_configured:
+            return []
         now = time.monotonic()
-        models: list[str] = []
-        if now >= self._primary_cooldown_until:
-            models.append(self.model)
-        if self.fallback_model and self.fallback_model != self.model:
-            models.append(self.fallback_model)
-        if not models:
-            models.append(self.model)
-        return models
+        all_models = self._all_models()
+        ready = [m for m in all_models if now >= self._model_cooldowns.get(m, 0.0)]
+        if ready:
+            return ready
+        # If DeepSeek paid fallback is configured and all Gemini Free-Tier models are
+        # cooling down, skip Gemini immediately (0ms overhead) until a cooldown expires
+        # and automatically re-probes Gemini.
+        if self.settings.deepseek_configured:
+            return []
+        # No DeepSeek fallback: try Gemini models in order of earliest cooldown expiry.
+        return sorted(all_models, key=lambda m: self._model_cooldowns.get(m, 0.0))
 
-    def _mark_primary_cooldown(self, model_name: str, exc: Exception) -> None:
+    def _mark_model_cooldown(self, model_name: str, exc: Exception) -> None:
         err_text = str(exc).lower()
-        if model_name == self.model and (
+        is_unavailable_on_tier = (
+            "404" in err_text
+            or "not found" in err_text
+            or "no longer available" in err_text
+            or "limit: 0" in err_text
+        )
+        is_transient_overload = (
             "503" in err_text
             or "service_unavailable" in err_text
             or "high demand" in err_text
+            or "overloaded" in err_text
             or "disconnected" in err_text
-        ):
-            self._primary_cooldown_until = time.monotonic() + 120.0
-            logger.warning(
-                "Primary model %s unavailable (%s); cooling down 120s and falling back to %s",
-                self.model,
-                type(exc).__name__,
-                self.fallback_model,
+            or "timeout" in err_text
+            or "timed out" in err_text
+            or "429" in err_text
+            or "too_many_requests" in err_text
+            or "resource_exhausted" in err_text
+            or isinstance(exc, TimeoutError)
+        )
+        if not (is_unavailable_on_tier or is_transient_overload):
+            return
+
+        duration = max(self._cooldown_seconds, 600.0) if is_unavailable_on_tier else self._cooldown_seconds
+        self._model_cooldowns[model_name] = time.monotonic() + duration
+        remaining = [
+            m for m in self._all_models()
+            if m != model_name and time.monotonic() >= self._model_cooldowns.get(m, 0.0)
+        ]
+        fallback_note = (
+            remaining
+            if remaining
+            else (
+                [f"deepseek:{self.deepseek_model}"]
+                if self.settings.deepseek_configured
+                else ["(all cooling down)"]
             )
+        )
+        logger.warning(
+            "Model %s unavailable (%s); cooling down %.0fs; next fallbacks=%s",
+            model_name,
+            type(exc).__name__,
+            duration,
+            fallback_note,
+        )
+
+    def _remember_interaction_model(self, interaction_id: Optional[str], model_name: str) -> None:
+        if not interaction_id:
+            return
+        self._interaction_models[interaction_id] = model_name
+        if len(self._interaction_models) > 64:
+            oldest_key = next(iter(self._interaction_models))
+            self._interaction_models.pop(oldest_key, None)
+
+    def _remember_deepseek_session(
+        self,
+        interaction_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        self._deepseek_sessions[interaction_id] = messages
+        if len(self._deepseek_sessions) > 64:
+            oldest_key = next(iter(self._deepseek_sessions))
+            self._deepseek_sessions.pop(oldest_key, None)
+
+    def status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        gemini_models_status: list[dict[str, Any]] = []
+        first_ready_gemini: Optional[str] = None
+        for m in self._all_models():
+            rem = max(0.0, self._model_cooldowns.get(m, 0.0) - now)
+            ready = self.settings.api_key_configured and rem <= 0.0
+            if ready and first_ready_gemini is None:
+                first_ready_gemini = m
+            gemini_models_status.append(
+                {
+                    "model": m,
+                    "ready": ready,
+                    "cooldown_remaining_seconds": round(rem, 1),
+                }
+            )
+
+        if first_ready_gemini is not None:
+            active_provider = "gemini"
+            active_model = first_ready_gemini
+        elif self.settings.deepseek_configured:
+            active_provider = "deepseek"
+            active_model = self.deepseek_model
+        elif self.settings.api_key_configured:
+            active_provider = "gemini"
+            active_model = self.model
+        else:
+            active_provider = "none"
+            active_model = ""
+
+        return {
+            "active_provider": active_provider,
+            "active_model": active_model,
+            "gemini_configured": self.settings.api_key_configured,
+            "deepseek_configured": self.settings.deepseek_configured,
+            "deepseek_model": self.deepseek_model,
+            "last_used_provider": self.last_used_provider,
+            "last_used_model": self.last_used_model,
+            "gemini_models": gemini_models_status,
+        }
+
+    async def probe_gemini_free_tier(self, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
+        """Actively probe Gemini Free Tier models in priority order and update cooldowns."""
+        probe_results: list[dict[str, Any]] = []
+        gemini_available = False
+
+        if self.settings.api_key_configured:
+            for model_name in self._all_models():
+                t0 = time.perf_counter()
+                try:
+                    client = self._get_client()
+                    await asyncio.wait_for(
+                        client.aio.interactions.create(
+                            model=model_name,
+                            input='Reply with strictly JSON: {"ok": true}',
+                            response_format={
+                                "type": "text",
+                                "mime_type": "application/json",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"ok": {"type": "boolean"}},
+                                    "required": ["ok"],
+                                },
+                            },
+                            generation_config={"thinking_level": "low"},
+                            store=False,
+                        ),
+                        timeout=timeout_seconds,
+                    )
+                    latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                    self._model_cooldowns.pop(model_name, None)
+                    gemini_available = True
+                    probe_results.append(
+                        {"model": model_name, "ok": True, "latency_ms": latency_ms}
+                    )
+                    break
+                except Exception as exc:
+                    latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                    self._mark_model_cooldown(model_name, exc)
+                    probe_results.append(
+                        {
+                            "model": model_name,
+                            "ok": False,
+                            "latency_ms": latency_ms,
+                            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+                        }
+                    )
+
+        return {
+            "gemini_available": gemini_available,
+            "probe_results": probe_results,
+            **self.status(),
+        }
+
+    # ------------------------------------------------------------------
+    # DeepSeek OpenAI-compatible paid fallback helpers
+    # ------------------------------------------------------------------
+
+    def _deepseek_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.deepseek_api_key.strip()}",
+            "Content-Type": "application/json",
+        }
+
+    async def _deepseek_post_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        url = f"{self.deepseek_base_url}/chat/completions"
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            resp = await http_client.post(url, headers=self._deepseek_headers(), json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _deepseek_stream_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        url = f"{self.deepseek_base_url}/chat/completions"
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            async with http_client.stream(
+                "POST",
+                url,
+                headers=self._deepseek_headers(),
+                json=payload,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    stripped = line.strip()
+                    if not stripped or not stripped.startswith("data:"):
+                        continue
+                    data_str = stripped[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk_obj = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk_obj.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    text = delta.get("content")
+                    if text:
+                        yield str(text)
+
+    @staticmethod
+    def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for t in tools:
+            if t.get("type") == "function" and "function" in t:
+                converted.append(t)
+            else:
+                converted.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name", ""),
+                            "description": t.get("description", ""),
+                            "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                        },
+                    }
+                )
+        return converted
+
+    async def _run_deepseek_structured_json(
+        self,
+        *,
+        input_text: str,
+        system_instruction: str,
+        schema_cls: type[Any],
+    ) -> Any:
+        sys_prompt = system_instruction
+        if "json" not in sys_prompt.lower():
+            sys_prompt = f"{sys_prompt}\n\nReturn strictly valid JSON."
+        payload: dict[str, Any] = {
+            "model": self.deepseek_model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": input_text},
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 4096,
+        }
+        data = await self._deepseek_post_chat(payload)
+        choices = data.get("choices") or []
+        raw_text = ""
+        if choices:
+            raw_text = str((choices[0].get("message") or {}).get("content") or "")
+        self.last_used_provider = "deepseek"
+        self.last_used_model = self.deepseek_model
+        return schema_cls.model_validate_json(_extract_json_block(raw_text))
+
+    async def _run_deepseek_agent_turn(
+        self,
+        *,
+        input_data: Any,
+        tools: list[dict[str, Any]],
+        system_instruction: str,
+        previous_interaction_id: Optional[str] = None,
+    ) -> Any:
+        if previous_interaction_id and previous_interaction_id in self._deepseek_sessions:
+            messages = list(self._deepseek_sessions[previous_interaction_id])
+        else:
+            messages = [{"role": "system", "content": system_instruction}]
+
+        if isinstance(input_data, list):
+            for item in input_data:
+                if isinstance(item, dict) and item.get("type") == "function_result":
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(item.get("call_id") or ""),
+                            "content": str(item.get("result") or ""),
+                        }
+                    )
+                else:
+                    messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
+        else:
+            messages.append({"role": "user", "content": str(input_data)})
+
+        payload: dict[str, Any] = {
+            "model": self.deepseek_model,
+            "messages": messages,
+            "max_tokens": 8192,
+        }
+        if tools:
+            payload["tools"] = self._convert_tools_to_openai(tools)
+            payload["tool_choice"] = "auto"
+
+        data = await self._deepseek_post_chat(payload, timeout=90.0)
+        choices = data.get("choices") or []
+        assistant_msg = (choices[0].get("message") or {}) if choices else {}
+        output_text = str(assistant_msg.get("content") or "")
+        raw_tool_calls = assistant_msg.get("tool_calls") or []
+
+        steps: list[Any] = []
+        for idx, tc in enumerate(raw_tool_calls):
+            fn = tc.get("function") or {}
+            raw_args = fn.get("arguments") or "{}"
+            if isinstance(raw_args, str):
+                try:
+                    parsed_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    parsed_args = {}
+            elif isinstance(raw_args, dict):
+                parsed_args = raw_args
+            else:
+                parsed_args = {}
+            steps.append(
+                SimpleNamespace(
+                    type="function_call",
+                    id=str(tc.get("id") or f"ds_call_{idx + 1}"),
+                    name=str(fn.get("name") or "unknown"),
+                    arguments=parsed_args,
+                )
+            )
+
+        stored_assistant: dict[str, Any] = {"role": "assistant", "content": output_text}
+        if raw_tool_calls:
+            stored_assistant["tool_calls"] = raw_tool_calls
+        messages.append(stored_assistant)
+
+        interaction_id = f"ds_int_{uuid.uuid4().hex[:16]}"
+        self._remember_deepseek_session(interaction_id, messages)
+        self.last_used_provider = "deepseek"
+        self.last_used_model = self.deepseek_model
+        return SimpleNamespace(
+            id=interaction_id,
+            status="completed",
+            steps=steps,
+            output_text=output_text,
+        )
 
     async def _run_structured_json(
         self,
@@ -198,12 +573,65 @@ class KikiLLMClient:
                     store=False,
                 )
                 raw_text = interaction.output_text or ""
-                return schema_cls.model_validate_json(_extract_json_block(raw_text)), None
+                parsed = schema_cls.model_validate_json(_extract_json_block(raw_text))
+                self.last_used_provider = "gemini"
+                self.last_used_model = model_name
+                return parsed, None
             except Exception as exc:
                 last_exc = exc
-                self._mark_primary_cooldown(model_name, exc)
+                self._mark_model_cooldown(model_name, exc)
                 logger.warning("%s (%s) call failed: %s", call_label, model_name, exc)
+
+        if self.settings.deepseek_configured:
+            try:
+                logger.info(
+                    "%s falling back to paid DeepSeek (%s)",
+                    call_label,
+                    self.deepseek_model,
+                )
+                parsed = await self._run_deepseek_structured_json(
+                    input_text=input_text,
+                    system_instruction=system_instruction,
+                    schema_cls=schema_cls,
+                )
+                return parsed, None
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "%s (deepseek:%s) fallback failed: %s",
+                    call_label,
+                    self.deepseek_model,
+                    exc,
+                )
+
         return None, last_exc
+
+    @staticmethod
+    def _format_session_run_note(
+        session_run: Optional[dict[str, Any]],
+        *,
+        role: Optional[str] = None,
+    ) -> str:
+        if not isinstance(session_run, dict):
+            return ""
+        status = str(session_run.get("status") or "").strip().lower()
+        if not status:
+            return ""
+        agent_type = str(session_run.get("agent_type") or "agent").strip()
+        if status == "failed":
+            err = " ".join(str(session_run.get("error_message") or "").split())
+            if len(err) > 100:
+                err = err[:99] + "…"
+            return f" [后台任务执行失败({agent_type}): {err}]" if err else f" [后台任务执行失败({agent_type})]"
+        if status == "cancelled":
+            return f" [后台任务已取消({agent_type})]"
+        if status == "waiting_input":
+            return f" [后台任务等待人工确认({agent_type})]"
+        if status in ("running", "queued"):
+            return f" [后台任务进行中({agent_type})]"
+        if status == "completed" and role == "user":
+            return f" [已触发后台任务({agent_type}): 已完成]"
+        return ""
 
     @staticmethod
     def _format_context_lines(messages: Optional[list[dict[str, Any]]], *, include_id: bool = False) -> str:
@@ -218,7 +646,10 @@ class KikiLLMClient:
             content = " ".join(str(msg.get("content") or "").split())
             if len(content) > 240:
                 content = content[:239] + "…"
-            lines.append(f"- {prefix}{topic_tag}{role_label}: {content}")
+            run_note = KikiLLMClient._format_session_run_note(
+                msg.get("session_run"), role=msg.get("role")
+            )
+            lines.append(f"- {prefix}{topic_tag}{role_label}: {content}{run_note}")
         return "\n".join(lines) if lines else "（无）"
 
     async def route_message(
@@ -355,8 +786,12 @@ class KikiLLMClient:
         context_lines: list[str] = []
         for msg in history[-10:]:
             role_label = "用户" if msg["role"] == "user" else "Kiki"
-            if msg["content"].strip():
-                context_lines.append(f"{role_label}: {msg['content']}")
+            content_text = str(msg.get("content") or "").strip()
+            run_note = self._format_session_run_note(
+                msg.get("session_run"), role=msg.get("role")
+            )
+            if content_text or run_note:
+                context_lines.append(f"{role_label}: {content_text}{run_note}")
 
         if context_lines:
             prompt_input = (
@@ -393,19 +828,56 @@ class KikiLLMClient:
                                 yielded_any = True
                                 yield text_chunk
                 if yielded_any:
+                    self.last_used_provider = "gemini"
+                    self.last_used_model = model_name
                     return
             except Exception as exc:
                 last_exc = exc
-                self._mark_primary_cooldown(model_name, exc)
+                self._mark_model_cooldown(model_name, exc)
                 logger.warning("Fast-Path streaming (%s) failed: %s", model_name, exc)
+                if yielded_any:
+                    return
+
+        if self.settings.deepseek_configured:
+            yielded_any = False
+            try:
+                logger.info(
+                    "Fast-Path streaming falling back to paid DeepSeek (%s)",
+                    self.deepseek_model,
+                )
+                payload = {
+                    "model": self.deepseek_model,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": prompt_input},
+                    ],
+                    "stream": True,
+                    "max_tokens": 4096,
+                }
+                async for text_chunk in self._deepseek_stream_chat(payload):
+                    yielded_any = True
+                    yield text_chunk
+                if yielded_any:
+                    self.last_used_provider = "deepseek"
+                    self.last_used_model = self.deepseek_model
+                    return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Fast-Path streaming (deepseek:%s) fallback failed: %s",
+                    self.deepseek_model,
+                    exc,
+                )
                 if yielded_any:
                     return
 
         err_str = str(last_exc) if last_exc else ""
         if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            yield "喵呜～Gemini API 刚刚触发了速率限制（429），稍等几秒再喊我吧！"
-        elif not self.settings.api_key_configured:
-            yield "喵～还没在 `.env` 里配置 `GEMINI_API_KEY` 呢，配好之后我就能陪你聊啦！"
+            yield "喵呜～API 刚刚触发了速率限制（429），稍等几秒再喊我吧！"
+        elif "503" in err_str or "SERVICE_UNAVAILABLE" in err_str or "high demand" in err_str.lower():
+            yield "喵呜～Gemini API 多个备选模型目前都处于高负载（503），稍等几秒再试试吧！"
+        elif not self.settings.any_llm_configured:
+            yield "喵～还没在 `.env` 里配置 `GEMINI_API_KEY` 或 `DEEPSEEK_API_KEY` 呢，配好之后我就能陪你聊啦！"
         elif last_exc is not None:
             yield f"喵呜，刚才开小差出错了（{type(last_exc).__name__}），请稍后再试一次。"
         else:
@@ -419,27 +891,60 @@ class KikiLLMClient:
         previous_interaction_id: Optional[str] = None,
         thinking_level: str = "medium",
     ) -> Any:
-        client = self._get_client()
+        if previous_interaction_id and previous_interaction_id.startswith("ds_int_"):
+            return await self._run_deepseek_agent_turn(
+                input_data=input_data,
+                tools=tools,
+                system_instruction=system_instruction,
+                previous_interaction_id=previous_interaction_id,
+            )
+
+        pinned_model = (
+            self._interaction_models.get(previous_interaction_id)
+            if previous_interaction_id
+            else None
+        )
         last_exc: Optional[Exception] = None
-        for model_name in self._candidate_models():
-            kwargs: dict[str, Any] = {
-                "model": model_name,
-                "input": input_data,
-                "tools": tools,
-                "system_instruction": system_instruction,
-                "generation_config": {"thinking_level": thinking_level},
-                "store": True,
-            }
-            if previous_interaction_id:
-                kwargs["previous_interaction_id"] = previous_interaction_id
-            try:
-                return await client.aio.interactions.create(**kwargs)
-            except Exception as exc:
-                last_exc = exc
-                self._mark_primary_cooldown(model_name, exc)
-                logger.warning("Agent turn (%s) failed: %s", model_name, exc)
+        candidates = self._candidate_models(pinned_model=pinned_model)
+        if candidates:
+            client = self._get_client()
+            for model_name in candidates:
+                kwargs: dict[str, Any] = {
+                    "model": model_name,
+                    "input": input_data,
+                    "tools": tools,
+                    "system_instruction": system_instruction,
+                    "generation_config": {"thinking_level": thinking_level},
+                    "store": True,
+                }
                 if previous_interaction_id:
-                    # Cannot switch model mid-chain with previous_interaction_id
-                    raise
-        assert last_exc is not None
-        raise last_exc
+                    kwargs["previous_interaction_id"] = previous_interaction_id
+                try:
+                    interaction = await client.aio.interactions.create(**kwargs)
+                    self._remember_interaction_model(getattr(interaction, "id", None), model_name)
+                    self.last_used_provider = "gemini"
+                    self.last_used_model = model_name
+                    return interaction
+                except Exception as exc:
+                    last_exc = exc
+                    self._mark_model_cooldown(model_name, exc)
+                    logger.warning("Agent turn (%s) failed: %s", model_name, exc)
+                    if previous_interaction_id:
+                        # Cannot switch model mid-chain with previous_interaction_id
+                        raise
+
+        if not previous_interaction_id and self.settings.deepseek_configured:
+            logger.info(
+                "Agent turn falling back to paid DeepSeek (%s)",
+                self.deepseek_model,
+            )
+            return await self._run_deepseek_agent_turn(
+                input_data=input_data,
+                tools=tools,
+                system_instruction=system_instruction,
+                previous_interaction_id=None,
+            )
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No LLM provider configured (set GEMINI_API_KEY or DEEPSEEK_API_KEY)")

@@ -37,6 +37,7 @@ export interface RouteDecision {
   topic_action: 'reuse' | 'create' | 'none';
   topic_id?: string | null;
   new_topic_title?: string | null;
+  agent_type?: string | null;
   confidence: number;
   reasoning?: string | null;
 }

@@ -150,6 +150,26 @@ def create_app(
     async def get_search_status() -> dict[str, Any]:
         return search_service.status()
 
+    @app.get("/api/llm/status")
+    async def get_llm_status() -> dict[str, Any]:
+        status_fn = getattr(llm_client, "status", None)
+        if callable(status_fn):
+            return status_fn()
+        return {
+            "active_provider": "gemini",
+            "active_model": cfg.gemini_model,
+            "gemini_configured": cfg.api_key_configured,
+            "deepseek_configured": cfg.deepseek_configured,
+            "deepseek_model": cfg.deepseek_model,
+        }
+
+    @app.post("/api/llm/probe")
+    async def probe_llm() -> dict[str, Any]:
+        probe_fn = getattr(llm_client, "probe_gemini_free_tier", None)
+        if callable(probe_fn):
+            return await probe_fn()
+        return await get_llm_status()
+
     # ------------------------------------------------------------------
     # Topics
     # ------------------------------------------------------------------
@@ -332,12 +352,26 @@ def create_app(
         session_run: Optional[dict[str, Any]] = None
 
         if decision.path == "heavy":
+            explicit_agent = registry.detect_requested_agent(req.content)
+            routed_agent = registry.try_resolve_type(decision.agent_type)
+            history_agent: Optional[str] = None
+            if not explicit_agent and (not routed_agent or routed_agent == "gemini_agent"):
+                topic_history = database.get_topic_history(topic["id"], limit=10)
+                for hist_msg in reversed(topic_history):
+                    if hist_msg.get("role") == "user" and hist_msg.get("content") != req.content:
+                        detected = registry.detect_requested_agent(hist_msg.get("content", ""))
+                        if detected:
+                            history_agent = detected
+                            break
+            resolved_agent_type = explicit_agent or history_agent or routed_agent or req.agent_type
+            if resolved_agent_type and decision.agent_type != resolved_agent_type:
+                decision = decision.model_copy(update={"agent_type": resolved_agent_type})
             try:
                 session_run = task_manager.enqueue_run(
                     topic_id=topic["id"],
                     trigger_message_id=user_msg["id"],
                     user_content=req.content,
-                    agent_type=req.agent_type,
+                    agent_type=resolved_agent_type,
                     model_override=req.model,
                     thinking_override=req.thinking_level,
                 )

@@ -203,7 +203,10 @@ async def test_health_and_five_core_tables(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path):
+async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from app.adapters.codex import CodexAdapter
+
+    monkeypatch.setattr(CodexAdapter, "resolve_binary", lambda self: None)
     app, _db, bus, fake_llm, _db_path = _build_test_app(tmp_path)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -216,6 +219,7 @@ async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path):
         assert data["route_decision"]["path"] == "fast"
         assert data["topic"]["id"] == "topic-general"
         assert data["assistant_message"] is not None
+        assert data["assistant_message"]["streaming"] is True
 
         # Wait briefly for background streaming to finish
         await asyncio.sleep(0.15)
@@ -223,22 +227,115 @@ async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path):
         assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         assert "喵~" in assistant_msgs[0]["content"]
+        assert assistant_msgs[0]["streaming"] is False
 
-        # 2. Create a custom topic and test Topic Focus Mode bypass
+        # 2. Create a custom topic and test Topic Focus Mode:
+        # 2a. Explicit force_path bypasses Decision Model
         t_res = await client.post("/api/topics", json={"title": "排查502"})
         assert t_res.status_code == 201
         topic_id = t_res.json()["id"]
 
         res2 = await client.post(
             "/api/chat",
-            json={"content": "继续看这个报错", "focus_topic_id": topic_id},
+            json={
+                "content": "继续看这个报错",
+                "focus_topic_id": topic_id,
+                "force_path": "fast",
+            },
         )
         assert res2.status_code == 200
         data2 = res2.json()
-        # Decision Model must have been bypassed!
         assert fake_llm.route_calls == 1
         assert data2["topic"]["id"] == topic_id
+        assert data2["route_decision"]["path"] == "fast"
         assert data2["route_decision"]["confidence"] == 1.0
+
+        # 2b. Default auto mode in Topic Focus Mode still classifies path (e.g. heavy) while locking topic
+        fake_llm.next_decision = RouteDecision(
+            path="heavy",
+            topic_action="create",
+            topic_id=None,
+            new_topic_title="不应被新建的话题",
+            agent_type="codex",
+            confidence=0.88,
+            reasoning="用户要求重新执行后台任务",
+        )
+        res3 = await client.post(
+            "/api/chat",
+            json={
+                "content": "来，再生成一次",
+                "focus_topic_id": topic_id,
+                "agent_type": "gemini_agent",
+            },
+        )
+        assert res3.status_code == 200
+        data3 = res3.json()
+        assert fake_llm.route_calls == 2
+        assert data3["topic"]["id"] == topic_id
+        assert data3["route_decision"]["path"] == "heavy"
+        assert data3["route_decision"]["topic_action"] == "reuse"
+        assert data3["route_decision"]["confidence"] == 1.0
+        assert data3["session_run"] is not None
+        assert data3["session_run"]["agent_type"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_explicit_agent_detection_overrides_default_selector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.adapters.codex import CodexAdapter
+
+    monkeypatch.setattr(CodexAdapter, "resolve_binary", lambda self: None)
+    app, _db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    fake_llm.next_decision = RouteDecision(
+        path="heavy",
+        topic_action="create",
+        topic_id=None,
+        new_topic_title="生成猫猫 lulu 图片",
+        agent_type=None,
+        confidence=0.95,
+        reasoning="用户请求生图任务",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post(
+            "/api/chat",
+            json={
+                "content": "调用 Codex 帮我生成一张猫猫的图吧，名字叫 lulu",
+                "agent_type": "gemini_agent",
+            },
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["route_decision"]["path"] == "heavy"
+        assert data["route_decision"]["agent_type"] == "codex"
+        assert data["session_run"] is not None
+        assert data["session_run"]["agent_type"] == "codex"
+
+        # Follow-up in same topic without repeating "Codex" should still resolve to codex
+        topic_id = data["topic"]["id"]
+        fake_llm.next_decision = RouteDecision(
+            path="heavy",
+            topic_action="reuse",
+            topic_id=topic_id,
+            new_topic_title=None,
+            agent_type="gemini_agent",
+            confidence=0.9,
+            reasoning="用户追问重跑生图任务",
+        )
+        res2 = await client.post(
+            "/api/chat",
+            json={
+                "content": "你也没生成啊",
+                "focus_topic_id": topic_id,
+                "agent_type": "gemini_agent",
+            },
+        )
+        assert res2.status_code == 200
+        data2 = res2.json()
+        assert data2["route_decision"]["agent_type"] == "codex"
+        assert data2["session_run"]["agent_type"] == "codex"
 
 
 @pytest.mark.asyncio

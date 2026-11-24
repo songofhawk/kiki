@@ -385,3 +385,39 @@ async def test_doubao_work_hybrid_ark_api_fallback(
         result = await adapter.execute(ctx)
         assert "豆包工作" in result.summary
         assert result.session_id == "chatcmpl_ark_01"
+
+
+@pytest.mark.asyncio
+async def test_gemini_agent_includes_topic_history_when_present(tmp_path: Path):
+    adapter = GeminiAgentAdapter()
+    ctx = _make_context(tmp_path, "再试一次")
+    ctx.topic_title = "深圳实时天气查询"
+    ctx.history = [
+        {
+            "role": "user",
+            "content": "再查一下深圳现在的天气",
+            "session_run": {
+                "status": "failed",
+                "agent_type": "gemini_agent",
+                "error_message": "503 high demand",
+            },
+        }
+    ]
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_run_agent_turn(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return MagicMock(id="int-1", steps=[], output_text="深圳当前多云 17°C。")
+
+    ctx.llm = MagicMock()
+    ctx.llm.run_agent_turn = AsyncMock(side_effect=fake_run_agent_turn)
+
+    result = await adapter.execute(ctx)
+    assert result.summary == "深圳当前多云 17°C。"
+    assert len(captured) == 1
+    sent_input = captured[0]["input_data"]
+    assert "当前话题：深圳实时天气查询" in sent_input
+    assert "再查一下深圳现在的天气" in sent_input
+    assert "[后台任务执行失败(gemini_agent): 503 high demand]" in sent_input
+    assert "用户当前任务：再试一次" in sent_input

@@ -80,36 +80,75 @@ function upsertTopic(list: Topic[], incoming: Topic): Topic[] {
   return next.sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
 }
 
-function upsertMessage(list: Message[], incoming: Message): Message[] {
+function isMessageStreaming(msg: Message | undefined | null): boolean {
+  if (!msg) return false;
+  if (typeof msg.streaming === 'boolean') return msg.streaming;
+  return Boolean(msg.metadata?.streaming);
+}
+
+function normalizeMessage(msg: Message): Message {
+  const streaming = isMessageStreaming(msg);
+  return msg.streaming === streaming ? msg : { ...msg, streaming };
+}
+
+function mergeMessage(existing: Message, incomingRaw: Message): Message {
+  const incoming = normalizeMessage(incomingRaw);
+  const existingStreaming = isMessageStreaming(existing);
+  const incomingStreaming = isMessageStreaming(incoming);
+  const incomingIsEmptyPlaceholder =
+    incomingStreaming && !(incoming.content && incoming.content.length > 0);
+
+  // Never let a stale empty streaming placeholder (e.g. from /api/chat HTTP response
+  // or late message_created) wipe out already-streamed deltas or completed content.
+  if (incomingIsEmptyPlaceholder && existing.content && existing.content.length > 0) {
+    const alreadyCompleted =
+      !existingStreaming && existing.metadata?.streaming === false;
+    return {
+      ...existing,
+      topic: incoming.topic ?? existing.topic,
+      session_run: incoming.session_run ?? existing.session_run,
+      streaming: alreadyCompleted ? false : true,
+    };
+  }
+
+  // If existing is already completed and incoming is still marked streaming (out-of-order),
+  // keep completed content & state.
+  const existingCompleted =
+    !existingStreaming &&
+    existing.metadata?.streaming === false &&
+    Boolean(existing.content);
+  if (existingCompleted && incomingStreaming) {
+    return {
+      ...existing,
+      topic: incoming.topic ?? existing.topic,
+      session_run: incoming.session_run ?? existing.session_run,
+      streaming: false,
+    };
+  }
+
+  return {
+    ...existing,
+    ...incoming,
+    streaming: incomingStreaming,
+    session_run: incoming.session_run ?? existing.session_run,
+    topic: incoming.topic ?? existing.topic,
+  };
+}
+
+function upsertMessage(list: Message[], incomingRaw: Message): Message[] {
+  const incoming = normalizeMessage(incomingRaw);
   const idx = list.findIndex((m) => m.id === incoming.id);
   if (idx >= 0) {
-    return list.map((m, i) =>
-      i === idx
-        ? {
-          ...m,
-          ...incoming,
-          session_run: incoming.session_run ?? m.session_run,
-          topic: incoming.topic ?? m.topic,
-        }
-        : m
-    );
+    return list.map((m, i) => (i === idx ? mergeMessage(m, incoming) : m));
   }
   return [...list, incoming];
 }
 
-function upsertMessageChronological(list: Message[], incoming: Message): Message[] {
+function upsertMessageChronological(list: Message[], incomingRaw: Message): Message[] {
+  const incoming = normalizeMessage(incomingRaw);
   const idx = list.findIndex((m) => m.id === incoming.id);
   if (idx >= 0) {
-    return list.map((m, i) =>
-      i === idx
-        ? {
-          ...m,
-          ...incoming,
-          session_run: incoming.session_run ?? m.session_run,
-          topic: incoming.topic ?? m.topic,
-        }
-        : m
-    );
+    return list.map((m, i) => (i === idx ? mergeMessage(m, incoming) : m));
   }
   const incomingTs = incoming.created_at || '';
   const insertAt = list.findIndex((m) => (m.created_at || '') > incomingTs);
@@ -376,14 +415,20 @@ export const App: React.FC = () => {
         hydrateRunsFromMessages(page.messages);
         setStreamsByKey((prev) => {
           const current = prev[viewKey];
-          let merged = page.messages;
+          const existingById = new Map<string, Message>(
+            (current?.messages ?? []).map((m) => [m.id, m])
+          );
+          let merged = page.messages.map((fetched) => {
+            const existing = existingById.get(fetched.id);
+            return existing ? mergeMessage(existing, fetched) : normalizeMessage(fetched);
+          });
           if (current && current.messages.length > 0) {
             const fetchedIds = new Set(page.messages.map((m) => m.id));
             const liveTail = current.messages.filter(
-              (m) => !fetchedIds.has(m.id) && (m.streaming || m.metadata?.optimistic)
+              (m) => !fetchedIds.has(m.id) && (isMessageStreaming(m) || m.metadata?.optimistic)
             );
             if (liveTail.length > 0) {
-              merged = [...page.messages, ...liveTail];
+              merged = [...merged, ...liveTail];
             }
           }
           return {
@@ -524,14 +569,20 @@ export const App: React.FC = () => {
 
       setStreamsByKey((prev) => {
         const current = prev[ALL_STREAM_KEY];
-        let merged = messagesPage.messages;
+        const existingById = new Map<string, Message>(
+          (current?.messages ?? []).map((m) => [m.id, m])
+        );
+        let merged = messagesPage.messages.map((fetched) => {
+          const existing = existingById.get(fetched.id);
+          return existing ? mergeMessage(existing, fetched) : normalizeMessage(fetched);
+        });
         if (current && current.messages.length > 0) {
           const fetchedIds = new Set(messagesPage.messages.map((m) => m.id));
           const liveTail = current.messages.filter(
-            (m) => !fetchedIds.has(m.id) && (m.streaming || m.metadata?.optimistic)
+            (m) => !fetchedIds.has(m.id) && (isMessageStreaming(m) || m.metadata?.optimistic)
           );
           if (liveTail.length > 0) {
-            merged = [...messagesPage.messages, ...liveTail];
+            merged = [...merged, ...liveTail];
           }
         }
         return {
@@ -778,7 +829,7 @@ export const App: React.FC = () => {
   const hasStreamingMessage = useMemo(
     () =>
       Object.values(streamsByKey).some((stream) =>
-        stream.messages.some((m) => m.streaming)
+        stream.messages.some((m) => isMessageStreaming(m))
       ),
     [streamsByKey]
   );
@@ -808,7 +859,7 @@ export const App: React.FC = () => {
     if (sending || toasts.length > 0) {
       usedInMainView.add('delivering');
     }
-    if (visibleMessages.some((m) => m.streaming)) {
+    if (visibleMessages.some((m) => isMessageStreaming(m))) {
       usedInMainView.add('thinking');
     }
 

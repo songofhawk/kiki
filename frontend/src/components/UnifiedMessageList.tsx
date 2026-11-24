@@ -334,7 +334,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   const latestRunIdByStatus: Partial<Record<SessionRun['status'], string>> = {};
 
   for (const msg of messages) {
-    if (msg.streaming) {
+    if (Boolean(msg.streaming ?? msg.metadata?.streaming)) {
       latestStreamingMsgId = msg.id;
     }
     const rId =
@@ -545,7 +545,8 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           // Assistant message:
           // Completed messages stay completely static (`animated={false}`);
           // Only the actively streaming message animates (`thinking`).
-          const isActivelyStreaming = Boolean(msg.streaming && msg.id === latestStreamingMsgId);
+          const msgIsStreaming = Boolean(msg.streaming ?? msg.metadata?.streaming);
+          const isActivelyStreaming = Boolean(msgIsStreaming && msg.id === latestStreamingMsgId);
 
           return (
             <div
@@ -602,7 +603,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
 
                 <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
                   {renderInlineMarkdown(msg.content)}
-                  {msg.streaming && (
+                  {msgIsStreaming && (
                     <span className="inline-flex items-center gap-1 ml-1.5 align-middle">
                       <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />
                       <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:150ms]" />

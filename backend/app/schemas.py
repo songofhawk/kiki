@@ -22,6 +22,10 @@ class RouteDecision(BaseModel):
         default=None,
         description="Short concise title if topic_action is create, else null",
     )
+    agent_type: Optional[str] = Field(
+        default=None,
+        description="Explicitly requested Heavy-Path agent ID (e.g. codex, claude_code, gemini_agent) if mentioned by user or continuing a previous agent task, else null",
+    )
     confidence: float = Field(
         ge=0.0,
         le=1.0,
@@ -177,6 +181,7 @@ class MessageItem(BaseModel):
     content: str
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
+    streaming: bool = False
     topic: Optional[TopicSummary] = None
     session_run: Optional[SessionRunDetail] = None
 

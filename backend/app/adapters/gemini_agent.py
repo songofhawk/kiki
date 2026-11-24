@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from ..llm import KikiLLMClient
 from ..tools import AGENT_TOOL_DECLARATIONS
 from .base import (
     AdapterContext,
@@ -23,6 +24,7 @@ AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (gemini_agent)�
 2. 若需要产出报告、分析文档或代码，使用 `write_artifact` 保存为产物文件。
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
 4. 任务完成时，用简洁、信息密度高的中文给出最终总结（**严格控制在 200 字以内**），直接说明结论与产出物。
+5. 你当前**不具备**真实图片生成（PNG/JPG/WebP）工具；若用户要求生成图片或插画，**严禁**用 ASCII 字符画或 Markdown 文档冒充图片，应直接诚实说明无法生成真实图片，并建议用户改用支持生图的执行引擎（例如 Codex）。
 """
 
 
@@ -130,7 +132,15 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
             }
         )
 
-        input_data: Any = f"当前话题：{ctx.topic_title}\n用户任务：{ctx.user_content}"
+        if ctx.history:
+            history_text = KikiLLMClient._format_context_lines(ctx.history[-10:])
+            input_data: Any = (
+                f"当前话题：{ctx.topic_title}\n"
+                f"本话题近期对话与任务记录（按时间从早到晚）：\n{history_text}\n\n"
+                f"用户当前任务：{ctx.user_content}"
+            )
+        else:
+            input_data = f"当前话题：{ctx.topic_title}\n用户任务：{ctx.user_content}"
         previous_interaction_id: Optional[str] = None
         final_text: str = ""
 
