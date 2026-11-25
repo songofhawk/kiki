@@ -113,6 +113,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         database.init_db()
+        database.reconcile_orphaned_state()
         cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
         dream_consolidator.start()
         yield

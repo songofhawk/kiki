@@ -387,6 +387,7 @@ class FastPathService:
     ) -> None:
         self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在回复...")
         chunks: list[str] = []
+        cancelled = False
         try:
             async for delta in self.llm.stream_fast_reply(
                 content=user_content,
@@ -402,6 +403,9 @@ class FastPathService:
                         "delta": delta,
                     },
                 )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as exc:
             logger.exception("Unexpected error during fast reply stream: %s", exc)
             err_msg = "喵呜，回复时遇到了一点小问题，请再试一次。"
@@ -412,7 +416,8 @@ class FastPathService:
             )
         finally:
             self._active_message_ids.discard(message_id)
-            final_text = "".join(chunks).strip() or "喵？我刚刚没听清，能再说一遍吗？"
+            fallback_empty = "（回复已中断）" if cancelled else "喵？我刚刚没听清，能再说一遍吗？"
+            final_text = "".join(chunks).strip() or fallback_empty
             completed = self.db.update_message(
                 message_id,
                 content=final_text,

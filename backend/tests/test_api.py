@@ -1289,3 +1289,37 @@ async def test_single_message_reassign_keeps_paired_assistant_reply(tmp_path: Pa
         new_tid = split_res.json()["topic"]["id"]
         assert db.get_message(user_msg_id)["topic_id"] == new_tid
         assert db.get_message(assistant_msg_id)["topic_id"] == new_tid
+
+
+def test_reconcile_orphaned_state_on_startup(tmp_path: Path):
+    db = Database(tmp_path / "orphan.db")
+    db.init_db()
+    topic = db.create_topic(title="重启恢复测试")
+    u_msg = db.create_message(topic["id"], "user", "执行长任务")
+    a_streaming = db.create_message(
+        topic["id"], "assistant", "", metadata={"streaming": True}
+    )
+    run_running = db.create_session_run(
+        topic["id"], u_msg["id"], status="running", current_step="执行中"
+    )
+    step = db.add_step_log(run_running["id"], 1, "tool_call", "读取文件", status="in_progress")
+    run_waiting = db.create_session_run(
+        topic["id"], u_msg["id"], status="waiting_input", current_step="等拍板"
+    )
+
+    counts = db.reconcile_orphaned_state()
+    assert counts == {"runs": 1, "step_logs": 1, "messages": 1}
+
+    fixed_run = db.get_session_run(run_running["id"])
+    assert fixed_run is not None
+    assert fixed_run["status"] == "failed"
+    assert fixed_run["step_logs"][0]["id"] == step["id"]
+    assert fixed_run["step_logs"][0]["status"] == "failed"
+
+    # waiting_input remains intact for manual resume/cancel
+    assert db.get_session_run(run_waiting["id"])["status"] == "waiting_input"
+
+    fixed_msg = db.get_message(a_streaming["id"])
+    assert fixed_msg is not None
+    assert fixed_msg["streaming"] is False
+    assert "中断" in fixed_msg["content"]

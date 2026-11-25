@@ -121,6 +121,52 @@ class Database:
                 conn.execute("ALTER TABLE topics ADD COLUMN unread INTEGER DEFAULT 0")
             conn.commit()
 
+    def reconcile_orphaned_state(self) -> dict[str, int]:
+        """Converge stale in-flight runs, step logs, and streaming placeholders left by a restart."""
+        now = utc_now_iso()
+        with self._connect() as conn:
+            run_cur = conn.execute(
+                """
+                UPDATE session_runs
+                SET status = 'failed',
+                    current_step = '服务重启导致后台任务中断',
+                    error_message = COALESCE(error_message, '服务重启导致后台任务中断'),
+                    updated_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (now,),
+            )
+            step_cur = conn.execute(
+                """
+                UPDATE step_logs
+                SET status = 'failed'
+                WHERE status = 'in_progress'
+                  AND run_id NOT IN (
+                      SELECT id FROM session_runs WHERE status = 'waiting_input'
+                  )
+                """
+            )
+            streaming_rows = conn.execute(
+                "SELECT id, content, metadata FROM messages WHERE metadata LIKE '%\"streaming\"%'"
+            ).fetchall()
+            fixed_messages = 0
+            for row in streaming_rows:
+                meta = _parse_metadata(row["metadata"])
+                if meta.get("streaming") is True:
+                    meta["streaming"] = False
+                    content = row["content"] if (row["content"] or "").strip() else "（服务重启，流式回复已中断）"
+                    conn.execute(
+                        "UPDATE messages SET content = ?, metadata = ? WHERE id = ?",
+                        (content, json.dumps(meta, ensure_ascii=False), row["id"]),
+                    )
+                    fixed_messages += 1
+            conn.commit()
+            return {
+                "runs": max(0, run_cur.rowcount),
+                "step_logs": max(0, step_cur.rowcount),
+                "messages": fixed_messages,
+            }
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
