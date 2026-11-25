@@ -12,9 +12,6 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = REPO_ROOT / ".env"
 
-if ENV_FILE.exists():
-    load_dotenv(dotenv_path=ENV_FILE, override=False)
-
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_FALLBACK_MODELS: tuple[str, ...] = (

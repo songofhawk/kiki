@@ -120,6 +120,9 @@ def create_app(
         await dream_consolidator.shutdown()
         await fast_path.shutdown()
         await task_manager.shutdown()
+        aclose_fn = getattr(llm_client, "aclose", None)
+        if callable(aclose_fn):
+            await aclose_fn()
         database.close()
 
     app = FastAPI(
@@ -511,4 +514,13 @@ def create_app(
     return app
 
 
-app = create_app()
+_lazy_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str) -> Any:
+    global _lazy_app
+    if name == "app":
+        if _lazy_app is None:
+            _lazy_app = create_app()
+        return _lazy_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

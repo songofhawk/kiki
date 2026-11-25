@@ -163,6 +163,7 @@ class KikiLLMClient:
         self._jev_cooldown_until: float = 0.0
         self._http_client: Optional[httpx.AsyncClient] = None
         self._client: Optional[genai.Client] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
         self._cooldown_seconds: float = max(0.0, float(settings.gemini_cooldown_seconds))
         self._model_cooldowns: dict[str, float] = {}
         self._interaction_models: dict[str, str] = {}
@@ -403,6 +404,18 @@ class KikiLLMClient:
             "Content-Type": "application/json",
         }
 
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            )
+        return self._http_client
+
+    async def aclose(self) -> None:
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+        self._http_client = None
+
     async def _openai_post_chat(
         self,
         *,
@@ -416,10 +429,10 @@ class KikiLLMClient:
             "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=timeout) as http_client:
-            resp = await http_client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        http_client = self._get_http_client()
+        resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
     async def _deepseek_post_chat(
         self,
@@ -447,32 +460,33 @@ class KikiLLMClient:
             "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=timeout) as http_client:
-            async with http_client.stream(
-                "POST",
-                url,
-                headers=headers,
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    stripped = line.strip()
-                    if not stripped or not stripped.startswith("data:"):
-                        continue
-                    data_str = stripped[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk_obj = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = chunk_obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    text = delta.get("content")
-                    if text:
-                        yield str(text)
+        http_client = self._get_http_client()
+        async with http_client.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                stripped = line.strip()
+                if not stripped or not stripped.startswith("data:"):
+                    continue
+                data_str = stripped[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk_obj = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk_obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                text = delta.get("content")
+                if text:
+                    yield str(text)
 
     async def _deepseek_stream_chat(
         self,
@@ -863,11 +877,6 @@ class KikiLLMClient:
             )
             lines.append(f"- {prefix}{topic_tag}{role_label}: {content}{run_note}")
         return "\n".join(lines) if lines else "（无）"
-
-    def _get_http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=60.0)
-        return self._http_client
 
     async def _jev_post_systemone(
         self,
