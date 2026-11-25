@@ -544,6 +544,15 @@ async def test_heavy_path_tools_artifacts_and_toast(tmp_path: Path):
         assert len(done_run["artifacts"]) == 1
         assert done_run["artifacts"][0]["file_type"] == "markdown"
 
+        # Artifact preview/download endpoint returns the written content
+        art_id = done_run["artifacts"][0]["id"]
+        art_res = await client.get(f"/api/runs/{run_id}/artifacts/{art_id}")
+        assert art_res.status_code == 200
+        assert "巡检报告" in art_res.text
+
+        missing_art = await client.get(f"/api/runs/{run_id}/artifacts/nonexistent")
+        assert missing_art.status_code == 404
+
         # Topic should be marked unread & have <= 200-char writeback assistant message
         topics = (await client.get("/api/topics")).json()
         topic = next(t for t in topics if t["id"] == topic_id)

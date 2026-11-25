@@ -83,6 +83,42 @@ function formatTime(ts?: string | null): string {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 }
 
+function renderLinksAndText(text: string, keyPrefix: string): React.ReactNode {
+  const linkRe = /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<>()]+)/g;
+  const parts = text.split(linkRe);
+  return parts.map((part, idx) => {
+    if (!part) return null;
+    const mdMatch = part.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+    if (mdMatch) {
+      return (
+        <a
+          key={`${keyPrefix}-l-${idx}`}
+          href={mdMatch[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#456B8A] underline decoration-[#456B8A]/40 hover:decoration-[#456B8A] break-all"
+        >
+          {mdMatch[1]}
+        </a>
+      );
+    }
+    if (/^https?:\/\/\S+$/.test(part)) {
+      return (
+        <a
+          key={`${keyPrefix}-u-${idx}`}
+          href={part}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#456B8A] underline decoration-[#456B8A]/40 hover:decoration-[#456B8A] break-all"
+        >
+          {part}
+        </a>
+      );
+    }
+    return <React.Fragment key={`${keyPrefix}-t-${idx}`}>{part}</React.Fragment>;
+  });
+}
+
 function renderInlineCode(text: string, keyPrefix: string): React.ReactNode {
   const codeParts = text.split(/(`[^`]+`)/g);
   return codeParts.map((part, idx) => {
@@ -96,23 +132,108 @@ function renderInlineCode(text: string, keyPrefix: string): React.ReactNode {
         </code>
       );
     }
-    return <React.Fragment key={`${keyPrefix}-t-${idx}`}>{part}</React.Fragment>;
+    return (
+      <React.Fragment key={`${keyPrefix}-r-${idx}`}>
+        {renderLinksAndText(part, `${keyPrefix}-r-${idx}`)}
+      </React.Fragment>
+    );
   });
 }
 
-function renderInlineMarkdown(text: string): React.ReactNode {
-  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+function renderInlineMarkdown(text: string, keyPrefix = 'm'): React.ReactNode {
+  const parts = text.split(/(\*\*[^*\n]+\*\*)/g);
   return parts.map((part, idx) => {
     if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
       return (
-        <strong key={`b-${idx}`} className="font-semibold text-[#1E1C1A]">
-          {renderInlineCode(part.slice(2, -2), `b-${idx}`)}
+        <strong key={`${keyPrefix}-b-${idx}`} className="font-semibold text-[#1E1C1A]">
+          {renderInlineCode(part.slice(2, -2), `${keyPrefix}-b-${idx}`)}
         </strong>
       );
     }
     return (
-      <React.Fragment key={`p-${idx}`}>
-        {renderInlineCode(part, `p-${idx}`)}
+      <React.Fragment key={`${keyPrefix}-p-${idx}`}>
+        {renderInlineCode(part, `${keyPrefix}-p-${idx}`)}
+      </React.Fragment>
+    );
+  });
+}
+
+function renderMarkdownContent(text: string): React.ReactNode {
+  if (!text) return null;
+  const segments = text.split(/(```[\s\S]*?```)/g);
+  return segments.map((seg, segIdx) => {
+    if (seg.startsWith('```') && seg.endsWith('```') && seg.length >= 6) {
+      const inner = seg.slice(3, -3);
+      const nlIdx = inner.indexOf('\n');
+      const lang = nlIdx >= 0 ? inner.slice(0, nlIdx).trim() : '';
+      const code = nlIdx >= 0 ? inner.slice(nlIdx + 1) : inner;
+      return (
+        <div
+          key={`code-${segIdx}`}
+          className="my-2 rounded-xl bg-[#1F1E1C] text-[#EAE6DF] border border-[#34312D] overflow-hidden"
+        >
+          {lang && (
+            <div className="px-3 py-1 text-[10px] font-mono uppercase tracking-wider text-[#9A938A] bg-[#282623] border-b border-[#34312D]">
+              {lang}
+            </div>
+          )}
+          <pre className="p-3 overflow-x-auto text-[12px] font-mono leading-relaxed whitespace-pre">
+            <code>{code.replace(/\n$/, '')}</code>
+          </pre>
+        </div>
+      );
+    }
+
+    const lines = seg.split('\n');
+    return (
+      <React.Fragment key={`txt-${segIdx}`}>
+        {lines.map((line, lineIdx) => {
+          const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
+          if (headingMatch) {
+            const level = headingMatch[1].length;
+            const cls =
+              level === 1
+                ? 'text-base font-bold text-[#1E1C1A] mt-2 mb-1'
+                : level === 2
+                  ? 'text-[15px] font-semibold text-[#1E1C1A] mt-2 mb-1'
+                  : 'text-sm font-semibold text-[#262422] mt-1.5 mb-0.5';
+            return (
+              <div key={`h-${segIdx}-${lineIdx}`} className={cls}>
+                {renderInlineMarkdown(headingMatch[2], `h-${segIdx}-${lineIdx}`)}
+              </div>
+            );
+          }
+          const bulletMatch = line.match(/^\s*[-*•]\s+(.+)$/);
+          if (bulletMatch) {
+            return (
+              <div key={`li-${segIdx}-${lineIdx}`} className="flex items-start gap-2 pl-1 my-0.5">
+                <span className="text-[#5B7A95] select-none leading-relaxed">•</span>
+                <span className="flex-1 min-w-0">
+                  {renderInlineMarkdown(bulletMatch[1], `li-${segIdx}-${lineIdx}`)}
+                </span>
+              </div>
+            );
+          }
+          const orderedMatch = line.match(/^\s*(\d+\.)\s+(.+)$/);
+          if (orderedMatch) {
+            return (
+              <div key={`ol-${segIdx}-${lineIdx}`} className="flex items-start gap-2 pl-1 my-0.5">
+                <span className="text-[#5B7A95] font-mono text-xs select-none leading-relaxed">
+                  {orderedMatch[1]}
+                </span>
+                <span className="flex-1 min-w-0">
+                  {renderInlineMarkdown(orderedMatch[2], `ol-${segIdx}-${lineIdx}`)}
+                </span>
+              </div>
+            );
+          }
+          return (
+            <React.Fragment key={`ln-${segIdx}-${lineIdx}`}>
+              {renderInlineMarkdown(line, `ln-${segIdx}-${lineIdx}`)}
+              {lineIdx < lines.length - 1 ? '\n' : null}
+            </React.Fragment>
+          );
+        })}
       </React.Fragment>
     );
   });
@@ -634,7 +755,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                 </div>
 
                 <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
-                  {renderInlineMarkdown(msg.content)}
+                  {renderMarkdownContent(msg.content)}
                   {msgIsStreaming && (
                     <span className="inline-flex items-center gap-1 ml-1.5 align-middle">
                       <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />

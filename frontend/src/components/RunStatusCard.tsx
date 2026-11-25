@@ -6,6 +6,8 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  Download,
+  Eye,
   File,
   FileCode2,
   FileImage,
@@ -79,6 +81,10 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
 }) => {
   const [expanded, setExpanded] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [hitlComment, setHitlComment] = useState('');
+  const [previewArtifactId, setPreviewArtifactId] = useState<string | null>(null);
+  const [previewContent, setPreviewContent] = useState<Record<string, string>>({});
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
   const isActive =
@@ -108,9 +114,39 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
       await onResumeRun(sessionRun.id, {
         decision: opt.value,
         approved: opt.approved,
+        comment: hitlComment.trim() || undefined,
       });
+      setHitlComment('');
     } finally {
       setActionBusy(false);
+    }
+  };
+
+  const handleToggleArtifactPreview = async (artifactId: string) => {
+    if (previewArtifactId === artifactId) {
+      setPreviewArtifactId(null);
+      return;
+    }
+    setPreviewArtifactId(artifactId);
+    if (previewContent[artifactId] !== undefined) return;
+    setPreviewLoading(true);
+    try {
+      const res = await fetch(
+        `/api/runs/${encodeURIComponent(sessionRun.id)}/artifacts/${encodeURIComponent(artifactId)}`
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      setPreviewContent((prev) => ({
+        ...prev,
+        [artifactId]: text.length > 8000 ? `${text.slice(0, 8000)}\n... (已截断，请点击下载完整文件)` : text,
+      }));
+    } catch {
+      setPreviewContent((prev) => ({
+        ...prev,
+        [artifactId]: '无法预览该产物内容，请尝试下载查看。',
+      }));
+    } finally {
+      setPreviewLoading(false);
     }
   };
 
@@ -315,27 +351,61 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                   生成产物 ({artifacts.length})
                 </div>
                 <div className="space-y-1.5">
-                  {artifacts.map((art) => (
-                    <div
-                      key={art.id}
-                      className="flex items-start gap-2.5 px-2.5 py-2 rounded-xl bg-white border border-[#E8E2D9]"
-                    >
-                      {getArtifactIcon(art.file_type)}
-                      <div className="min-w-0 flex-1">
-                        <div className="text-xs font-mono font-medium text-[#262422] truncate">
-                          {art.file_path}
+                  {artifacts.map((art) => {
+                    const artUrl = `/api/runs/${encodeURIComponent(sessionRun.id)}/artifacts/${encodeURIComponent(art.id)}`;
+                    const isPreviewOpen = previewArtifactId === art.id;
+                    return (
+                      <div
+                        key={art.id}
+                        className="rounded-xl bg-white border border-[#E8E2D9] overflow-hidden"
+                      >
+                        <div className="flex items-start gap-2.5 px-2.5 py-2">
+                          {getArtifactIcon(art.file_type)}
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-mono font-medium text-[#262422] truncate">
+                              {art.file_path}
+                            </div>
+                            {art.description && (
+                              <div className="text-[11px] text-[#7A7269] mt-0.5">
+                                {art.description}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => void handleToggleArtifactPreview(art.id)}
+                              title="在线预览产物"
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-[#FAF8F5] hover:bg-[#EFEAE2] border border-[#E8E2D9] text-[#4E4842] transition-colors"
+                            >
+                              <Eye className="w-3 h-3 text-[#5B7A95]" />
+                              <span>{isPreviewOpen ? '收起' : '预览'}</span>
+                            </button>
+                            <a
+                              href={`${artUrl}?download=true`}
+                              download
+                              title="下载产物文件"
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-[#FAF8F5] hover:bg-[#EFEAE2] border border-[#E8E2D9] text-[#4E4842] transition-colors"
+                            >
+                              <Download className="w-3 h-3 text-[#5B7A95]" />
+                              <span>下载</span>
+                            </a>
+                          </div>
                         </div>
-                        {art.description && (
-                          <div className="text-[11px] text-[#7A7269] mt-0.5">
-                            {art.description}
+                        {isPreviewOpen && (
+                          <div className="border-t border-[#EFEAE2] bg-[#FAF8F5] px-3 py-2 max-h-60 overflow-auto">
+                            {previewLoading && previewContent[art.id] === undefined ? (
+                              <span className="text-[11px] text-[#8C8378]">正在加载产物内容...</span>
+                            ) : (
+                              <pre className="text-[11px] font-mono text-[#2E2B28] whitespace-pre-wrap break-words leading-relaxed">
+                                {previewContent[art.id] ?? ''}
+                              </pre>
+                            )}
                           </div>
                         )}
                       </div>
-                      <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-[#FAF8F5] border border-[#E8E2D9] text-[#7A7269] shrink-0">
-                        {art.file_type}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -362,7 +432,16 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                 {hitl?.prompt || sessionRun.current_step || '后台任务需要你的确认才能继续执行。'}
               </p>
 
-              <div className="mt-3 flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                value={hitlComment}
+                onChange={(e) => setHitlComment(e.target.value)}
+                disabled={actionBusy}
+                placeholder="可选：补充说明或限定条件（点击下方按钮一并提交）"
+                className="mt-2.5 w-full px-3 py-1.5 rounded-xl text-xs bg-white/90 border border-amber-300/90 text-[#2E271E] placeholder:text-amber-800/50 focus:outline-none focus:border-amber-500"
+              />
+
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
                 {(hitl?.options && hitl.options.length > 0
                   ? hitl.options
                   : FALLBACK_HITL_OPTIONS

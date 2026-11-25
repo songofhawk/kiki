@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Hash, Layers, Loader2, PawPrint, Plus } from 'lucide-react';
+import { Archive, Check, Hash, Layers, Loader2, PawPrint, Pencil, Plus, X } from 'lucide-react';
 import type { KikiStatus, ReassignTopicPayload, Topic } from '../types';
 import KikiAvatar, { KIKI_POSE_LABELS, KIKI_STATUS_LABELS, type KikiPose } from './KikiAvatar';
 import UserAvatar from './UserAvatar';
@@ -14,6 +14,8 @@ export interface SidebarProps {
   onSelectAllStream: () => void;
   onSelectTopic: (topicId: string) => void;
   onCreateTopic: (title: string) => Promise<void> | void;
+  onRenameTopic?: (topicId: string, title: string) => Promise<void> | void;
+  onArchiveTopic?: (topicId: string) => Promise<void> | void;
   onReassignMessage: (
     messageId: string,
     payload: ReassignTopicPayload
@@ -30,12 +32,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectAllStream,
   onSelectTopic,
   onCreateTopic,
+  onRenameTopic,
+  onArchiveTopic,
   onReassignMessage,
 }) => {
   const [dragOverTopicId, setDragOverTopicId] = useState<string | null>(null);
   const [addingTopic, setAddingTopic] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
+  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
   const [companionMoodLabel, setCompanionMoodLabel] = useState<string | null>(null);
 
   const activeTopics = topics.filter((t) => t.status === 'active');
@@ -167,12 +173,65 @@ export const Sidebar: React.FC<SidebarProps> = ({
             const isSelected = focusTopicId === topic.id;
             const isDragTarget = dragOverTopicId === topic.id;
             const isRunning = (topic.active_run_count ?? 0) > 0;
+            const isGeneral = topic.id === 'topic-general';
+            const isEditing = editingTopicId === topic.id;
+
+            if (isEditing) {
+              return (
+                <form
+                  key={topic.id}
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const trimmed = editingTitle.trim();
+                    if (trimmed && trimmed !== topic.title) {
+                      await onRenameTopic?.(topic.id, trimmed);
+                    }
+                    setEditingTopicId(null);
+                  }}
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-xl bg-white border border-[#5B7A95] shadow-sm"
+                >
+                  <input
+                    type="text"
+                    autoFocus
+                    value={editingTitle}
+                    onChange={(e) => setEditingTitle(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setEditingTopicId(null);
+                    }}
+                    className="flex-1 min-w-0 text-xs bg-transparent focus:outline-none text-[#262422]"
+                  />
+                  <button
+                    type="submit"
+                    aria-label="保存话题名"
+                    className="p-0.5 rounded text-[#5B7A95] hover:bg-[#EAF0F5]"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="取消重命名"
+                    onClick={() => setEditingTopicId(null)}
+                    className="p-0.5 rounded text-[#8C8378] hover:bg-[#F3EFE9]"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </form>
+              );
+            }
 
             return (
-              <button
+              <div
                 key={topic.id}
-                type="button"
+                role="button"
+                tabIndex={0}
+                title={topic.summary || topic.title}
                 onClick={() => onSelectTopic(topic.id)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onSelectTopic(topic.id);
+                  }
+                }}
                 onDragOver={(e) => {
                   e.preventDefault();
                   e.dataTransfer.dropEffect = 'move';
@@ -186,7 +245,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   }
                 }}
                 onDrop={(e) => handleDrop(e, topic.id)}
-                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border ${
+                className={`w-full group flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-left text-xs transition-all border cursor-pointer ${
                   isDragTarget
                     ? 'bg-amber-50 border-amber-400 ring-2 ring-amber-300/60 scale-[1.01]'
                     : isSelected
@@ -194,16 +253,57 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       : 'text-[#4E4842] hover:bg-[#ECE6DD] border-transparent'
                 }`}
               >
-                <div className="flex items-center gap-2 min-w-0 flex-1">
+                <div className="flex items-start gap-2 min-w-0 flex-1">
                   <Hash
-                    className={`w-3.5 h-3.5 shrink-0 ${
+                    className={`w-3.5 h-3.5 shrink-0 mt-0.5 ${
                       isSelected ? 'text-[#5B7A95]' : 'text-[#9A9187]'
                     }`}
                   />
-                  <span className="truncate">{topic.title}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate">{topic.title}</div>
+                    {topic.summary && (
+                      <div className="text-[10px] font-normal text-[#8C8378] truncate mt-0.5">
+                        {topic.summary}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
-                <div className="flex items-center gap-1.5 shrink-0">
+                <div className="flex items-center gap-1 shrink-0">
+                  {!isGeneral && (onRenameTopic || onArchiveTopic) && (
+                    <div className="hidden group-hover:flex items-center gap-0.5">
+                      {onRenameTopic && (
+                        <button
+                          type="button"
+                          title="重命名话题"
+                          aria-label="重命名话题"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingTopicId(topic.id);
+                            setEditingTitle(topic.title);
+                          }}
+                          className="p-1 rounded-md text-[#7D756C] hover:text-[#262422] hover:bg-[#E2DBD0]"
+                        >
+                          <Pencil className="w-3 h-3" />
+                        </button>
+                      )}
+                      {onArchiveTopic && (
+                        <button
+                          type="button"
+                          title="归档话题"
+                          aria-label="归档话题"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void onArchiveTopic(topic.id);
+                          }}
+                          className="p-1 rounded-md text-[#7D756C] hover:text-rose-700 hover:bg-rose-50"
+                        >
+                          <Archive className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   {isRunning && (
                     <span title="后台任务执行中">
                       <Loader2 className="w-3.5 h-3.5 text-[#5B7A95] animate-spin" />
@@ -220,12 +320,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   )}
 
                   {typeof topic.message_count === 'number' && (
-                    <span className="text-[10px] font-mono text-[#9A9187] tabular-nums">
+                    <span className="text-[10px] font-mono text-[#9A9187] tabular-nums group-hover:hidden">
                       {topic.message_count}
                     </span>
                   )}
                 </div>
-              </button>
+              </div>
             );
           })
         )}

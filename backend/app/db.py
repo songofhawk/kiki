@@ -559,6 +559,14 @@ class Database:
             row = conn.execute("SELECT * FROM artifacts WHERE id = ?", (aid,)).fetchone()
             return dict(row)
 
+    def get_artifact(self, run_id: str, artifact_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifacts WHERE id = ? AND run_id = ?",
+                (artifact_id, run_id),
+            ).fetchone()
+            return dict(row) if row else None
+
     # ------------------------------------------------------------------
     # Messages
     # ------------------------------------------------------------------

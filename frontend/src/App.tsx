@@ -1056,6 +1056,27 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const handleRenameTopic = useCallback(async (topicId: string, title: string) => {
+    try {
+      const updated = await updateTopic(topicId, { title });
+      setTopics((prev) => upsertTopic(prev, updated));
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : '重命名话题失败');
+    }
+  }, []);
+
+  const handleArchiveTopic = useCallback(async (topicId: string) => {
+    try {
+      const updated = await updateTopic(topicId, { status: 'archived' });
+      setTopics((prev) => upsertTopic(prev, updated));
+      if (focusTopicIdRef.current === topicId) {
+        setFocusTopicId(null);
+      }
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : '归档话题失败');
+    }
+  }, []);
+
   const handleSend = useCallback(
     async (overrideText?: string) => {
       const content = (overrideText ?? inputText).trim();
@@ -1407,6 +1428,8 @@ export const App: React.FC = () => {
           onSelectAllStream={handleSelectAllStream}
           onSelectTopic={handleSelectTopic}
           onCreateTopic={handleCreateTopic}
+          onRenameTopic={handleRenameTopic}
+          onArchiveTopic={handleArchiveTopic}
           onReassignMessage={handleReassignMessage}
         />
       </div>
@@ -1429,6 +1452,8 @@ export const App: React.FC = () => {
               onSelectAllStream={handleSelectAllStream}
               onSelectTopic={handleSelectTopic}
               onCreateTopic={handleCreateTopic}
+              onRenameTopic={handleRenameTopic}
+              onArchiveTopic={handleArchiveTopic}
               onReassignMessage={handleReassignMessage}
             />
           </div>

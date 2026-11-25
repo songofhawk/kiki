@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import hmac
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .adapters import AdapterRegistry, create_default_registry
 from .config import Settings, get_settings
@@ -495,6 +496,35 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="SessionRun not found")
         return RunActionResponse(run=SessionRunDetail.model_validate(run))
+
+    @app.get("/api/runs/{run_id}/artifacts/{artifact_id}")
+    async def get_run_artifact(
+        run_id: str,
+        artifact_id: str,
+        download: bool = Query(default=False),
+    ) -> FileResponse:
+        artifact = database.get_artifact(run_id, artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+
+        raw_path = Path(str(artifact["file_path"]))
+        candidate = (
+            raw_path.resolve()
+            if raw_path.is_absolute()
+            else (cfg.workspace_root / raw_path).resolve()
+        )
+        allowed_roots = [cfg.artifacts_dir.resolve(), cfg.workspace_root.resolve()]
+        if not any(
+            candidate == root or root in candidate.parents for root in allowed_roots
+        ):
+            raise HTTPException(status_code=403, detail="Artifact path outside workspace")
+        if not candidate.is_file():
+            raise HTTPException(status_code=404, detail="Artifact file missing on disk")
+
+        return FileResponse(
+            path=candidate,
+            filename=candidate.name if download else None,
+        )
 
     # ------------------------------------------------------------------
     # SSE Stream
