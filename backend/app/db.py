@@ -782,6 +782,17 @@ class Database:
                 reply_to = parsed_meta.get(r["id"], {}).get("reply_to")
                 if isinstance(reply_to, str) and reply_to in expanded:
                     expanded.add(r["id"])
+            # Also pair messages linked by the same session_run_id (Heavy-Path turns)
+            linked_run_ids = {
+                parsed_meta[mid]["session_run_id"]
+                for mid in expanded
+                if isinstance(parsed_meta.get(mid, {}).get("session_run_id"), str)
+            }
+            if linked_run_ids:
+                for r in rows:
+                    srid = parsed_meta.get(r["id"], {}).get("session_run_id")
+                    if isinstance(srid, str) and srid in linked_run_ids:
+                        expanded.add(r["id"])
 
             ordered_ids: list[str] = []
             min_rowid: Optional[int] = None

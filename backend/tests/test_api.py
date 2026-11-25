@@ -1259,3 +1259,33 @@ async def test_workspace_tools_block_sensitive_files_and_scrub_shell_env(
     env_out = await executor.run_shell("run-1", "echo $GEMINI_API_KEY:$KIKI_API_TOKEN")
     assert "should-not-leak-to-shell" not in env_out
     assert "token-should-not-leak" not in env_out
+
+
+@pytest.mark.asyncio
+async def test_single_message_reassign_keeps_paired_assistant_reply(tmp_path: Path):
+    app, db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    fake_llm.next_decision = RouteDecision(
+        path="fast",
+        topic_action="create",
+        topic_id=None,
+        new_topic_title="初始话题",
+        confidence=0.45,
+        reasoning="低置信度",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post("/api/chat", json={"content": "帮我看看这个方案"})
+        assert res.status_code == 200
+        user_msg_id = res.json()["user_message"]["id"]
+        assistant_msg_id = res.json()["assistant_message"]["id"]
+        await asyncio.sleep(0.1)
+
+        split_res = await client.patch(
+            f"/api/messages/{user_msg_id}/topic",
+            json={"action": "split", "new_topic_title": "拆分后话题"},
+        )
+        assert split_res.status_code == 200
+        new_tid = split_res.json()["topic"]["id"]
+        assert db.get_message(user_msg_id)["topic_id"] == new_tid
+        assert db.get_message(assistant_msg_id)["topic_id"] == new_tid

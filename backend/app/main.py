@@ -293,20 +293,24 @@ def create_app(
 
         source_topic_id = existing_msg["topic_id"]
         dream_consolidator.notify_activity(topic_created=(req.action == "split"))
-        updated_msg = database.reassign_message_topic(message_id, target_topic["id"])
-        if updated_msg is None:
+        paired_ids, _ = database.expand_paired_topic_messages(source_topic_id, [message_id])
+        ids_to_move = paired_ids or [message_id]
+        updated_msgs = database.reassign_messages_topic(ids_to_move, target_topic["id"])
+        if not updated_msgs:
             raise HTTPException(status_code=404, detail="Message not found")
 
         refreshed_topic = database.get_topic(target_topic["id"]) or target_topic
-        enriched_msg = _enrich_message(updated_msg, bus)
-        bus.publish("message_updated", {"message": enriched_msg})
+        enriched_msgs = [_enrich_message(m, bus) for m in updated_msgs]
+        for em in enriched_msgs:
+            bus.publish("message_updated", {"message": em})
+        primary_msg = next((m for m in enriched_msgs if m["id"] == message_id), enriched_msgs[0])
         if source_topic_id != target_topic["id"]:
             source_topic = database.get_topic(source_topic_id)
             if source_topic:
                 bus.publish("topic_updated", {"topic": source_topic})
         bus.publish("topic_updated", {"topic": refreshed_topic})
         return MessageTopicReassignResponse(
-            message=MessageItem.model_validate(enriched_msg),
+            message=MessageItem.model_validate(primary_msg),
             topic=TopicSummary.model_validate(refreshed_topic),
         )
 

@@ -210,6 +210,7 @@ class TaskManager:
             self._execute_run(
                 run_id=run_id,
                 topic_id=topic_id,
+                trigger_message_id=trigger_message_id,
                 user_content=user_content,
                 agent_type=canonical_type,
                 model_override=model_override,
@@ -289,6 +290,7 @@ class TaskManager:
         self,
         run_id: str,
         topic_id: str,
+        trigger_message_id: str,
         user_content: str,
         agent_type: str = "gemini_agent",
         model_override: Optional[str] = None,
@@ -366,6 +368,7 @@ class TaskManager:
                 role="assistant",
                 content=summary,
                 metadata={
+                    "reply_to": trigger_message_id,
                     "session_run_id": run_id,
                     "source": "heavy_agent",
                     "path": "heavy",
@@ -447,6 +450,7 @@ class TaskManager:
                 role="assistant",
                 content=failure_reply,
                 metadata={
+                    "reply_to": trigger_message_id,
                     "session_run_id": run_id,
                     "source": "heavy_agent_error",
                     "path": "heavy",
