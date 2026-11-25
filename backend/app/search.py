@@ -10,7 +10,7 @@ import re
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -292,13 +292,32 @@ class WebSearchService:
                 except Exception as exc:
                     logger.warning("Jina Reader failed for %s (%s), falling back to direct fetch", target, exc)
 
-            resp = await client.get(
-                target,
-                headers={
-                    "User-Agent": "KikiPersonalAgent/1.0 (+https://localhost)",
-                    "Accept": "text/html,application/xhtml+xml,text/plain,application/json",
-                },
-            )
+            current_url = target
+            max_redirects = 5
+            resp: Optional[httpx.Response] = None
+            for _ in range(max_redirects + 1):
+                resp = await client.get(
+                    current_url,
+                    headers={
+                        "User-Agent": "KikiPersonalAgent/1.0 (+https://localhost)",
+                        "Accept": "text/html,application/xhtml+xml,text/plain,application/json",
+                    },
+                    follow_redirects=False,
+                )
+                if resp.is_redirect and resp.headers.get("location"):
+                    next_url = urljoin(str(resp.url), resp.headers["location"].strip())
+                    hop_allowed, hop_reason = await asyncio.to_thread(_is_public_http_url, next_url)
+                    if not hop_allowed:
+                        raise PermissionError(hop_reason)
+                    current_url = next_url
+                    continue
+                break
+            else:
+                raise RuntimeError("网页重定向次数过多（超过 5 次）。")
+
+            assert resp is not None
+            if resp.is_redirect:
+                raise RuntimeError("网页重定向次数过多（超过 5 次）。")
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "").lower()
             raw_text = resp.text

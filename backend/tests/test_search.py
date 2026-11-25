@@ -199,6 +199,42 @@ async def test_fetch_webpage_blocks_private_addresses_and_extracts_html(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_fetch_webpage_blocks_ssrf_redirect_to_private_address(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "https://93.184.216.34/evil-redirect":
+            return httpx.Response(
+                302,
+                headers={"Location": "http://127.0.0.1:8000/api/health"},
+                request=request,
+            )
+        if url == "https://93.184.216.34/safe-redirect":
+            return httpx.Response(
+                302,
+                headers={"Location": "/final-page"},
+                request=request,
+            )
+        if url == "https://93.184.216.34/final-page":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text="Safe redirected content",
+                request=request,
+            )
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    transport = httpx.MockTransport(handler)
+    cfg = _make_settings(tmp_path)
+    svc = WebSearchService(cfg, client_factory=lambda: httpx.AsyncClient(transport=transport))
+
+    with pytest.raises(PermissionError):
+        await svc.fetch_webpage("https://93.184.216.34/evil-redirect")
+
+    safe_text = await svc.fetch_webpage("https://93.184.216.34/safe-redirect")
+    assert safe_text == "Safe redirected content"
+
+
+@pytest.mark.asyncio
 async def test_tool_executor_and_api_search_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-live-mock")
     monkeypatch.setenv("SERPER_API_KEY", "serper-live-mock")
