@@ -1323,3 +1323,25 @@ def test_reconcile_orphaned_state_on_startup(tmp_path: Path):
     assert fixed_msg is not None
     assert fixed_msg["streaming"] is False
     assert "中断" in fixed_msg["content"]
+
+
+def test_event_bus_lru_eviction_and_raw_log_backpressure():
+    bus = EventBus(max_raw_logs_per_run=5, subscriber_queue_size=2, max_tracked_runs=2)
+    bus.append_raw_log("run-1", "line-1")
+    bus.append_raw_log("run-2", "line-2")
+    bus.append_raw_log("run-3", "line-3")
+
+    # run-1 evicted by LRU cap=2
+    assert bus.get_raw_logs("run-1") == []
+    assert len(bus.get_raw_logs("run-2")) == 1
+    assert len(bus.get_raw_logs("run-3")) == 1
+
+    # Queue full with critical events: raw_log burst must not evict them
+    q: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=2)
+    bus._subscribers.add(q)
+    bus.publish("message_completed", {"id": "m1"})
+    bus.publish("hitl_required", {"run_id": "r1"})
+    bus.append_raw_log("run-3", "noisy-log")
+
+    items = [q.get_nowait()[0], q.get_nowait()[0]]
+    assert items == ["message_completed", "hitl_required"]

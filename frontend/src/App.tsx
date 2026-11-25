@@ -634,12 +634,32 @@ export const App: React.FC = () => {
 
   // Subscribe to global SSE event stream
   useEffect(() => {
+    let wasDisconnected = false;
     const disconnect = connectEventStream({
       onOpen: () => {
         setSseConnected(true);
         setErrorBanner(null);
+        if (wasDisconnected) {
+          wasDisconnected = false;
+          fetchTopics()
+            .then((list) => setTopics(list))
+            .catch(() => { });
+          fetchActiveRuns()
+            .then((runs) => {
+              setRunsById((prev) => {
+                const next = { ...prev };
+                for (const run of runs) {
+                  next[run.id] = mergeRun(next[run.id], run);
+                }
+                return next;
+              });
+            })
+            .catch(() => { });
+          void loadStreamFirstPage(focusTopicIdRef.current);
+        }
       },
       onError: () => {
+        wasDisconnected = true;
         setSseConnected(false);
       },
       onKikiStatus: ({ status }) => {
@@ -825,7 +845,7 @@ export const App: React.FC = () => {
     });
 
     return disconnect;
-  }, [pushToast]);
+  }, [pushToast, loadStreamFirstPage]);
 
   const topicsById = useMemo(() => {
     const map: Record<string, Topic> = {};

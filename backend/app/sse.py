@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Literal, Optional
 
@@ -16,11 +16,17 @@ def _utc_now() -> str:
 class EventBus:
     """Broadcasts SSE events to concurrent subscribers and caches transient run state."""
 
-    def __init__(self, max_raw_logs_per_run: int = 500, subscriber_queue_size: int = 256) -> None:
+    def __init__(
+        self,
+        max_raw_logs_per_run: int = 500,
+        subscriber_queue_size: int = 256,
+        max_tracked_runs: int = 100,
+    ) -> None:
         self._subscribers: set[asyncio.Queue[tuple[str, dict[str, Any]]]] = set()
         self._subscriber_queue_size = subscriber_queue_size
         self._max_raw_logs = max_raw_logs_per_run
-        self._raw_logs: dict[str, deque[dict[str, Any]]] = {}
+        self._max_tracked_runs = max(1, max_tracked_runs)
+        self._raw_logs: OrderedDict[str, deque[dict[str, Any]]] = OrderedDict()
         self._hitl_requests: dict[str, dict[str, Any]] = {}
         self._current_kiki_status: dict[str, Any] = {"status": "idle"}
 
@@ -35,6 +41,9 @@ class EventBus:
         dead: list[asyncio.Queue[tuple[str, dict[str, Any]]]] = []
         for queue in list(self._subscribers):
             if queue.full():
+                # Never let high-volume raw_log bursts evict critical state events
+                if event_type == "raw_log":
+                    continue
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -72,6 +81,10 @@ class EventBus:
         if buf is None:
             buf = deque(maxlen=self._max_raw_logs)
             self._raw_logs[run_id] = buf
+            while len(self._raw_logs) > self._max_tracked_runs:
+                self._raw_logs.popitem(last=False)
+        else:
+            self._raw_logs.move_to_end(run_id)
         buf.append(entry)
         self.publish("raw_log", entry)
         return entry
