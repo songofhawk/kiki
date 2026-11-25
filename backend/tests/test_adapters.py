@@ -428,3 +428,34 @@ async def test_gemini_agent_probe_model_override_and_max_steps_synthesis(tmp_pat
     assert result.model_used == "gemini-3.8-flash"
     assert result.metadata["max_steps_reached"] is True
     assert "已完成根目录扫描" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_cli_adapter_hitl_rejection_cancels_instead_of_completing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fake_cli = tmp_path / "fake_qoder.py"
+    fake_cli.write_text(
+        f"""#!{sys.executable}
+import json
+print(json.dumps({{
+    "type": "result",
+    "session_id": "q_sess_1",
+    "permission_denials": [{{"tool_name": "Bash"}}],
+    "result": "等待授权执行 Bash"
+}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("KIKI_QODER_BIN", str(fake_cli))
+
+    adapter = QoderAdapter()
+    ctx = _make_context(tmp_path, "清理临时文件")
+
+    async def reject_hitl(_prompt: str, _opts: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"decision": "reject", "approved": False}
+
+    ctx._hitl_handler = reject_hitl
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.execute(ctx)

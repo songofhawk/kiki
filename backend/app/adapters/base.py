@@ -649,9 +649,12 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
             approved = bool(decision.get("approved", False))
             ctx.finish_step(
                 hitl_step["id"],
-                status="success",
+                status="success" if approved else "failed",
                 detail=f"主人已拍板：{'同意' if approved else '拒绝'} ({decision.get('decision', '')})",
             )
+            if not approved:
+                ctx.finish_step(init_step["id"], status="failed")
+                raise asyncio.CancelledError("用户拒绝了人工确认操作，任务已终止")
             if approved and state.session_id:
                 resume_argv = self.build_resume_command(
                     binary, ctx, profile, state.session_id, decision
