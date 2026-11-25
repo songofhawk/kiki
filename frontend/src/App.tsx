@@ -669,7 +669,12 @@ export const App: React.FC = () => {
         setTopics((prev) => upsertTopic(prev, topic));
       },
       onTopicUpdated: ({ topic }) => {
-        setTopics((prev) => upsertTopic(prev, topic));
+        if (focusTopicIdRef.current === topic.id && topic.unread) {
+          setTopics((prev) => upsertTopic(prev, { ...topic, unread: false }));
+          updateTopic(topic.id, { unread: false }).catch(() => { });
+        } else {
+          setTopics((prev) => upsertTopic(prev, topic));
+        }
       },
       onMessageCreated: ({ message }) => {
         if (message.role === 'user') {
@@ -769,7 +774,15 @@ export const App: React.FC = () => {
           run.status === 'cancelled'
         ) {
           fetchTopics()
-            .then((list) => setTopics(list))
+            .then((list) =>
+              setTopics(
+                list.map((t) =>
+                  t.id === focusTopicIdRef.current && t.unread
+                    ? { ...t, unread: false }
+                    : t
+                )
+              )
+            )
             .catch(() => { });
         }
       },
@@ -833,14 +846,21 @@ export const App: React.FC = () => {
         });
       },
       onToastNotification: (payload) => {
-        pushToast(payload);
-        if (focusTopicIdRef.current !== payload.topic_id) {
+        if (focusTopicIdRef.current === payload.topic_id) {
           setTopics((prev) =>
             prev.map((t) =>
-              t.id === payload.topic_id ? { ...t, unread: true } : t
+              t.id === payload.topic_id ? { ...t, unread: false } : t
             )
           );
+          updateTopic(payload.topic_id, { unread: false }).catch(() => { });
+          return;
         }
+        pushToast(payload);
+        setTopics((prev) =>
+          prev.map((t) =>
+            t.id === payload.topic_id ? { ...t, unread: true } : t
+          )
+        );
       },
     });
 
