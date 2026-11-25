@@ -105,7 +105,7 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
             vendor=self.vendor,
             description=self.description,
             category="builtin",
-            available=True,
+            available=bool(self._api_key_configured),
             binary_path="in-process",
             install_hint=self.install_hint,
             default_model=default_m,
@@ -143,16 +143,20 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
             input_data = f"当前话题：{ctx.topic_title}\n用户任务：{ctx.user_content}"
         previous_interaction_id: Optional[str] = None
         final_text: str = ""
+        completed_cleanly = False
 
         for turn in range(1, ctx.max_steps + 1):
             ctx.emit_event_log({"event": "llm_turn", "turn": turn})
-            interaction = await ctx.llm.run_agent_turn(
-                input_data=input_data,
-                tools=AGENT_TOOL_DECLARATIONS,
-                system_instruction=AGENT_SYSTEM_PROMPT,
-                previous_interaction_id=previous_interaction_id,
-                thinking_level=profile.thinking_level,
-            )
+            turn_kwargs: dict[str, Any] = {
+                "input_data": input_data,
+                "tools": AGENT_TOOL_DECLARATIONS,
+                "system_instruction": AGENT_SYSTEM_PROMPT,
+                "previous_interaction_id": previous_interaction_id,
+                "thinking_level": profile.thinking_level,
+            }
+            if ctx.model_override:
+                turn_kwargs["model"] = profile.model
+            interaction = await ctx.llm.run_agent_turn(**turn_kwargs)
             previous_interaction_id = getattr(interaction, "id", None)
             ctx.session_id = previous_interaction_id
 
@@ -161,6 +165,7 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
 
             if not function_calls:
                 final_text = getattr(interaction, "output_text", None) or ""
+                completed_cleanly = True
                 break
 
             function_results: list[dict[str, Any]] = []
@@ -239,11 +244,38 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
 
             input_data = function_results
 
+        if not completed_cleanly:
+            ctx.emit_event_log({"event": "max_steps_reached", "max_steps": ctx.max_steps})
+            try:
+                synth_kwargs: dict[str, Any] = {
+                    "input_data": input_data,
+                    "tools": [],
+                    "system_instruction": (
+                        f"{AGENT_SYSTEM_PROMPT}\n"
+                        "注意：已达到最大工具调用步数上限，请直接基于已有信息用 200 字以内总结当前进展与剩余事项，不要再调用工具。"
+                    ),
+                    "previous_interaction_id": previous_interaction_id,
+                    "thinking_level": profile.thinking_level,
+                }
+                if ctx.model_override:
+                    synth_kwargs["model"] = profile.model
+                synth = await ctx.llm.run_agent_turn(**synth_kwargs)
+                previous_interaction_id = getattr(synth, "id", None) or previous_interaction_id
+                final_text = getattr(synth, "output_text", None) or ""
+            except Exception:
+                final_text = ""
+            if not final_text:
+                final_text = f"已达到最大执行步数上限（{ctx.max_steps} 步），任务尚未完全收敛，请展开步骤日志查看进展。"
+
+        actual_model = getattr(ctx.llm, "last_used_model", None) or profile.model
         return AdapterResult(
             summary=final_text or "后台任务已完成。",
             raw_output=final_text,
             session_id=previous_interaction_id,
-            model_used=profile.model,
+            model_used=actual_model,
             thinking_level_used=profile.thinking_level,
-            metadata={"adapter": self.agent_type},
+            metadata={
+                "adapter": self.agent_type,
+                "max_steps_reached": not completed_cleanly,
+            },
         )

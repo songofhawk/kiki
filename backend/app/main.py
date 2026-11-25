@@ -61,7 +61,7 @@ def create_app(
     llm_client = llm or KikiLLMClient(cfg)
     registry = adapter_registry or create_default_registry(
         gemini_model=cfg.gemini_model,
-        gemini_api_key_configured=cfg.api_key_configured,
+        gemini_api_key_configured=cfg.any_llm_configured,
     )
     search_service = WebSearchService(cfg)
     tool_executor = WorkspaceToolExecutor(

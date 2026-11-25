@@ -145,7 +145,7 @@ class TaskManager:
         self.settings = settings
         self.adapter_registry = adapter_registry or create_default_registry(
             gemini_model=settings.gemini_model if settings else None,
-            gemini_api_key_configured=settings.api_key_configured if settings else True,
+            gemini_api_key_configured=settings.any_llm_configured if settings else True,
         )
         self.max_steps = max_steps
         self._status_provider = status_provider

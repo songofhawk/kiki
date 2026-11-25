@@ -386,3 +386,45 @@ async def test_gemini_agent_includes_topic_history_when_present(tmp_path: Path):
     assert "再查一下深圳现在的天气" in sent_input
     assert "[后台任务执行失败(gemini_agent): 503 high demand]" in sent_input
     assert "用户当前任务：再试一次" in sent_input
+
+
+@pytest.mark.asyncio
+async def test_gemini_agent_probe_model_override_and_max_steps_synthesis(tmp_path: Path):
+    assert GeminiAgentAdapter(api_key_configured=False).probe().available is False
+    assert GeminiAgentAdapter(api_key_configured=True).probe().available is True
+
+    adapter = GeminiAgentAdapter()
+    ctx = _make_context(tmp_path, "循环查目录")
+    ctx.max_steps = 1
+    ctx.model_override = "gemini-3.8-flash"
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_turn(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if kwargs.get("tools"):
+            return SimpleNamespace(
+                id="int-loop",
+                steps=[
+                    SimpleNamespace(
+                        type="function_call",
+                        id="fc-1",
+                        name="list_files",
+                        arguments={"path": "."},
+                    )
+                ],
+                output_text="",
+            )
+        return SimpleNamespace(id="int-synth", steps=[], output_text="已达步数上限，当前已完成根目录扫描。")
+
+    ctx.llm = MagicMock()
+    ctx.llm.last_used_model = "gemini-3.8-flash"
+    ctx.llm.run_agent_turn = AsyncMock(side_effect=fake_turn)
+
+    result = await adapter.execute(ctx)
+    assert len(calls) == 2
+    assert calls[0]["model"] == "gemini-3.8-flash"
+    assert calls[1]["tools"] == []
+    assert result.model_used == "gemini-3.8-flash"
+    assert result.metadata["max_steps_reached"] is True
+    assert "已完成根目录扫描" in result.summary

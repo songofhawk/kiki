@@ -1367,6 +1367,7 @@ class KikiLLMClient:
         system_instruction: str,
         previous_interaction_id: Optional[str] = None,
         thinking_level: str = "medium",
+        model: Optional[str] = None,
     ) -> Any:
         if previous_interaction_id and previous_interaction_id.startswith("ds_int_"):
             return await self._run_deepseek_agent_turn(
@@ -1390,6 +1391,9 @@ class KikiLLMClient:
         )
         last_exc: Optional[Exception] = None
         candidates = self._candidate_models(pinned_model=pinned_model)
+        requested_model = (model or "").strip()
+        if requested_model and not pinned_model and self.settings.api_key_configured:
+            candidates = [requested_model, *[m for m in candidates if m != requested_model]]
         if candidates:
             client = self._get_client()
             for model_name in candidates:
