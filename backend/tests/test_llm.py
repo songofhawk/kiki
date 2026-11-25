@@ -650,3 +650,77 @@ async def test_jev_primary_decision_routing_and_zhipu_fallback(
     assert d2.reasoning == "from-zhipu-fallback"
     assert llm.last_used_provider == "zhipu"
     assert len(zhipu_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_zhipu_only_status_fast_reply_and_agent_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        gemini_api_key="",
+        deepseek_api_key="",
+        zhipu_api_key="zhipu-only-key",
+        zhipu_model="glm-4-flash",
+    )
+    llm = KikiLLMClient(settings)
+
+    st = llm.status()
+    assert st["active_provider"] == "zhipu"
+    assert st["active_model"] == "glm-4-flash"
+
+    async def fake_zp_stream(payload: dict[str, Any], *, timeout: float = 90.0):
+        assert payload["model"] == "glm-4-flash"
+        yield "智谱"
+        yield "轻聊回复"
+
+    monkeypatch.setattr(llm, "_zhipu_stream_chat", fake_zp_stream)
+    chunks = [
+        c async for c in llm.stream_fast_reply("你好", history=[], topic_title="日常闲聊")
+    ]
+    assert "".join(chunks) == "智谱轻聊回复"
+    assert llm.last_used_provider == "zhipu"
+
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "zp_call_1",
+                                "type": "function",
+                                "function": {"name": "list_files", "arguments": '{"path": "."}'},
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {"choices": [{"message": {"content": "智谱重型任务完成"}}]},
+    ]
+
+    async def fake_openai_post(
+        *,
+        base_url: str,
+        api_key: str,
+        payload: dict[str, Any],
+        timeout: float = 90.0,
+    ) -> dict[str, Any]:
+        assert api_key == "zhipu-only-key"
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm, "_openai_post_chat", fake_openai_post)
+    t1 = await llm.run_agent_turn(input_data="查目录", tools=[], system_instruction="sys")
+    assert t1.id.startswith("zp_int_")
+    assert t1.steps[0].name == "list_files"
+
+    t2 = await llm.run_agent_turn(
+        input_data=[{"type": "function_result", "call_id": "zp_call_1", "result": "README.md"}],
+        tools=[],
+        system_instruction="sys",
+        previous_interaction_id=t1.id,
+    )
+    assert t2.output_text == "智谱重型任务完成"

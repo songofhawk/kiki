@@ -181,7 +181,7 @@ def create_app(
             status="ok",
             model=cfg.gemini_model,
             database_path=str(cfg.database_path),
-            api_key_configured=cfg.api_key_configured,
+            api_key_configured=cfg.any_llm_configured,
         )
 
     @app.get("/api/adapters", response_model=list[AdapterInfoResponse])

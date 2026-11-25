@@ -184,9 +184,13 @@ class KikiLLMClient:
         if self._client is None:
             if not self.settings.api_key_configured:
                 raise RuntimeError("GEMINI_API_KEY is not configured in .env")
-            # Fail fast on 503/429 when multiple fallback models (or DeepSeek fallback)
+            # Fail fast on 503/429 when multiple fallback models (or OpenAI-compatible fallback)
             # are configured, avoiding google-genai's default 5-attempt (~30s+) backoff.
-            has_failover = len(self._all_models()) > 1 or self.settings.deepseek_configured
+            has_failover = (
+                len(self._all_models()) > 1
+                or self.settings.deepseek_configured
+                or self.settings.zhipu_configured
+            )
             attempts = 1 if has_failover else 2
             self._client = genai.Client(
                 api_key=self.settings.gemini_api_key,
@@ -210,10 +214,12 @@ class KikiLLMClient:
         ready = [m for m in all_models if now >= self._model_cooldowns.get(m, 0.0)]
         if ready:
             return ready
-        # If DeepSeek paid fallback is configured and all Gemini Free-Tier models are
+        # If DeepSeek or Zhipu fallback is configured and all Gemini Free-Tier models are
         # cooling down, skip Gemini immediately (0ms overhead) until a cooldown expires
         # and automatically re-probes Gemini.
-        if self.settings.deepseek_configured:
+        if self.settings.deepseek_configured or (
+            self.settings.zhipu_configured and now >= self._zhipu_cooldown_until
+        ):
             return []
         # No DeepSeek fallback: try Gemini models in order of earliest cooldown expiry.
         return sorted(all_models, key=lambda m: self._model_cooldowns.get(m, 0.0))
@@ -303,12 +309,18 @@ class KikiLLMClient:
         if first_ready_gemini is not None:
             active_provider = "gemini"
             active_model = first_ready_gemini
+        elif self.settings.zhipu_configured and now >= self._zhipu_cooldown_until:
+            active_provider = "zhipu"
+            active_model = self.zhipu_model
         elif self.settings.deepseek_configured:
             active_provider = "deepseek"
             active_model = self.deepseek_model
         elif self.settings.api_key_configured:
             active_provider = "gemini"
             active_model = self.model
+        elif self.settings.zhipu_configured:
+            active_provider = "zhipu"
+            active_model = self.zhipu_model
         else:
             active_provider = "none"
             active_model = ""
@@ -422,18 +434,24 @@ class KikiLLMClient:
             timeout=timeout,
         )
 
-    async def _deepseek_stream_chat(
+    async def _openai_stream_chat(
         self,
-        payload: dict[str, Any],
         *,
+        base_url: str,
+        api_key: str,
+        payload: dict[str, Any],
         timeout: float = 90.0,
     ) -> AsyncIterator[str]:
-        url = f"{self.deepseek_base_url}/chat/completions"
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        }
         async with httpx.AsyncClient(timeout=timeout) as http_client:
             async with http_client.stream(
                 "POST",
                 url,
-                headers=self._deepseek_headers(),
+                headers=headers,
                 json=payload,
             ) as resp:
                 resp.raise_for_status()
@@ -455,6 +473,34 @@ class KikiLLMClient:
                     text = delta.get("content")
                     if text:
                         yield str(text)
+
+    async def _deepseek_stream_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        async for chunk in self._openai_stream_chat(
+            base_url=self.deepseek_base_url,
+            api_key=self.settings.deepseek_api_key,
+            payload=payload,
+            timeout=timeout,
+        ):
+            yield chunk
+
+    async def _zhipu_stream_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 90.0,
+    ) -> AsyncIterator[str]:
+        async for chunk in self._openai_stream_chat(
+            base_url=self.zhipu_base_url,
+            api_key=self.settings.zhipu_api_key,
+            payload=payload,
+            timeout=timeout,
+        ):
+            yield chunk
 
     @staticmethod
     def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -555,13 +601,19 @@ class KikiLLMClient:
             timeout=timeout,
         )
 
-    async def _run_deepseek_agent_turn(
+    async def _run_openai_agent_turn(
         self,
         *,
+        provider_name: str,
+        session_prefix: str,
+        base_url: str,
+        api_key: str,
+        model_name: str,
         input_data: Any,
         tools: list[dict[str, Any]],
         system_instruction: str,
         previous_interaction_id: Optional[str] = None,
+        post_fn: Optional[Any] = None,
     ) -> Any:
         if previous_interaction_id and previous_interaction_id in self._deepseek_sessions:
             messages = list(self._deepseek_sessions[previous_interaction_id])
@@ -584,7 +636,7 @@ class KikiLLMClient:
             messages.append({"role": "user", "content": str(input_data)})
 
         payload: dict[str, Any] = {
-            "model": self.deepseek_model,
+            "model": model_name,
             "messages": messages,
             "max_tokens": 8192,
         }
@@ -592,7 +644,15 @@ class KikiLLMClient:
             payload["tools"] = self._convert_tools_to_openai(tools)
             payload["tool_choice"] = "auto"
 
-        data = await self._deepseek_post_chat(payload, timeout=90.0)
+        if post_fn is not None:
+            data = await post_fn(payload, timeout=90.0)
+        else:
+            data = await self._openai_post_chat(
+                base_url=base_url,
+                api_key=api_key,
+                payload=payload,
+                timeout=90.0,
+            )
         choices = data.get("choices") or []
         assistant_msg = (choices[0].get("message") or {}) if choices else {}
         output_text = str(assistant_msg.get("content") or "")
@@ -614,7 +674,7 @@ class KikiLLMClient:
             steps.append(
                 SimpleNamespace(
                     type="function_call",
-                    id=str(tc.get("id") or f"ds_call_{idx + 1}"),
+                    id=str(tc.get("id") or f"{session_prefix}call_{idx + 1}"),
                     name=str(fn.get("name") or "unknown"),
                     arguments=parsed_args,
                 )
@@ -625,15 +685,56 @@ class KikiLLMClient:
             stored_assistant["tool_calls"] = raw_tool_calls
         messages.append(stored_assistant)
 
-        interaction_id = f"ds_int_{uuid.uuid4().hex[:16]}"
+        interaction_id = f"{session_prefix}int_{uuid.uuid4().hex[:16]}"
         self._remember_deepseek_session(interaction_id, messages)
-        self.last_used_provider = "deepseek"
-        self.last_used_model = self.deepseek_model
+        self.last_used_provider = provider_name
+        self.last_used_model = model_name
         return SimpleNamespace(
             id=interaction_id,
             status="completed",
             steps=steps,
             output_text=output_text,
+        )
+
+    async def _run_deepseek_agent_turn(
+        self,
+        *,
+        input_data: Any,
+        tools: list[dict[str, Any]],
+        system_instruction: str,
+        previous_interaction_id: Optional[str] = None,
+    ) -> Any:
+        return await self._run_openai_agent_turn(
+            provider_name="deepseek",
+            session_prefix="ds_",
+            base_url=self.deepseek_base_url,
+            api_key=self.settings.deepseek_api_key,
+            model_name=self.deepseek_model,
+            input_data=input_data,
+            tools=tools,
+            system_instruction=system_instruction,
+            previous_interaction_id=previous_interaction_id,
+            post_fn=self._deepseek_post_chat,
+        )
+
+    async def _run_zhipu_agent_turn(
+        self,
+        *,
+        input_data: Any,
+        tools: list[dict[str, Any]],
+        system_instruction: str,
+        previous_interaction_id: Optional[str] = None,
+    ) -> Any:
+        return await self._run_openai_agent_turn(
+            provider_name="zhipu",
+            session_prefix="zp_",
+            base_url=self.zhipu_base_url,
+            api_key=self.settings.zhipu_api_key,
+            model_name=self.zhipu_model,
+            input_data=input_data,
+            tools=tools,
+            system_instruction=system_instruction,
+            previous_interaction_id=previous_interaction_id,
         )
 
     async def _run_structured_json(
@@ -1180,6 +1281,40 @@ class KikiLLMClient:
                 if yielded_any:
                     return
 
+        if self.settings.zhipu_configured and time.monotonic() >= self._zhipu_cooldown_until:
+            yielded_any = False
+            try:
+                logger.info(
+                    "Fast-Path streaming falling back to Zhipu (%s)",
+                    self.zhipu_model,
+                )
+                payload = {
+                    "model": self.zhipu_model,
+                    "messages": [
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": prompt_input},
+                    ],
+                    "stream": True,
+                    "max_tokens": 4096,
+                }
+                async for text_chunk in self._zhipu_stream_chat(payload):
+                    yielded_any = True
+                    yield text_chunk
+                if yielded_any:
+                    self.last_used_provider = "zhipu"
+                    self.last_used_model = self.zhipu_model
+                    return
+            except Exception as exc:
+                last_exc = exc
+                self._zhipu_cooldown_until = time.monotonic() + min(self._cooldown_seconds, 60.0)
+                logger.warning(
+                    "Fast-Path streaming (zhipu:%s) fallback failed: %s",
+                    self.zhipu_model,
+                    exc,
+                )
+                if yielded_any:
+                    return
+
         if self.settings.deepseek_configured:
             yielded_any = False
             try:
@@ -1240,6 +1375,13 @@ class KikiLLMClient:
                 system_instruction=system_instruction,
                 previous_interaction_id=previous_interaction_id,
             )
+        if previous_interaction_id and previous_interaction_id.startswith("zp_int_"):
+            return await self._run_zhipu_agent_turn(
+                input_data=input_data,
+                tools=tools,
+                system_instruction=system_instruction,
+                previous_interaction_id=previous_interaction_id,
+            )
 
         pinned_model = (
             self._interaction_models.get(previous_interaction_id)
@@ -1274,6 +1416,27 @@ class KikiLLMClient:
                     if previous_interaction_id:
                         # Cannot switch model mid-chain with previous_interaction_id
                         raise
+
+        if (
+            not previous_interaction_id
+            and self.settings.zhipu_configured
+            and time.monotonic() >= self._zhipu_cooldown_until
+        ):
+            try:
+                logger.info(
+                    "Agent turn falling back to Zhipu (%s)",
+                    self.zhipu_model,
+                )
+                return await self._run_zhipu_agent_turn(
+                    input_data=input_data,
+                    tools=tools,
+                    system_instruction=system_instruction,
+                    previous_interaction_id=None,
+                )
+            except Exception as exc:
+                last_exc = exc
+                self._zhipu_cooldown_until = time.monotonic() + min(self._cooldown_seconds, 60.0)
+                logger.warning("Agent turn (zhipu:%s) fallback failed: %s", self.zhipu_model, exc)
 
         if not previous_interaction_id and self.settings.deepseek_configured:
             logger.info(

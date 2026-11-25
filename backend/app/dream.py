@@ -97,8 +97,14 @@ class DreamConsolidator:
         if not hasattr(self.llm, "consolidate_dream"):
             return False
         settings = getattr(self.llm, "settings", None)
-        if settings is not None and not getattr(settings, "api_key_configured", True):
-            return False
+        if settings is not None:
+            configured = getattr(
+                settings,
+                "any_llm_configured",
+                getattr(settings, "api_key_configured", True),
+            )
+            if not configured:
+                return False
         return True
 
     async def run_once(
