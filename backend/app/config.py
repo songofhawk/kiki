@@ -29,6 +29,10 @@ DEFAULT_ZHIPU_MODEL = "glm-4-flash"
 DEFAULT_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_JEV_MODEL = "jev-latest"
 DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1"
+DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
 
 
 def _parse_model_list(raw: str) -> tuple[str, ...]:
@@ -70,6 +74,8 @@ class Settings:
     jina_api_key: str = ""
     serpapi_api_key: str = ""
     search_provider_order: str = "tavily,serper,exa,jina,brave,bocha,serpapi"
+    cors_origins: tuple[str, ...] = DEFAULT_CORS_ORIGINS
+    api_token: str = ""
 
     @property
     def api_key_configured(self) -> bool:
@@ -154,6 +160,14 @@ def load_settings() -> Settings:
     except ValueError:
         cooldown_seconds = 120.0
 
+    raw_cors = os.getenv("KIKI_CORS_ORIGINS", "").strip()
+    if raw_cors:
+        cors_origins = tuple(
+            origin for origin in _parse_model_list(raw_cors) if origin != "*"
+        ) or DEFAULT_CORS_ORIGINS
+    else:
+        cors_origins = DEFAULT_CORS_ORIGINS
+
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -184,6 +198,8 @@ def load_settings() -> Settings:
             "KIKI_SEARCH_PROVIDER_ORDER",
             "tavily,serper,exa,jina,brave,bocha,serpapi",
         ),
+        cors_origins=cors_origins,
+        api_token=os.getenv("KIKI_API_TOKEN", "").strip(),
     )
 
 

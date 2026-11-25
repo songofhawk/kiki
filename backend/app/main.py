@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hmac
 from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .adapters import AdapterRegistry, create_default_registry
 from .config import Settings, get_settings
@@ -137,13 +138,39 @@ def create_app(
     app.state.fast_path = fast_path
     app.state.dream_consolidator = dream_consolidator
 
+    allowed_origins = [o for o in cfg.cors_origins if o and o != "*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    configured_api_token = cfg.api_token.strip()
+    if configured_api_token:
+        @app.middleware("http")
+        async def verify_api_token(request: Request, call_next: Any) -> Any:
+            if (
+                request.method == "OPTIONS"
+                or not request.url.path.startswith("/api/")
+                or request.url.path == "/api/health"
+            ):
+                return await call_next(request)
+
+            auth_header = request.headers.get("authorization", "")
+            provided = ""
+            if auth_header.lower().startswith("bearer "):
+                provided = auth_header[7:].strip()
+            elif request.url.path == "/api/events":
+                provided = request.query_params.get("token", "").strip()
+
+            if not provided or not hmac.compare_digest(provided, configured_api_token):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: invalid or missing API token"},
+                )
+            return await call_next(request)
 
     # ------------------------------------------------------------------
     # Health & Heavy-Path Adapters

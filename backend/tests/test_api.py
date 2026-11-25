@@ -1142,3 +1142,50 @@ async def test_parallel_tasks_and_chat_while_running(tmp_path: Path):
             await asyncio.sleep(0.02)
         assert r_a["status"] == "completed"
         assert bus.current_kiki_status["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_cors_restricts_origins_and_optional_api_token(tmp_path: Path):
+    db_path = tmp_path / "kiki_sec.db"
+    settings = Settings(
+        gemini_api_key="test-key",
+        gemini_model="gemini-3.5-flash-lite",
+        workspace_root=tmp_path,
+        database_path=db_path,
+        artifacts_dir=tmp_path / "artifacts",
+        api_token="secret-local-token",
+    )
+    db = Database(db_path)
+    db.init_db()
+    app = create_app(settings=settings, db=db, llm=FakeLLMClient(), event_bus=EventBus())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # Allowed localhost origin receives CORS header
+        res_ok = await client.get(
+            "/api/health", headers={"Origin": "http://localhost:5173"}
+        )
+        assert res_ok.status_code == 200
+        assert res_ok.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+        # Untrusted external origin is NOT reflected
+        res_evil = await client.get(
+            "/api/health", headers={"Origin": "https://evil.example"}
+        )
+        assert res_evil.status_code == 200
+        assert res_evil.headers.get("access-control-allow-origin") is None
+
+        # Protected endpoint requires Bearer token when api_token is configured
+        res_unauth = await client.get("/api/topics")
+        assert res_unauth.status_code == 401
+
+        res_bad = await client.get(
+            "/api/topics", headers={"Authorization": "Bearer wrong-token"}
+        )
+        assert res_bad.status_code == 401
+
+        res_auth = await client.get(
+            "/api/topics", headers={"Authorization": "Bearer secret-local-token"}
+        )
+        assert res_auth.status_code == 200
