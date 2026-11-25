@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 import pytest
 
-from app.config import Settings
+from app.config import REPO_ROOT, Settings
 from app.db import Database
 from app.main import create_app
 from app.schemas import (
@@ -147,7 +147,7 @@ def _build_test_app(tmp_path: Path, *, llm: Optional[Any] = None):
     settings = Settings(
         gemini_api_key="test-key",
         gemini_model="gemini-3.5-flash-lite",
-        workspace_root=Path("/Users/harry/gitrepo/kiki"),
+        workspace_root=REPO_ROOT,
         database_path=db_path,
         artifacts_dir=artifacts_dir,
     )

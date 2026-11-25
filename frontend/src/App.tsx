@@ -374,7 +374,6 @@ export const App: React.FC = () => {
   const pendingOptimisticRef = useRef<
     Array<{ tempId: string; content: string; focusTopicId: string | null }>
   >([]);
-  const resolvedOptimisticMapRef = useRef<Map<string, string>>(new Map());
   const loadingInitialKeysRef = useRef<Set<string>>(new Set());
   const loadingOlderKeysRef = useRef<Set<string>>(new Set());
 
@@ -696,7 +695,6 @@ export const App: React.FC = () => {
           }
           if (matchIdx >= 0) {
             const [matched] = pendingOptimisticRef.current.splice(matchIdx, 1);
-            resolvedOptimisticMapRef.current.set(matched.tempId, message.id);
             setStreamsByKey((prev) =>
               applyMessageCreatedToStreams(prev, message, matched.tempId)
             );
@@ -1157,7 +1155,6 @@ export const App: React.FC = () => {
           pendingOptimisticRef.current = pendingOptimisticRef.current.filter(
             (item) => item.tempId !== tempId
           );
-          resolvedOptimisticMapRef.current.delete(tempId);
           const enrichedUser: Message = {
             ...res.user_message,
             topic: res.topic ?? res.user_message.topic,
@@ -1193,7 +1190,6 @@ export const App: React.FC = () => {
         pendingOptimisticRef.current = pendingOptimisticRef.current.filter(
           (item) => item.tempId !== tempId
         );
-        resolvedOptimisticMapRef.current.delete(tempId);
         setStreamsByKey((prev) => {
           const next: Record<string, StreamPageState> = {};
           for (const [key, stream] of Object.entries(prev)) {
