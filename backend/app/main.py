@@ -120,6 +120,7 @@ def create_app(
         await dream_consolidator.shutdown()
         await fast_path.shutdown()
         await task_manager.shutdown()
+        database.close()
 
     app = FastAPI(
         title="Kiki V1 Personal Agent API",

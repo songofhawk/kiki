@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_session_runs_topic_id ON session_runs(topic_id);
+CREATE INDEX IF NOT EXISTS idx_session_runs_topic_status ON session_runs(topic_id, status);
 CREATE INDEX IF NOT EXISTS idx_session_runs_trigger_msg ON session_runs(trigger_message_id);
 CREATE INDEX IF NOT EXISTS idx_step_logs_run_id ON step_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
@@ -110,16 +111,41 @@ class Database:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
 
     def init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA_SQL)
             # Ensure unread column exists on pre-existing DBs
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(topics)").fetchall()}
             if "unread" not in cols:
                 conn.execute("ALTER TABLE topics ADD COLUMN unread INTEGER DEFAULT 0")
             conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            if self._conn is None:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(
+                    str(self.db_path), timeout=30.0, check_same_thread=False
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                self._conn = conn
+            yield self._conn
 
     def reconcile_orphaned_state(self) -> dict[str, int]:
         """Converge stale in-flight runs, step logs, and streaming placeholders left by a restart."""
@@ -167,63 +193,90 @@ class Database:
                 "messages": fixed_messages,
             }
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA foreign_keys = ON")
-            try:
-                yield conn
-            finally:
-                conn.close()
-
     # ------------------------------------------------------------------
     # Topics
     # ------------------------------------------------------------------
-    def _hydrate_topic_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
-        topic_id = row["id"]
-        msg_stats = conn.execute(
-            """
-            SELECT COUNT(*) AS cnt, MAX(created_at) AS last_at
-            FROM messages
-            WHERE topic_id = ?
-            """,
-            (topic_id,),
-        ).fetchone()
-        run_stats = conn.execute(
-            """
-            SELECT COUNT(*) AS active_cnt
-            FROM session_runs
-            WHERE topic_id = ? AND status IN ('queued', 'running', 'waiting_input')
-            """,
-            (topic_id,),
-        ).fetchone()
+    @staticmethod
+    def _topic_row_from_joined(row: sqlite3.Row) -> dict[str, Any]:
         return {
-            "id": topic_id,
+            "id": row["id"],
             "title": row["title"],
             "summary": row["summary"],
             "status": row["status"],
             "unread": bool(row["unread"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-            "message_count": int(msg_stats["cnt"] or 0),
-            "last_message_at": msg_stats["last_at"],
-            "active_run_count": int(run_stats["active_cnt"] or 0),
+            "message_count": int(row["message_count"] or 0),
+            "last_message_at": row["last_message_at"],
+            "active_run_count": int(row["active_run_count"] or 0),
         }
 
+    def _hydrate_topics_by_ids(
+        self,
+        conn: sqlite3.Connection,
+        topic_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(tid for tid in topic_ids if tid))
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = conn.execute(
+            f"""
+            SELECT
+                t.*,
+                COALESCE(m.cnt, 0) AS message_count,
+                m.last_at AS last_message_at,
+                COALESCE(r.active_cnt, 0) AS active_run_count
+            FROM topics t
+            LEFT JOIN (
+                SELECT topic_id, COUNT(*) AS cnt, MAX(created_at) AS last_at
+                FROM messages
+                WHERE topic_id IN ({placeholders})
+                GROUP BY topic_id
+            ) m ON m.topic_id = t.id
+            LEFT JOIN (
+                SELECT topic_id, COUNT(*) AS active_cnt
+                FROM session_runs
+                WHERE topic_id IN ({placeholders})
+                  AND status IN ('queued', 'running', 'waiting_input')
+                GROUP BY topic_id
+            ) r ON r.topic_id = t.id
+            WHERE t.id IN ({placeholders})
+            """,
+            [*unique_ids, *unique_ids, *unique_ids],
+        ).fetchall()
+        return {row["id"]: self._topic_row_from_joined(row) for row in rows}
+
+    def _hydrate_topic_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        return self._hydrate_topics_by_ids(conn, [row["id"]])[row["id"]]
+
     def list_topics(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        where_clause = "t.status != 'deleted'" if include_archived else "t.status = 'active'"
         with self._connect() as conn:
-            if include_archived:
-                rows = conn.execute(
-                    "SELECT * FROM topics WHERE status != 'deleted' ORDER BY updated_at DESC"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM topics WHERE status = 'active' ORDER BY updated_at DESC"
-                ).fetchall()
-            return [self._hydrate_topic_row(conn, r) for r in rows]
+            rows = conn.execute(
+                f"""
+                SELECT
+                    t.*,
+                    COALESCE(m.cnt, 0) AS message_count,
+                    m.last_at AS last_message_at,
+                    COALESCE(r.active_cnt, 0) AS active_run_count
+                FROM topics t
+                LEFT JOIN (
+                    SELECT topic_id, COUNT(*) AS cnt, MAX(created_at) AS last_at
+                    FROM messages
+                    GROUP BY topic_id
+                ) m ON m.topic_id = t.id
+                LEFT JOIN (
+                    SELECT topic_id, COUNT(*) AS active_cnt
+                    FROM session_runs
+                    WHERE status IN ('queued', 'running', 'waiting_input')
+                    GROUP BY topic_id
+                ) r ON r.topic_id = t.id
+                WHERE {where_clause}
+                ORDER BY t.updated_at DESC
+                """
+            ).fetchall()
+            return [self._topic_row_from_joined(r) for r in rows]
 
     def get_topic(self, topic_id: str) -> Optional[dict[str, Any]]:
         with self._connect() as conn:
@@ -509,6 +562,108 @@ class Database:
     # ------------------------------------------------------------------
     # Messages
     # ------------------------------------------------------------------
+    def _hydrate_messages_batch(
+        self,
+        conn: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        parsed_metas = [_parse_metadata(r["metadata"]) for r in rows]
+        topic_map = self._hydrate_topics_by_ids(conn, [r["topic_id"] for r in rows])
+
+        explicit_run_ids = list(
+            dict.fromkeys(
+                str(m["session_run_id"])
+                for m in parsed_metas
+                if isinstance(m.get("session_run_id"), str) and m.get("session_run_id")
+            )
+        )
+        msg_ids = [r["id"] for r in rows]
+
+        runs_by_id: dict[str, dict[str, Any]] = {}
+        runs_by_trigger: dict[str, dict[str, Any]] = {}
+
+        if explicit_run_ids or msg_ids:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if explicit_run_ids:
+                ph = ", ".join("?" for _ in explicit_run_ids)
+                clauses.append(f"id IN ({ph})")
+                params.extend(explicit_run_ids)
+            if msg_ids:
+                ph = ", ".join("?" for _ in msg_ids)
+                clauses.append(f"trigger_message_id IN ({ph})")
+                params.extend(msg_ids)
+
+            run_rows = conn.execute(
+                f"SELECT * FROM session_runs WHERE {' OR '.join(clauses)} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+
+            if run_rows:
+                found_run_ids = [r["id"] for r in run_rows]
+                rph = ", ".join("?" for _ in found_run_ids)
+                steps_by_run: dict[str, list[dict[str, Any]]] = {}
+                for srow in conn.execute(
+                    f"SELECT * FROM step_logs WHERE run_id IN ({rph}) ORDER BY step_number ASC, id ASC",
+                    found_run_ids,
+                ).fetchall():
+                    steps_by_run.setdefault(srow["run_id"], []).append(dict(srow))
+
+                arts_by_run: dict[str, list[dict[str, Any]]] = {}
+                for arow in conn.execute(
+                    f"SELECT * FROM artifacts WHERE run_id IN ({rph}) ORDER BY created_at ASC",
+                    found_run_ids,
+                ).fetchall():
+                    arts_by_run.setdefault(arow["run_id"], []).append(dict(arow))
+
+                for rrow in run_rows:
+                    rid = rrow["id"]
+                    run_dict = {
+                        "id": rid,
+                        "topic_id": rrow["topic_id"],
+                        "trigger_message_id": rrow["trigger_message_id"],
+                        "agent_type": rrow["agent_type"],
+                        "status": rrow["status"],
+                        "current_step": rrow["current_step"],
+                        "error_message": rrow["error_message"],
+                        "created_at": rrow["created_at"],
+                        "updated_at": rrow["updated_at"],
+                        "step_logs": steps_by_run.get(rid, []),
+                        "artifacts": arts_by_run.get(rid, []),
+                        "raw_logs": [],
+                        "hitl_request": None,
+                    }
+                    runs_by_id[rid] = run_dict
+                    # ORDER BY created_at DESC ensures first seen is the latest run per trigger message
+                    runs_by_trigger.setdefault(rrow["trigger_message_id"], run_dict)
+
+        result: list[dict[str, Any]] = []
+        for row, meta in zip(rows, parsed_metas):
+            tid = row["topic_id"]
+            explicit_rid = meta.get("session_run_id")
+            run_dict = (
+                runs_by_id.get(explicit_rid)
+                if isinstance(explicit_rid, str) and explicit_rid
+                else runs_by_trigger.get(row["id"])
+            )
+            result.append(
+                {
+                    "id": row["id"],
+                    "topic_id": tid,
+                    "role": row["role"],
+                    "content": row["content"],
+                    "metadata": meta,
+                    "created_at": row["created_at"],
+                    "streaming": bool(meta.get("streaming", False)),
+                    "topic": topic_map.get(tid),
+                    "session_run": run_dict,
+                }
+            )
+        return result
+
     def _hydrate_message_row(
         self,
         conn: sqlite3.Connection,
@@ -680,11 +835,7 @@ class Database:
 
             has_more = len(rows) > limit
             page_rows = list(reversed(rows[:limit]))
-            topic_cache: dict[str, Optional[dict[str, Any]]] = {}
-            messages = [
-                self._hydrate_message_row(conn, r, topic_cache=topic_cache)
-                for r in page_rows
-            ]
+            messages = self._hydrate_messages_batch(conn, page_rows)
             next_cursor = page_rows[0]["id"] if (has_more and page_rows) else None
             return {
                 "messages": messages,
@@ -737,17 +888,14 @@ class Database:
                     """,
                     (limit,),
                 ).fetchall()
-            topic_cache: dict[str, Optional[dict[str, Any]]] = {}
-            result: list[dict[str, Any]] = []
-            for row in reversed(rows):
-                hydrated = self._hydrate_message_row(conn, row, topic_cache=topic_cache)
+            result = self._hydrate_messages_batch(conn, list(reversed(rows)))
+            for hydrated in result:
                 topic = hydrated.get("topic")
                 hydrated["topic_title"] = (
                     topic["title"]
                     if isinstance(topic, dict) and topic.get("title")
                     else GENERAL_TOPIC_TITLE
                 )
-                result.append(hydrated)
             return result
 
     def get_latest_message(self) -> Optional[dict[str, Any]]:
