@@ -336,6 +336,27 @@ async def test_explicit_agent_skips_model_selection_while_auto_uses_decision_mod
         assert data2["route_decision"]["agent_type"] == "gemini_agent"
         assert data2["session_run"]["agent_type"] == "gemini_agent"
 
+        # 3. Literal "auto" is treated identically to None (falls back to Decision Model)
+        fake_llm.next_decision = RouteDecision(
+            path="heavy",
+            topic_action="reuse",
+            topic_id=topic_id,
+            new_topic_title=None,
+            agent_type="codex",
+            confidence=0.9,
+            reasoning="auto 模式采用路由结果",
+        )
+        res3 = await client.post(
+            "/api/chat",
+            json={
+                "content": "自动选择引擎重跑",
+                "focus_topic_id": topic_id,
+                "agent_type": "auto",
+            },
+        )
+        assert res3.status_code == 200
+        assert res3.json()["session_run"]["agent_type"] == "codex"
+
 
 @pytest.mark.asyncio
 async def test_failed_heavy_run_creates_readable_kiki_reply(

@@ -395,9 +395,14 @@ def create_app(
         session_run: Optional[dict[str, Any]] = None
 
         if decision.path == "heavy":
+            raw_req_agent = (req.agent_type or "").strip()
+            requested_agent = (
+                None if (not raw_req_agent or raw_req_agent.lower() == "auto") else raw_req_agent
+            )
             resolved_agent_type = (
-                (req.agent_type.strip() if req.agent_type and req.agent_type.strip() else None)
+                requested_agent
                 or registry.try_resolve_type(decision.agent_type)
+                or cfg.default_heavy_agent
                 or "gemini_agent"
             )
             if decision.agent_type != resolved_agent_type:
