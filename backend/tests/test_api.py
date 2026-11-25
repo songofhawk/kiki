@@ -1189,3 +1189,52 @@ async def test_cors_restricts_origins_and_optional_api_token(tmp_path: Path):
             "/api/topics", headers={"Authorization": "Bearer secret-local-token"}
         )
         assert res_auth.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_workspace_tools_block_sensitive_files_and_scrub_shell_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.tools import WorkspaceToolExecutor
+
+    (tmp_path / ".env").write_text("GEMINI_API_KEY=super-secret-value\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("GEMINI_API_KEY=your_key\n", encoding="utf-8")
+    (tmp_path / "private.pem").write_text("PRIVATE KEY", encoding="utf-8")
+    monkeypatch.setenv("GEMINI_API_KEY", "should-not-leak-to-shell")
+    monkeypatch.setenv("KIKI_API_TOKEN", "token-should-not-leak")
+
+    db = Database(tmp_path / "tools.db")
+    db.init_db()
+    executor = WorkspaceToolExecutor(
+        workspace_root=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        db=db,
+        event_bus=EventBus(),
+    )
+
+    # list_files hides .env and private.pem, keeps .env.example
+    listing = executor.list_files(".")
+    entries = listing.splitlines()
+    assert ".env.example" in entries
+    assert ".env" not in entries
+    assert "private.pem" not in entries
+
+    # read_file blocks .env and .pem, allows .env.example
+    out_env, err_env = await executor.execute("run-1", "read_file", {"path": ".env"})
+    assert err_env is True
+    assert "sensitive" in out_env.lower()
+
+    out_pem, err_pem = await executor.execute("run-1", "read_file", {"path": "private.pem"})
+    assert err_pem is True
+
+    out_ex, err_ex = await executor.execute("run-1", "read_file", {"path": ".env.example"})
+    assert err_ex is False
+    assert "your_key" in out_ex
+
+    # run_shell blocks split rm -r -f and scrubs secret env vars
+    blocked = await executor.run_shell("run-1", "rm -r -f ./tmp_dir")
+    assert "Blocked unsafe command" in blocked
+
+    env_out = await executor.run_shell("run-1", "echo $GEMINI_API_KEY:$KIKI_API_TOKEN")
+    assert "should-not-leak-to-shell" not in env_out
+    assert "token-should-not-leak" not in env_out

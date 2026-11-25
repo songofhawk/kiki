@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -14,9 +15,15 @@ from .sse import EventBus
 
 IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"}
 
+_SAFE_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+_SENSITIVE_EXTENSIONS = {".pem", ".key", ".p12", ".pfx", ".jks"}
+_SENSITIVE_BASENAMES = {"id_rsa", "id_ed25519", "id_ecdsa", ".netrc", ".npmrc", ".pypirc"}
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_KEY", "_SECRET", "_TOKEN", "_PASSWORD", "_CREDENTIAL", "_CREDENTIALS")
+
 BLOCKED_SHELL_PATTERNS = [
-    r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b",
-    r"\brm\s+-[a-zA-Z]*f[a-zA-Z]*r\b",
+    r"(?:^|[;&|]\s*)(?:/\S*/)?rm\s+[^\n]*(?:-r\b|-rf\b|-fr\b|--recursive\b)",
+    r"\bfind\b[^\n]*-delete\b",
+    r"\bshutil\.rmtree\b",
     r"\bsudo\b",
     r"\bmkfs\b",
     r"\bdd\s+if=",
@@ -26,7 +33,33 @@ BLOCKED_SHELL_PATTERNS = [
     r">\s*/dev/sd",
     r"\bgit\s+push\s+--force\b",
     r"\bgit\s+reset\s+--hard\b",
+    r"(?:^|[;&|]\s*)(?:cat|head|tail|less|more|sed|awk|grep)\b[^\n]*\.env(?:\b|\.(?!example|sample|template))",
 ]
+
+
+def _is_sensitive_path(target: Path, workspace_root: Path) -> bool:
+    name = target.name.lower()
+    if name == ".env" or (name.startswith(".env.") and name not in _SAFE_ENV_TEMPLATES):
+        return True
+    if name in _SENSITIVE_BASENAMES or target.suffix.lower() in _SENSITIVE_EXTENSIONS:
+        return True
+    try:
+        rel_parts = [p.lower() for p in target.relative_to(workspace_root).parts]
+        if ".git" in rel_parts and name in {"config", "credentials"}:
+            return True
+    except ValueError:
+        return True
+    return False
+
+
+def _sanitized_shell_env() -> dict[str, str]:
+    clean: dict[str, str] = {}
+    for k, v in os.environ.items():
+        upper = k.upper()
+        if any(upper.endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES):
+            continue
+        clean[k] = v
+    return clean
 
 AGENT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
     {
@@ -220,7 +253,7 @@ class WorkspaceToolExecutor:
 
         entries: list[str] = []
         for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
-            if item.name in IGNORED_DIRS:
+            if item.name in IGNORED_DIRS or _is_sensitive_path(item, self.workspace_root):
                 continue
             rel = str(item.relative_to(self.workspace_root))
             entries.append(f"{rel}/" if item.is_dir() else rel)
@@ -231,6 +264,8 @@ class WorkspaceToolExecutor:
 
     def read_file(self, path: str, max_lines: int = 120) -> str:
         target = self._resolve_safe_path(path)
+        if _is_sensitive_path(target, self.workspace_root):
+            raise PermissionError(f"Access denied to sensitive file: {path}")
         if not target.exists() or not target.is_file():
             return f"Error: file '{path}' not found."
         capped_lines = max(1, min(int(max_lines or 120), 300))
@@ -289,6 +324,7 @@ class WorkspaceToolExecutor:
             cwd=str(self.workspace_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_sanitized_shell_env(),
         )
 
         stdout_lines: list[str] = []
