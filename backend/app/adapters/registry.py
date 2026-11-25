@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from typing import Iterable, Optional
-import re
 
 from .antigravity import AntigravityAdapter
 from .base import AdapterInfo, HeavyTaskAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .deepseek_harness import DeepSeekHarnessAdapter
-from .doubao_work import DoubaoWorkAdapter
 from .gemini_agent import GeminiAgentAdapter
 from .kcode import KCodeAdapter
 from .qoder import QoderAdapter
@@ -58,38 +56,6 @@ class AdapterRegistry:
         key = _normalize_key(raw)
         return self._aliases.get(key)
 
-    def detect_requested_agent(self, text: str) -> Optional[str]:
-        """Detect an explicitly named Heavy-Path adapter from user natural-language text."""
-        clean = (text or "").strip()
-        if not clean:
-            return None
-
-        # Exclude overly generic aliases that could match ordinary prose
-        generic_aliases = {"builtin", "default", "ark", "cbc", "dsh", "agy"}
-        candidates: list[tuple[str, str]] = []
-        for canonical, adapter in self._adapters.items():
-            names = [canonical, adapter.agent_type, *adapter.aliases]
-            for name in names:
-                normalized = _normalize_key(name)
-                if not normalized or normalized in generic_aliases:
-                    continue
-                # Build human-readable variants (e.g. claude_code -> claude code / claude-code)
-                for variant in {name.strip(), name.strip().replace("_", " "), name.strip().replace("_", "-")}:
-                    if len(variant) >= 3:
-                        candidates.append((variant, canonical))
-
-        # Match longest candidate first so "claude code" beats "claude"
-        candidates.sort(key=lambda item: len(item[0]), reverse=True)
-        for variant, canonical in candidates:
-            escaped = re.escape(variant)
-            if variant.isascii():
-                pattern = rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])"
-            else:
-                pattern = escaped
-            if re.search(pattern, clean, flags=re.IGNORECASE):
-                return canonical
-        return None
-
     def get(self, agent_type: Optional[str], default: str = "gemini_agent") -> HeavyTaskAdapter:
         canonical = self.resolve_type(agent_type, default=default)
         return self._adapters[canonical]
@@ -106,7 +72,7 @@ def create_default_registry(
     gemini_model: Optional[str] = None,
     gemini_api_key_configured: bool = True,
 ) -> AdapterRegistry:
-    """Build the default registry containing all 10 Kiki Heavy-Path adapters."""
+    """Build the default registry containing all Kiki Heavy-Path adapters."""
     return AdapterRegistry(
         adapters=[
             GeminiAgentAdapter(
@@ -121,6 +87,5 @@ def create_default_registry(
             KCodeAdapter(),
             QoderAdapter(),
             WorkBuddyAdapter(),
-            DoubaoWorkAdapter(),
         ]
     )

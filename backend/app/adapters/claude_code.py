@@ -58,6 +58,10 @@ class ClaudeCodeAdapter(SubprocessCLIAdapter):
     vendor = "Anthropic"
     description = "Anthropic Claude Code CLI，支持 stream-json 实时事件流、工具权限控制、思考强度与 --resume 续跑。"
     binary_candidates = ("claude",)
+    extra_binary_paths = (
+        "~/.local/bin/claude",
+        "~/Library/Application Support/Claude/claude-code-vm/*/claude",
+    )
     env_bin_var = "KIKI_CLAUDE_BIN"
     env_model_var = "KIKI_CLAUDE_MODEL"
     install_hint = "npm install -g @anthropic-ai/claude-code"

@@ -141,7 +141,7 @@ class FakeLLMClient:
         )
 
 
-def _build_test_app(tmp_path: Path):
+def _build_test_app(tmp_path: Path, *, llm: Optional[Any] = None):
     db_path = tmp_path / "kiki_test.db"
     artifacts_dir = tmp_path / "artifacts"
     settings = Settings(
@@ -154,7 +154,7 @@ def _build_test_app(tmp_path: Path):
     db = Database(db_path)
     db.init_db()
     bus = EventBus()
-    fake_llm = FakeLLMClient()
+    fake_llm = llm or FakeLLMClient()
     app = create_app(settings=settings, db=db, llm=fake_llm, event_bus=bus)
     return app, db, bus, fake_llm, db_path
 
@@ -265,7 +265,7 @@ async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path, monkey
             json={
                 "content": "来，再生成一次",
                 "focus_topic_id": topic_id,
-                "agent_type": "gemini_agent",
+                "agent_type": None,
             },
         )
         assert res3.status_code == 200
@@ -280,31 +280,30 @@ async def test_fast_path_streaming_and_topic_focus_bypass(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
-async def test_explicit_agent_detection_overrides_default_selector(
+async def test_explicit_agent_skips_model_selection_while_auto_uses_decision_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     from app.adapters.codex import CodexAdapter
 
     monkeypatch.setattr(CodexAdapter, "resolve_binary", lambda self: None)
     app, _db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+
+    # 1. Auto mode (agent_type omitted / None): Decision Model chooses agent_type
     fake_llm.next_decision = RouteDecision(
         path="heavy",
         topic_action="create",
         topic_id=None,
         new_topic_title="生成猫猫 lulu 图片",
-        agent_type=None,
+        agent_type="codex",
         confidence=0.95,
-        reasoning="用户请求生图任务",
+        reasoning="用户请求调用 Codex 生图",
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         res = await client.post(
             "/api/chat",
-            json={
-                "content": "调用 Codex 帮我生成一张猫猫的图吧，名字叫 lulu",
-                "agent_type": "gemini_agent",
-            },
+            json={"content": "调用 Codex 帮我生成一张猫猫的图吧，名字叫 lulu"},
         )
         assert res.status_code == 200
         data = res.json()
@@ -313,29 +312,110 @@ async def test_explicit_agent_detection_overrides_default_selector(
         assert data["session_run"] is not None
         assert data["session_run"]["agent_type"] == "codex"
 
-        # Follow-up in same topic without repeating "Codex" should still resolve to codex
+        # 2. Explicit agent_type in request overrides Decision Model (skips model agent selection)
         topic_id = data["topic"]["id"]
         fake_llm.next_decision = RouteDecision(
             path="heavy",
             topic_action="reuse",
             topic_id=topic_id,
             new_topic_title=None,
-            agent_type="gemini_agent",
+            agent_type="codex",
             confidence=0.9,
-            reasoning="用户追问重跑生图任务",
+            reasoning="默认判断",
         )
         res2 = await client.post(
             "/api/chat",
             json={
-                "content": "你也没生成啊",
+                "content": "这次用内置引擎再试一次",
                 "focus_topic_id": topic_id,
                 "agent_type": "gemini_agent",
             },
         )
         assert res2.status_code == 200
         data2 = res2.json()
-        assert data2["route_decision"]["agent_type"] == "codex"
-        assert data2["session_run"]["agent_type"] == "codex"
+        assert data2["route_decision"]["agent_type"] == "gemini_agent"
+        assert data2["session_run"]["agent_type"] == "gemini_agent"
+
+
+@pytest.mark.asyncio
+async def test_failed_heavy_run_creates_readable_kiki_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.adapters.codex import CodexAdapter
+
+    async def fake_execute_usage_limit(self, ctx):
+        raise RuntimeError(
+            "OpenAI Codex CLI 退出码 1: You’ve hit your usage limit. "
+            "Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 9:42 PM."
+        )
+
+    monkeypatch.setattr(CodexAdapter, "execute", fake_execute_usage_limit)
+    app, _db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    fake_llm.next_decision = RouteDecision(
+        path="heavy",
+        topic_action="create",
+        topic_id=None,
+        new_topic_title="Codex 额度测试",
+        agent_type="codex",
+        confidence=0.95,
+        reasoning="调用 Codex 执行任务",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post(
+            "/api/chat",
+            json={"content": "调用 Codex 生成一张猫猫图"},
+        )
+        assert res.status_code == 200
+        run_id = res.json()["session_run"]["id"]
+        topic_id = res.json()["topic"]["id"]
+
+        run_detail = await _wait_for_run_status(client, run_id, {"failed"})
+        assert run_detail["status"] == "failed"
+
+        msgs = (await client.get(f"/api/messages?topic_id={topic_id}")).json()["messages"]
+        assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+        reply_text = assistant_msgs[0]["content"]
+        assert "OpenAI Codex CLI" in reply_text
+        assert "额度" in reply_text
+        assert "9:42 PM" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_corrective_agent_switch_prefers_desired_agent_over_complained_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.adapters.workbuddy import WorkBuddyAdapter
+
+    monkeypatch.setattr(WorkBuddyAdapter, "resolve_binary", lambda self: None)
+    app, _db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    fake_llm.next_decision = RouteDecision(
+        path="fast",
+        topic_action="create",
+        topic_id=None,
+        new_topic_title="生成猫猫图",
+        agent_type="workbuddy",
+        confidence=0.9,
+        reasoning="用户要求用 WorkBuddy 执行任务",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post(
+            "/api/chat",
+            json={
+                "content": "不是，我是让你用 WorkBuddy 来执行，你为什么不停地用 Codex？",
+                "agent_type": None,
+            },
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["route_decision"]["path"] == "heavy"
+        assert data["route_decision"]["agent_type"] == "workbuddy"
+        assert data["session_run"] is not None
+        assert data["session_run"]["agent_type"] == "workbuddy"
 
 
 @pytest.mark.asyncio
@@ -950,3 +1030,115 @@ async def test_messages_cursor_pagination_and_active_runs(tmp_path: Path):
 
         all_runs = (await client.get("/api/runs?active_only=false")).json()
         assert len(all_runs) == 2
+
+
+@pytest.mark.asyncio
+async def test_parallel_tasks_and_chat_while_running(tmp_path: Path):
+    """While Heavy-Path tasks are running, Kiki accepts parallel Heavy and Fast inputs without blocking."""
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+    started_a = asyncio.Event()
+    started_b = asyncio.Event()
+
+    class ParallelFakeLLM(FakeLLMClient):
+        async def run_agent_turn(
+            self,
+            input_data: Any,
+            tools: list[dict[str, Any]],
+            system_instruction: str,
+            previous_interaction_id: Optional[str] = None,
+            thinking_level: str = "medium",
+        ) -> Any:
+            text = str(input_data)
+            if "任务A" in text:
+                started_a.set()
+                await gate_a.wait()
+                return SimpleNamespace(id="int-a", status="completed", steps=[], output_text="任务A完成")
+            if "任务B" in text:
+                started_b.set()
+                await gate_b.wait()
+                return SimpleNamespace(id="int-b", status="completed", steps=[], output_text="任务B完成")
+            return SimpleNamespace(id="int-x", status="completed", steps=[], output_text="完成")
+
+        async def stream_fast_reply(
+            self,
+            content: str,
+            history: list[dict[str, str]],
+            topic_title: str,
+        ):
+            yield f"并行轻聊回复:{content}"
+
+    app, db, bus, _fake_llm, _db_path = _build_test_app(tmp_path, llm=ParallelFakeLLM())
+    topic_a = db.create_topic(title="并行话题A")
+    topic_b = db.create_topic(title="并行话题B")
+    topic_c = db.create_topic(title="并行轻聊C")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. Start Heavy-Path Task A
+        res_a = await client.post(
+            "/api/chat",
+            json={
+                "content": "执行任务A",
+                "focus_topic_id": topic_a["id"],
+                "force_path": "heavy",
+            },
+        )
+        assert res_a.status_code == 200
+        run_a_id = res_a.json()["session_run"]["id"]
+        await asyncio.wait_for(started_a.wait(), timeout=3.0)
+
+        # 2. While Task A is still running, launch Heavy-Path Task B AND Fast-Path Chat C concurrently
+        res_b, res_c = await asyncio.gather(
+            client.post(
+                "/api/chat",
+                json={
+                    "content": "执行任务B",
+                    "focus_topic_id": topic_b["id"],
+                    "force_path": "heavy",
+                },
+            ),
+            client.post(
+                "/api/chat",
+                json={
+                    "content": "顺便问一句天气",
+                    "focus_topic_id": topic_c["id"],
+                    "force_path": "fast",
+                },
+            ),
+        )
+        assert res_b.status_code == 200
+        assert res_c.status_code == 200
+        run_b_id = res_b.json()["session_run"]["id"]
+        await asyncio.wait_for(started_b.wait(), timeout=3.0)
+
+        # Both runs are simultaneously active
+        active_runs = (await client.get("/api/runs?active_only=true")).json()
+        assert {r["id"] for r in active_runs} == {run_a_id, run_b_id}
+
+        # Wait briefly for Fast-Path C to finish streaming; status must stay 'running' while A & B run
+        await asyncio.sleep(0.05)
+        msgs_c = (await client.get(f"/api/messages?topic_id={topic_c['id']}")).json()["messages"]
+        assert any("并行轻聊回复:顺便问一句天气" in m["content"] for m in msgs_c)
+        assert bus.current_kiki_status["status"] == "running"
+
+        # 3. Release Task B first -> Task A is still running so status remains 'running'
+        gate_b.set()
+        for _ in range(50):
+            r_b = (await client.get(f"/api/runs/{run_b_id}")).json()
+            if r_b["status"] == "completed":
+                break
+            await asyncio.sleep(0.02)
+        assert r_b["status"] == "completed"
+        assert bus.current_kiki_status["status"] == "running"
+
+        # 4. Release Task A -> now everything is done and status returns to 'idle'
+        gate_a.set()
+        for _ in range(50):
+            r_a = (await client.get(f"/api/runs/{run_a_id}")).json()
+            if r_a["status"] == "completed":
+                break
+            await asyncio.sleep(0.02)
+        assert r_a["status"] == "completed"
+        assert bus.current_kiki_status["status"] == "idle"

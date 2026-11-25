@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import ipaddress
 import logging
@@ -265,7 +266,7 @@ class WebSearchService:
 
     async def fetch_webpage(self, url: str, *, max_chars: int = 6000) -> str:
         target = (url or "").strip()
-        allowed, reason = _is_public_http_url(target)
+        allowed, reason = await asyncio.to_thread(_is_public_http_url, target)
         if not allowed:
             raise PermissionError(reason)
 

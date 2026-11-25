@@ -63,6 +63,10 @@ class DeepSeekHarnessAdapter(SubprocessCLIAdapter):
         "推理模式切换与工具调用。"
     )
     binary_candidates = ("dsh", "deepseek-harness")
+    extra_binary_paths = (
+        "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+        "~/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+    )
     env_bin_var = "KIKI_DEEPSEEK_HARNESS_BIN"
     env_model_var = "KIKI_DEEPSEEK_HARNESS_MODEL"
     npx_package = "@deepseek-ai/dsh"

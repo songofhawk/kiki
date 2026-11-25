@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -156,7 +157,7 @@ class CodexAdapter(SubprocessCLIAdapter):
         info = super().probe()
         local_model = self._read_local_config_model()
         if local_model:
-            info.default_model = local_model
+            return replace(info, default_model=local_model)
         return info
 
     def build_command(

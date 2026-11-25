@@ -27,6 +27,10 @@ def _make_settings(
     gemini_cooldown_seconds: float = 120.0,
     deepseek_api_key: str = "",
     deepseek_model: str = "deepseek-flash",
+    zhipu_api_key: str = "",
+    zhipu_model: str = "glm-4-flash",
+    jev_api_key: str = "",
+    jev_model: str = "jev-latest",
 ) -> Settings:
     return Settings(
         gemini_api_key=gemini_api_key,
@@ -36,6 +40,10 @@ def _make_settings(
         gemini_cooldown_seconds=gemini_cooldown_seconds,
         deepseek_api_key=deepseek_api_key,
         deepseek_model=deepseek_model,
+        zhipu_api_key=zhipu_api_key,
+        zhipu_model=zhipu_model,
+        jev_api_key=jev_api_key,
+        jev_model=jev_model,
         workspace_root=tmp_path,
         database_path=tmp_path / "kiki.db",
         artifacts_dir=tmp_path / "artifacts",
@@ -492,3 +500,153 @@ def test_recent_messages_with_topic_includes_failed_session_run_in_context(tmp_p
     assert "(#深圳实时天气查询)" in formatted
     assert "再查一下深圳现在的天气" in formatted
     assert "[后台任务执行失败(gemini_agent): 503 Service Unavailable]" in formatted
+
+
+@pytest.mark.asyncio
+async def test_zhipu_glm4_flash_primary_routing_and_gemini_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        gemini_model="gemini-3.5-flash-lite",
+        zhipu_api_key="zhipu-test-key",
+        zhipu_model="glm-4-flash",
+    )
+    llm = KikiLLMClient(settings)
+
+    async def _gemini_handler(_kwargs: dict[str, Any]) -> Any:
+        return SimpleNamespace(
+            output_text=(
+                '{"path":"fast","topic_action":"none","topic_id":null,'
+                '"new_topic_title":null,"confidence":0.85,"reasoning":"from-gemini"}'
+            )
+        )
+
+    gemini_stub = _attach_stub_client(llm, _gemini_handler)
+    zhipu_up = True
+    zhipu_calls: list[dict[str, Any]] = []
+
+    async def fake_openai_post(
+        *,
+        base_url: str,
+        api_key: str,
+        payload: dict[str, Any],
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        zhipu_calls.append({"base_url": base_url, "api_key": api_key, "payload": payload, "timeout": timeout})
+        if not zhipu_up:
+            raise RuntimeError("zhipu timeout")
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"path":"heavy","topic_action":"create","topic_id":null,'
+                            '"new_topic_title":"智谱路由测试","confidence":0.94,"reasoning":"from-zhipu"}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm, "_openai_post_chat", fake_openai_post)
+
+    # 1) Zhipu glm-4-flash is called first for routing, Gemini is untouched
+    d1 = await llm.route_message("帮我用 codex 改一下代码", active_topics=[])
+    assert d1.reasoning == "from-zhipu"
+    assert d1.path == "heavy"
+    assert llm.last_used_provider == "zhipu"
+    assert llm.last_used_model == "glm-4-flash"
+    assert len(zhipu_calls) == 1
+    assert zhipu_calls[0]["payload"]["model"] == "glm-4-flash"
+    assert len(gemini_stub.calls) == 0
+
+    # 2) When Zhipu fails, it cools down and falls back seamlessly to Gemini
+    zhipu_up = False
+    d2 = await llm.route_message("早安", active_topics=[])
+    assert d2.reasoning == "from-gemini"
+    assert llm.last_used_provider == "gemini"
+    assert len(gemini_stub.calls) == 1
+
+    # 3) Subsequent route during cooldown skips Zhipu immediately
+    d3 = await llm.route_message("晚上好", active_topics=[])
+    assert d3.reasoning == "from-gemini"
+    assert len(zhipu_calls) == 2
+    assert len(gemini_stub.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_jev_primary_decision_routing_and_zhipu_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        zhipu_api_key="zhipu-test-key",
+        zhipu_model="glm-4-flash",
+        jev_api_key="jev-test-key",
+        jev_model="jev-latest",
+    )
+    llm = KikiLLMClient(settings)
+
+    jev_up = True
+    jev_calls: list[dict[str, Any]] = []
+    zhipu_calls: list[dict[str, Any]] = []
+
+    async def fake_jev_post(payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
+        jev_calls.append({"payload": payload, "timeout": timeout})
+        if not jev_up:
+            raise RuntimeError("jev unavailable")
+        return {
+            "model": "jev-1.14.0",
+            "answers": {
+                "path": {"type": "choice", "choice": "heavy", "probabilities": {"fast": 0.08, "heavy": 0.92}},
+                "topic_action": {"type": "choice", "choice": "reuse", "probabilities": {"none": 0.02, "reuse": 0.91, "create": 0.07}},
+                "topic_id": {"type": "choice", "choice": "topic-1", "probabilities": {"topic-1": 0.91, "__none__": 0.09}},
+                "agent_type": {"type": "choice", "choice": "workbuddy", "probabilities": {"workbuddy": 0.99}},
+            },
+        }
+
+    async def fake_openai_post(
+        *,
+        base_url: str,
+        api_key: str,
+        payload: dict[str, Any],
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        zhipu_calls.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"path":"fast","topic_action":"none","topic_id":null,'
+                            '"new_topic_title":null,"confidence":0.88,"reasoning":"from-zhipu-fallback"}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm, "_jev_post_systemone", fake_jev_post)
+    monkeypatch.setattr(llm, "_openai_post_chat", fake_openai_post)
+
+    topics = [{"id": "topic-1", "title": "WorkBuddy协作", "summary": "使用WorkBuddy执行任务"}]
+    d1 = await llm.route_message("继续让WorkBuddy工作吧", active_topics=topics)
+    assert d1.path == "heavy"
+    assert d1.topic_action == "reuse"
+    assert d1.topic_id == "topic-1"
+    assert d1.agent_type == "workbuddy"
+    assert d1.confidence == 0.91
+    assert llm.last_used_provider == "jev"
+    assert llm.last_used_model == "jev-1.14.0"
+    assert len(jev_calls) == 1
+    assert len(zhipu_calls) == 0
+
+    # When Jev fails, it cools down and falls back seamlessly to Zhipu glm-4-flash
+    jev_up = False
+    d2 = await llm.route_message("早安", active_topics=topics)
+    assert d2.reasoning == "from-zhipu-fallback"
+    assert llm.last_used_provider == "zhipu"
+    assert len(zhipu_calls) == 1

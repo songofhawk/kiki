@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Literal, Optional
+import re
+from typing import Any, Callable, Literal, Optional
 
 from .adapters import (
     AdapterContext,
@@ -29,6 +30,73 @@ def _truncate_summary(text: str, max_chars: int = 200) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[: max_chars - 1] + "…"
+
+
+def _format_human_failure_reply(agent_name: str, err_msg: str) -> str:
+    """Translate raw Heavy-Path exception text into a readable Kiki assistant message."""
+    raw = " ".join((err_msg or "").split())
+    lower = raw.lower()
+
+    if any(
+        kw in lower
+        for kw in (
+            "usage limit",
+            "rate limit",
+            "insufficient_quota",
+            "quota",
+            "429",
+            "too many requests",
+        )
+    ):
+        retry_match = re.search(
+            r"try again (?:at|in)\s+([A-Za-z0-9:.,\s]+?)(?:\.|\n|$)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        retry_hint = (
+            f"（预计恢复时间：{retry_match.group(1).strip()}）"
+            if retry_match
+            else ""
+        )
+        return (
+            f"喵呜，调用 **{agent_name}** 失败了：当前账户的额度或调用频率已达上限{retry_hint}。\n\n"
+            f"建议等额度恢复后再试，或者在底部切换其他可用引擎 / 账号来执行这个任务。"
+        )
+
+    if any(
+        kw in lower
+        for kw in ("unauthorized", "invalid api key", "api key", "authentication", "401", "login")
+    ):
+        return (
+            f"喵呜，**{agent_name}** 鉴权失败了，好像是登录态失效或 API Key 未配置正确。\n\n"
+            f"请检查对应应用的登录状态或 `.env` 配置后再试一次~"
+        )
+
+    if any(
+        kw in lower
+        for kw in (
+            "service_unavailable",
+            "503",
+            "high demand",
+            "server disconnected",
+            "timed out",
+            "timeout",
+            "connection",
+        )
+    ):
+        return (
+            f"喵呜，**{agent_name}** 上游服务暂时繁忙或网络波动中断了（{ _truncate_summary(raw, max_chars=90) }）。\n\n"
+            f"稍等一下再让我重跑一次就好啦。"
+        )
+
+    if "未检测到" in raw or "not found" in lower:
+        return f"喵呜，**{agent_name}** 还没准备好：{_truncate_summary(raw, max_chars=180)}"
+
+    detail = _truncate_summary(raw, max_chars=160) if raw else "未知错误"
+    return (
+        f"喵呜，**{agent_name}** 执行任务时出错了：{detail}\n\n"
+        f"你可以点开上方失败卡片的「日志」查看完整报错详情，或者换个指令让我再试一次。"
+    )
 
 
 def _normalize_hitl_options(raw_options: Any) -> list[dict[str, Any]]:
@@ -68,6 +136,7 @@ class TaskManager:
         adapter_registry: Optional[AdapterRegistry] = None,
         settings: Optional[Settings] = None,
         max_steps: int = 10,
+        status_provider: Optional[Callable[[], Literal["idle", "thinking", "running", "waiting_input"]]] = None,
     ) -> None:
         self.db = db
         self.llm = llm
@@ -79,12 +148,19 @@ class TaskManager:
             gemini_api_key_configured=settings.api_key_configured if settings else True,
         )
         self.max_steps = max_steps
+        self._status_provider = status_provider
 
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._run_adapters: dict[str, str] = {}
         self._run_states: dict[str, str] = {}
         self._hitl_events: dict[str, asyncio.Event] = {}
         self._hitl_decisions: dict[str, dict[str, Any]] = {}
+
+    def set_status_provider(
+        self,
+        provider: Optional[Callable[[], Literal["idle", "thinking", "running", "waiting_input"]]],
+    ) -> None:
+        self._status_provider = provider
 
     def compute_kiki_status(self) -> Literal["idle", "thinking", "running", "waiting_input"]:
         states = set(self._run_states.values())
@@ -93,6 +169,10 @@ class TaskManager:
         if "running" in states or "queued" in states:
             return "running"
         return "idle"
+
+    def _publish_kiki_status(self, reason: Optional[str] = None) -> None:
+        status = self._status_provider() if self._status_provider else self.compute_kiki_status()
+        self.event_bus.publish_kiki_status(status, reason=reason)
 
     def enqueue_run(
         self,
@@ -124,7 +204,7 @@ class TaskManager:
         self._run_adapters[run_id] = canonical_type
         enriched = self.event_bus.enrich_run(run)
         self.event_bus.publish("run_created", {"run": enriched})
-        self.event_bus.publish_kiki_status(self.compute_kiki_status(), reason="后台任务已启动")
+        self._publish_kiki_status(reason="后台任务已启动")
 
         task = asyncio.create_task(
             self._execute_run(
@@ -178,7 +258,7 @@ class TaskManager:
         )
         self.event_bus.publish("hitl_required", hitl_req)
         self._publish_run_update(run_id)
-        self.event_bus.publish_kiki_status(self.compute_kiki_status(), reason=prompt)
+        self._publish_kiki_status(reason=prompt)
 
         wait_event = asyncio.Event()
         self._hitl_events[run_id] = wait_event
@@ -194,7 +274,7 @@ class TaskManager:
             current_step="收到主人决策，继续执行中...",
         )
         self._publish_run_update(run_id)
-        self.event_bus.publish_kiki_status(self.compute_kiki_status())
+        self._publish_kiki_status()
         self.event_bus.append_raw_log(
             run_id,
             json.dumps(
@@ -223,7 +303,7 @@ class TaskManager:
                 current_step=f"{adapter.display_name} 正在拆解任务并规划步骤...",
             )
             self._publish_run_update(run_id)
-            self.event_bus.publish_kiki_status(self.compute_kiki_status(), reason="后台任务运行中")
+            self._publish_kiki_status(reason="后台任务运行中")
             self.event_bus.append_raw_log(
                 run_id,
                 json.dumps(
@@ -324,7 +404,7 @@ class TaskManager:
                 ),
                 stream="ndjson",
             )
-            self.event_bus.publish_kiki_status(self.compute_kiki_status())
+            self._publish_kiki_status()
 
         except asyncio.CancelledError:
             await adapter.cancel(run_id)
@@ -341,7 +421,7 @@ class TaskManager:
                 json.dumps({"event": "run_cancelled", "run_id": run_id}, ensure_ascii=False),
                 stream="ndjson",
             )
-            self.event_bus.publish_kiki_status(self.compute_kiki_status())
+            self._publish_kiki_status()
             raise
         except Exception as exc:
             logger.exception("SessionRun %s (%s) failed: %s", run_id, agent_type, exc)
@@ -360,7 +440,26 @@ class TaskManager:
                 f"[ERROR] {err_msg}",
                 stream="stderr",
             )
-            self.event_bus.publish_kiki_status(self.compute_kiki_status())
+
+            failure_reply = _format_human_failure_reply(adapter.display_name, err_msg)
+            failure_msg = self.db.create_message(
+                topic_id=topic_id,
+                role="assistant",
+                content=failure_reply,
+                metadata={
+                    "session_run_id": run_id,
+                    "source": "heavy_agent_error",
+                    "path": "heavy",
+                    "agent_type": adapter.agent_type,
+                    "error": True,
+                },
+            )
+            self.event_bus.publish("message_created", {"message": failure_msg})
+            updated_topic = self.db.update_topic(topic_id, unread=True)
+            if updated_topic:
+                self.event_bus.publish("topic_updated", {"topic": updated_topic})
+
+            self._publish_kiki_status()
 
     def resume_run(
         self,
@@ -426,7 +525,7 @@ class TaskManager:
                     current_step="任务已取消",
                 )
                 self._publish_run_update(run_id)
-                self.event_bus.publish_kiki_status(self.compute_kiki_status())
+                self._publish_kiki_status()
 
         updated = self.db.get_session_run(run_id)
         return self.event_bus.enrich_run(updated) if updated else None

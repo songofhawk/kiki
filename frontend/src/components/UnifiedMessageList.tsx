@@ -33,6 +33,7 @@ export interface UnifiedMessageListProps {
   loadingOlder?: boolean;
   onLoadOlder?: () => void;
   sending?: boolean;
+  pendingSendCount?: number;
   selectionMode?: boolean;
   selectedMessageIds?: Set<string>;
   onToggleSelectMessage?: (messageId: string, shiftKey?: boolean) => void;
@@ -128,6 +129,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   loadingOlder = false,
   onLoadOlder,
   sending = false,
+  pendingSendCount = 0,
   selectionMode = false,
   selectedMessageIds,
   onToggleSelectMessage,
@@ -419,13 +421,43 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
               !(sending && sessionRun.status === 'queued')
           );
 
-          const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+          const handleDragStart = (e: React.DragEvent<HTMLElement>) => {
             if (selectionMode) {
               e.preventDefault();
               return;
             }
             e.dataTransfer.setData('text/kiki-message-id', msg.id);
             e.dataTransfer.effectAllowed = 'move';
+
+            // Use a compact floating pill as drag preview so it won't obscure sidebar topics
+            const previewText = msg.content.replace(/\s+/g, ' ').trim();
+            const label = `${isUser ? userProfile.name : 'Kiki'}：${previewText || '（空消息）'}`;
+            const ghost = document.createElement('div');
+            ghost.textContent = label;
+            Object.assign(ghost.style, {
+              position: 'fixed',
+              top: '-9999px',
+              left: '-9999px',
+              maxWidth: '220px',
+              padding: '6px 12px',
+              borderRadius: '9999px',
+              background: '#2E2B28',
+              color: '#FAF8F5',
+              fontSize: '12px',
+              lineHeight: '1.2',
+              fontWeight: '500',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              boxShadow: '0 6px 16px rgba(0, 0, 0, 0.18)',
+              pointerEvents: 'none',
+              zIndex: '9999',
+            });
+            document.body.appendChild(ghost);
+            e.dataTransfer.setDragImage(ghost, 12, 16);
+            requestAnimationFrame(() => {
+              ghost.remove();
+            });
           };
 
           const handleRowSelectClick = (e: React.MouseEvent) => {
@@ -473,8 +505,6 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             return (
               <div
                 key={msg.id}
-                draggable={!selectionMode}
-                onDragStart={handleDragStart}
                 onClick={selectionMode ? handleRowSelectClick : undefined}
                 className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
                   selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
@@ -485,12 +515,14 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                 <div className="flex-1 min-w-0 flex flex-col items-end">
                   <div className="flex items-center gap-2 mb-1.5">
                     {!selectionMode && (
-                      <span
+                      <div
+                        draggable
+                        onDragStart={handleDragStart}
                         title="可拖拽此消息到左侧任意话题进行改绑"
-                        className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
+                        className="inline-flex items-center justify-center p-1 -m-1 rounded opacity-0 group-hover:opacity-60 hover:!opacity-100 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378] [-webkit-user-drag:element]"
                       >
-                        <GripVertical className="w-3.5 h-3.5" />
-                      </span>
+                        <GripVertical className="w-3.5 h-3.5 pointer-events-none" />
+                      </div>
                     )}
                     {topic ? (
                       <TopicBadge
@@ -551,8 +583,6 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           return (
             <div
               key={msg.id}
-              draggable={!selectionMode}
-              onDragStart={handleDragStart}
               onClick={selectionMode ? handleRowSelectClick : undefined}
               className={`group flex items-start gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
                 selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
@@ -578,12 +608,14 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       {formatTime(msg.created_at)}
                     </span>
                     {!selectionMode && (
-                      <span
+                      <div
+                        draggable
+                        onDragStart={handleDragStart}
                         title="可拖拽此消息到左侧任意话题进行改绑"
-                        className="opacity-0 group-hover:opacity-60 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378]"
+                        className="inline-flex items-center justify-center p-1 -m-1 rounded opacity-0 group-hover:opacity-60 hover:!opacity-100 transition-opacity cursor-grab active:cursor-grabbing text-[#8C8378] [-webkit-user-drag:element]"
                       >
-                        <GripVertical className="w-3.5 h-3.5" />
-                      </span>
+                        <GripVertical className="w-3.5 h-3.5 pointer-events-none" />
+                      </div>
                     )}
                   </div>
 
@@ -632,7 +664,11 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
               <KikiAvatar status="running" pose="delivering" animated size="md" />
             </div>
             <div className="mt-2 rounded-2xl rounded-tl-sm bg-white/85 border border-[#E8E2D9] px-4 py-2.5 text-xs text-[#7A7269] inline-flex items-center gap-2 shadow-sm">
-              <span>Kiki 正在飞奔递信并分流话题</span>
+              <span>
+                {pendingSendCount > 1
+                  ? `Kiki 正在并行递信并分流 ${pendingSendCount} 条消息`
+                  : 'Kiki 正在飞奔递信并分流话题'}
+              </span>
               <span className="inline-flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />
                 <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:150ms]" />

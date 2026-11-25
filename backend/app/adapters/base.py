@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import glob
 import json
 import os
 import re
@@ -310,8 +311,39 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
     def __init__(self) -> None:
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
 
+    @staticmethod
+    def _is_executable_file(path: str) -> bool:
+        try:
+            p = Path(path)
+            return p.is_file() and os.access(p, os.X_OK)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _common_bin_dirs() -> list[str]:
+        dirs = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            os.path.expanduser("~/.local/bin"),
+            os.path.expanduser("~/bin"),
+            os.path.expanduser("~/.npm-global/bin"),
+            os.path.expanduser("~/.pnpm"),
+            os.path.expanduser("~/.bun/bin"),
+            os.path.expanduser("~/.cargo/bin"),
+            os.path.expanduser("~/.volta/bin"),
+        ]
+        try:
+            nvm_bins = sorted(
+                glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin")),
+                reverse=True,
+            )
+            dirs.extend(nvm_bins)
+        except OSError:
+            pass
+        return dirs
+
     def resolve_binary(self) -> Optional[str]:
-        """Locate the CLI binary via env override, PATH lookup, or known app bundle paths."""
+        """Locate the CLI binary via env override, PATH, common bin dirs, or app bundle paths."""
         if self.env_bin_var:
             override = os.getenv(self.env_bin_var, "").strip()
             if override:
@@ -319,16 +351,28 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
                 if found:
                     return found
                 expanded = os.path.expanduser(override)
-                if Path(expanded).is_file() and os.access(expanded, os.X_OK):
+                if self._is_executable_file(expanded):
                     return expanded
         for candidate in self.binary_candidates:
             found = shutil.which(candidate)
             if found:
                 return found
-        for raw_path in self.extra_binary_paths:
-            expanded = os.path.expanduser(raw_path)
-            if Path(expanded).is_file() and os.access(expanded, os.X_OK):
-                return expanded
+        for bin_dir in self._common_bin_dirs():
+            for candidate in self.binary_candidates:
+                candidate_path = os.path.join(bin_dir, candidate)
+                if self._is_executable_file(candidate_path):
+                    return candidate_path
+        for raw_pattern in self.extra_binary_paths:
+            expanded_pattern = os.path.expanduser(raw_pattern)
+            try:
+                matches = sorted(glob.glob(expanded_pattern), reverse=True)
+            except OSError:
+                matches = []
+            if not matches and self._is_executable_file(expanded_pattern):
+                return expanded_pattern
+            for matched in matches:
+                if self._is_executable_file(matched):
+                    return matched
         return None
 
     def probe(self) -> AdapterInfo:

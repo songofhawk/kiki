@@ -338,7 +338,7 @@ function mergeRun(prev: SessionRun | undefined, incoming: SessionRun): SessionRu
 export const App: React.FC = () => {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
-  const [selectedAgentType, setSelectedAgentType] = useState<string>('gemini_agent');
+  const [selectedAgentType, setSelectedAgentType] = useState<string>('auto');
   const [topics, setTopics] = useState<Topic[]>([]);
   const [streamsByKey, setStreamsByKey] = useState<Record<string, StreamPageState>>({
     [ALL_STREAM_KEY]: { ...EMPTY_STREAM, loadingInitial: true },
@@ -354,7 +354,7 @@ export const App: React.FC = () => {
 
   const [serverKikiStatus, setServerKikiStatus] = useState<KikiStatus>('idle');
   const [sseConnected, setSseConnected] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [pendingSendCount, setPendingSendCount] = useState(0);
   const [inputText, setInputText] = useState('');
   const [pathOption, setPathOption] = useState<PathOption>('auto');
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
@@ -371,7 +371,9 @@ export const App: React.FC = () => {
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const lastSelectedMsgIdRef = useRef<string | null>(null);
-  const pendingOptimisticRef = useRef<Array<{ tempId: string; content: string }>>([]);
+  const pendingOptimisticRef = useRef<
+    Array<{ tempId: string; content: string; focusTopicId: string | null }>
+  >([]);
   const resolvedOptimisticMapRef = useRef<Map<string, string>>(new Map());
   const loadingInitialKeysRef = useRef<Set<string>>(new Set());
   const loadingOlderKeysRef = useRef<Set<string>>(new Set());
@@ -651,9 +653,22 @@ export const App: React.FC = () => {
       },
       onMessageCreated: ({ message }) => {
         if (message.role === 'user') {
-          const matchIdx = pendingOptimisticRef.current.findIndex(
-            (item) => item.content === message.content
+          let matchIdx = pendingOptimisticRef.current.findIndex(
+            (item) =>
+              item.content === message.content &&
+              item.focusTopicId === message.topic_id
           );
+          if (matchIdx < 0) {
+            matchIdx = pendingOptimisticRef.current.findIndex(
+              (item) =>
+                item.content === message.content && item.focusTopicId === null
+            );
+          }
+          if (matchIdx < 0) {
+            matchIdx = pendingOptimisticRef.current.findIndex(
+              (item) => item.content === message.content
+            );
+          }
           if (matchIdx >= 0) {
             const [matched] = pendingOptimisticRef.current.splice(matchIdx, 1);
             resolvedOptimisticMapRef.current.set(matched.tempId, message.id);
@@ -834,19 +849,32 @@ export const App: React.FC = () => {
     [streamsByKey]
   );
 
+  const hasPendingSends = pendingSendCount > 0;
+
+  const activeRunCount = useMemo(
+    () =>
+      Object.values(runsById).filter(
+        (r) =>
+          r.status === 'queued' ||
+          r.status === 'running' ||
+          r.status === 'waiting_input'
+      ).length,
+    [runsById]
+  );
+
   const globalKikiStatus: KikiStatus = useMemo(() => {
     const allRuns = Object.values(runsById);
     if (allRuns.some((r) => r.status === 'waiting_input')) {
       return 'waiting_input';
     }
-    if (sending || hasStreamingMessage || serverKikiStatus === 'thinking') {
+    if (hasPendingSends || hasStreamingMessage || serverKikiStatus === 'thinking') {
       return 'thinking';
     }
     if (allRuns.some((r) => r.status === 'running' || r.status === 'queued')) {
       return 'running';
     }
     return serverKikiStatus;
-  }, [runsById, sending, hasStreamingMessage, serverKikiStatus]);
+  }, [runsById, hasPendingSends, hasStreamingMessage, serverKikiStatus]);
 
   // Compute which Kiki animations are currently visible in the main stream / toast
   // so the bottom-left companion Kiki NEVER performs the exact same animation at the same time.
@@ -856,7 +884,7 @@ export const App: React.FC = () => {
   } => {
     const usedInMainView = new Set<KikiPose>();
 
-    if (sending || toasts.length > 0) {
+    if (hasPendingSends || toasts.length > 0) {
       usedInMainView.add('delivering');
     }
     if (visibleMessages.some((m) => isMessageStreaming(m))) {
@@ -892,10 +920,13 @@ export const App: React.FC = () => {
         };
       }
       case 'thinking': {
-        if (sending) {
+        if (hasPendingSends) {
           return {
             companionPose: pickDistinct(['thinking', 'idle']),
-            companionCaption: '歪头判断话题分流中...',
+            companionCaption:
+              pendingSendCount > 1
+                ? `并行分流 ${pendingSendCount} 条消息中...`
+                : '歪头判断话题分流中...',
           };
         }
         if (usedInMainView.has('thinking')) {
@@ -908,18 +939,35 @@ export const App: React.FC = () => {
       }
       case 'running': {
         if (!usedInMainView.has('working')) {
-          return { companionPose: 'working', companionCaption: '后台敲键盘干活中...' };
+          return {
+            companionPose: 'working',
+            companionCaption:
+              activeRunCount > 1
+                ? `后台并行处理 ${activeRunCount} 个任务...`
+                : '后台敲键盘干活中...',
+          };
         }
         return {
           companionPose: pickDistinct(['delivering', 'thinking', 'idle']),
-          companionCaption: '后台跑腿盯梢中...',
+          companionCaption:
+            activeRunCount > 1
+              ? `后台并行盯梢 ${activeRunCount} 个任务...`
+              : '后台跑腿盯梢中...',
         };
       }
       case 'idle':
       default:
         return { companionPose: undefined, companionCaption: null };
     }
-  }, [visibleMessages, runsById, sending, toasts.length, globalKikiStatus]);
+  }, [
+    visibleMessages,
+    runsById,
+    hasPendingSends,
+    pendingSendCount,
+    activeRunCount,
+    toasts.length,
+    globalKikiStatus,
+  ]);
 
   const handleSelectTopic = useCallback(
     async (topicId: string) => {
@@ -971,9 +1019,13 @@ export const App: React.FC = () => {
   const handleSend = useCallback(
     async (overrideText?: string) => {
       const content = (overrideText ?? inputText).trim();
-      if (!content || sending) return;
+      if (!content) return;
 
-      setSending(true);
+      const currentFocusTopicId = focusTopicId;
+      const currentPathOption = pathOption;
+      const currentAgentType = selectedAgentType;
+
+      setPendingSendCount((count) => count + 1);
       setErrorBanner(null);
       if (!overrideText) {
         setInputText('');
@@ -985,20 +1037,24 @@ export const App: React.FC = () => {
       const tempId = `temp-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const optimisticUser: Message = {
         id: tempId,
-        topic_id: focusTopicId ?? '__routing__',
+        topic_id: currentFocusTopicId ?? '__routing__',
         role: 'user',
         content,
         created_at: new Date().toISOString(),
         metadata: {
           optimistic: true,
-          routing: !focusTopicId,
+          routing: !currentFocusTopicId,
         },
-        topic: focusTopicId ? topicsById[focusTopicId] ?? null : null,
+        topic: currentFocusTopicId ? topicsById[currentFocusTopicId] ?? null : null,
       };
-      pendingOptimisticRef.current.push({ tempId, content });
+      pendingOptimisticRef.current.push({
+        tempId,
+        content,
+        focusTopicId: currentFocusTopicId,
+      });
       setStreamsByKey((prev) => {
         const next: Record<string, StreamPageState> = { ...prev };
-        const activeKey = focusTopicId ?? ALL_STREAM_KEY;
+        const activeKey = currentFocusTopicId ?? ALL_STREAM_KEY;
         const activeStream = prev[activeKey] ?? { ...EMPTY_STREAM, loaded: true };
         next[activeKey] = {
           ...activeStream,
@@ -1016,9 +1072,9 @@ export const App: React.FC = () => {
       try {
         const res = await sendChat({
           content,
-          focus_topic_id: focusTopicId,
-          force_path: pathOption === 'auto' ? null : pathOption,
-          agent_type: selectedAgentType,
+          focus_topic_id: currentFocusTopicId,
+          force_path: currentPathOption === 'auto' ? null : currentPathOption,
+          agent_type: currentAgentType === 'auto' ? null : currentAgentType,
         });
 
         if (res.topic) {
@@ -1091,13 +1147,13 @@ export const App: React.FC = () => {
           err instanceof Error ? err.message : '发送消息失败，请稍后重试'
         );
         if (!overrideText) {
-          setInputText(content);
+          setInputText((prev) => (prev.trim() ? prev : content));
         }
       } finally {
-        setSending(false);
+        setPendingSendCount((count) => Math.max(0, count - 1));
       }
     },
-    [inputText, sending, focusTopicId, pathOption, selectedAgentType, topicsById]
+    [inputText, focusTopicId, pathOption, selectedAgentType, topicsById]
   );
 
   const handleReassignMessage = useCallback(
@@ -1420,7 +1476,8 @@ export const App: React.FC = () => {
           loadingInitial={currentStream.loadingInitial}
           loadingOlder={currentStream.loadingOlder}
           onLoadOlder={handleLoadOlder}
-          sending={sending}
+          sending={hasPendingSends}
+          pendingSendCount={pendingSendCount}
           selectionMode={selectionMode}
           selectedMessageIds={selectedMessageIds}
           onToggleSelectMessage={handleToggleSelectMessage}
@@ -1593,11 +1650,14 @@ export const App: React.FC = () => {
                     value={selectedAgentType}
                     onChange={(e) => setSelectedAgentType(e.target.value)}
                     title={
-                      adapters.find((a) => a.id === selectedAgentType)?.install_hint ??
-                      '选择重型任务 Adapter'
+                      selectedAgentType === 'auto'
+                        ? '由 Kiki 自动识别并选择最合适的执行引擎'
+                        : adapters.find((a) => a.id === selectedAgentType)?.install_hint ??
+                          '选择重型任务 Adapter'
                     }
                     className="h-7 px-2 rounded-xl text-[11px] font-medium bg-white text-[#4E4740] border border-[#E5DED4] focus:outline-none focus:border-[#5B7A95] cursor-pointer"
                   >
+                    <option value="auto">✦ 自动选择引擎</option>
                     {adapters.map((adapter) => (
                       <option key={adapter.id} value={adapter.id}>
                         {adapter.available ? '● ' : '○ '}
@@ -1608,9 +1668,17 @@ export const App: React.FC = () => {
                 )}
               </div>
 
-              <span className="text-[11px] text-[#9A9187] hidden sm:inline">
-                Enter 发送 · Shift + Enter 换行
-              </span>
+              <div className="flex items-center gap-2">
+                {activeRunCount > 0 && (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-[#EAF0F5] text-[#44637D] border border-[#CFE0EC]">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-pulse" />
+                    <span>{activeRunCount} 个任务并行中 · 可随时继续输入</span>
+                  </span>
+                )}
+                <span className="text-[11px] text-[#9A9187] hidden sm:inline">
+                  Enter 发送 · Shift + Enter 换行
+                </span>
+              </div>
             </div>
 
             {/* Input Container */}
@@ -1626,14 +1694,16 @@ export const App: React.FC = () => {
                 placeholder={
                   focusedTopic
                     ? `在 #${focusedTopic.title} 中继续对话...`
-                    : '和 Kiki 聊点什么，或直接交办一个后台任务...'
+                    : activeRunCount > 0
+                      ? '后台任务并行执行中，随时继续发新消息或开启新话题...'
+                      : '和 Kiki 聊点什么，或直接交办一个后台任务...'
                 }
                 className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
               />
 
               <button
                 type="button"
-                disabled={!inputText.trim() || sending}
+                disabled={!inputText.trim()}
                 onClick={() => handleSend()}
                 aria-label="发送消息"
                 className="w-9 h-9 rounded-xl bg-[#5B7A95] hover:bg-[#4B6882] text-white flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40 disabled:hover:bg-[#5B7A95]"

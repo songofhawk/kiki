@@ -25,6 +25,10 @@ DEFAULT_GEMINI_FALLBACK_MODELS: tuple[str, ...] = (
 )
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_ZHIPU_MODEL = "glm-4-flash"
+DEFAULT_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_JEV_MODEL = "jev-latest"
+DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1"
 
 
 def _parse_model_list(raw: str) -> tuple[str, ...]:
@@ -51,6 +55,12 @@ class Settings:
     deepseek_api_key: str = ""
     deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
     deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
+    zhipu_api_key: str = ""
+    zhipu_model: str = DEFAULT_ZHIPU_MODEL
+    zhipu_base_url: str = DEFAULT_ZHIPU_BASE_URL
+    jev_api_key: str = ""
+    jev_model: str = DEFAULT_JEV_MODEL
+    jev_base_url: str = DEFAULT_JEV_BASE_URL
     default_heavy_agent: str = "gemini_agent"
     tavily_api_key: str = ""
     serper_api_key: str = ""
@@ -72,8 +82,23 @@ class Settings:
         return bool(key) and key != "your_deepseek_api_key"
 
     @property
+    def zhipu_configured(self) -> bool:
+        key = self.zhipu_api_key.strip()
+        return bool(key) and key != "your_zhipu_api_key"
+
+    @property
+    def jev_configured(self) -> bool:
+        key = self.jev_api_key.strip()
+        return bool(key) and key != "your_jev_api_key"
+
+    @property
     def any_llm_configured(self) -> bool:
-        return self.api_key_configured or self.deepseek_configured
+        return (
+            self.api_key_configured
+            or self.deepseek_configured
+            or self.zhipu_configured
+            or self.jev_configured
+        )
 
     @property
     def resolved_gemini_models(self) -> list[str]:
@@ -138,6 +163,12 @@ def load_settings() -> Settings:
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         deepseek_model=os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
         deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/"),
+        zhipu_api_key=os.getenv("ZHIPU_API_KEY", ""),
+        zhipu_model=os.getenv("ZHIPU_MODEL", DEFAULT_ZHIPU_MODEL),
+        zhipu_base_url=os.getenv("ZHIPU_BASE_URL", DEFAULT_ZHIPU_BASE_URL).rstrip("/"),
+        jev_api_key=os.getenv("JEV_KEY") or os.getenv("JEV_API_KEY", ""),
+        jev_model=os.getenv("JEV_MODEL", DEFAULT_JEV_MODEL),
+        jev_base_url=os.getenv("JEV_BASE_URL", DEFAULT_JEV_BASE_URL).rstrip("/"),
         default_heavy_agent=os.getenv("KIKI_DEFAULT_HEAVY_AGENT", "gemini_agent"),
         workspace_root=workspace_root,
         database_path=db_path,

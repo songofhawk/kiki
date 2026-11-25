@@ -15,7 +15,6 @@ from .base import (
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .deepseek_harness import DeepSeekHarnessAdapter
-from .doubao_work import DoubaoWorkAdapter
 from .gemini_agent import GeminiAgentAdapter
 from .kcode import KCodeAdapter
 from .qoder import QoderAdapter
@@ -32,7 +31,6 @@ __all__ = [
     "ClaudeCodeAdapter",
     "CodexAdapter",
     "DeepSeekHarnessAdapter",
-    "DoubaoWorkAdapter",
     "ExecutionProfile",
     "GeminiAgentAdapter",
     "HeavyTaskAdapter",

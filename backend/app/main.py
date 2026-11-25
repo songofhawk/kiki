@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,20 +78,35 @@ def create_app(
         adapter_registry=registry,
         settings=cfg,
     )
-    decision_router = DecisionRouter(db=database, llm=llm_client, event_bus=bus)
+    decision_router = DecisionRouter(
+        db=database,
+        llm=llm_client,
+        event_bus=bus,
+        adapter_registry=registry,
+    )
     fast_path = FastPathService(
         db=database,
         llm=llm_client,
         event_bus=bus,
-        idle_status_provider=task_manager.compute_kiki_status,
     )
+
+    def compute_global_kiki_status() -> Literal["idle", "thinking", "running", "waiting_input"]:
+        run_status = task_manager.compute_kiki_status()
+        if run_status == "waiting_input":
+            return "waiting_input"
+        if decision_router.is_busy or fast_path.is_busy:
+            return "thinking"
+        return run_status
+
+    task_manager.set_status_provider(compute_global_kiki_status)
+    decision_router.set_status_provider(compute_global_kiki_status)
+    fast_path.set_idle_status_provider(compute_global_kiki_status)
+
     dream_consolidator = DreamConsolidator(
         db=database,
         llm=llm_client,
         event_bus=bus,
-        is_busy_provider=lambda: (
-            fast_path.is_busy or task_manager.compute_kiki_status() != "idle"
-        ),
+        is_busy_provider=lambda: compute_global_kiki_status() != "idle",
     )
 
     @asynccontextmanager
@@ -328,6 +343,7 @@ def create_app(
                 content=req.content,
                 focus_topic_id=req.focus_topic_id,
                 force_path=req.force_path,
+                force_agent_type=req.agent_type,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -352,20 +368,15 @@ def create_app(
         session_run: Optional[dict[str, Any]] = None
 
         if decision.path == "heavy":
-            explicit_agent = registry.detect_requested_agent(req.content)
-            routed_agent = registry.try_resolve_type(decision.agent_type)
-            history_agent: Optional[str] = None
-            if not explicit_agent and (not routed_agent or routed_agent == "gemini_agent"):
-                topic_history = database.get_topic_history(topic["id"], limit=10)
-                for hist_msg in reversed(topic_history):
-                    if hist_msg.get("role") == "user" and hist_msg.get("content") != req.content:
-                        detected = registry.detect_requested_agent(hist_msg.get("content", ""))
-                        if detected:
-                            history_agent = detected
-                            break
-            resolved_agent_type = explicit_agent or history_agent or routed_agent or req.agent_type
-            if resolved_agent_type and decision.agent_type != resolved_agent_type:
-                decision = decision.model_copy(update={"agent_type": resolved_agent_type})
+            resolved_agent_type = (
+                (req.agent_type.strip() if req.agent_type and req.agent_type.strip() else None)
+                or registry.try_resolve_type(decision.agent_type)
+                or "gemini_agent"
+            )
+            if decision.agent_type != resolved_agent_type:
+                canonical = registry.try_resolve_type(resolved_agent_type)
+                if canonical:
+                    decision = decision.model_copy(update={"agent_type": canonical})
             try:
                 session_run = task_manager.enqueue_run(
                     topic_id=topic["id"],

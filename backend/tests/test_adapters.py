@@ -21,7 +21,6 @@ from app.adapters import (
     ClaudeCodeAdapter,
     CodexAdapter,
     DeepSeekHarnessAdapter,
-    DoubaoWorkAdapter,
     GeminiAgentAdapter,
     KCodeAdapter,
     QoderAdapter,
@@ -48,7 +47,6 @@ ALL_ADAPTER_IDS = [
     "kcode",
     "qoder",
     "workbuddy",
-    "doubao_work",
 ]
 
 
@@ -122,8 +120,6 @@ def test_registry_contains_all_ten_adapters_and_aliases():
     assert registry.resolve_type("kimi") == "kcode"
     assert registry.resolve_type("qodercli") == "qoder"
     assert registry.resolve_type("codebuddy") == "workbuddy"
-    assert registry.resolve_type("豆包工作") == "doubao_work"
-    assert registry.resolve_type("ark") == "doubao_work"
 
     with pytest.raises(KeyError):
         registry.resolve_type("nonexistent_agent_xyz")
@@ -162,6 +158,15 @@ def test_auto_thinking_level_and_model_selection():
         assert p_override.thinking_level == "high"
 
 
+def test_codex_probe_uses_local_config_model(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(CodexAdapter, "_read_local_config_model", staticmethod(lambda: "gpt-6.1-terra"))
+    codex = CodexAdapter()
+    info = codex.probe()
+    assert info.default_model == "gpt-6.1-terra"
+    profile = codex.select_profile("帮我生成一张猫猫图")
+    assert profile.model == "gpt-6.1-terra"
+
+
 def test_command_and_resume_building_for_all_cli_adapters(tmp_path: Path):
     ctx = _make_context(tmp_path, "修复 auth.py 中的竞态条件")
     decision = {"decision": "approve", "approved": True, "comment": "可以继续"}
@@ -175,7 +180,6 @@ def test_command_and_resume_building_for_all_cli_adapters(tmp_path: Path):
         KCodeAdapter(),
         QoderAdapter(),
         WorkBuddyAdapter(),
-        DoubaoWorkAdapter(),
     ]
 
     for adapter in adapters:
@@ -263,7 +267,6 @@ def test_stream_json_parsing_for_codex_claude_and_chinese_adapters(tmp_path: Pat
         KCodeAdapter(),
         QoderAdapter(),
         WorkBuddyAdapter(),
-        DoubaoWorkAdapter(),
     ):
         st = StreamParseState()
         adapter.parse_stdout_line(
@@ -347,44 +350,6 @@ print(json.dumps({{"type": "result", "session_id": "sess_e2e_1", "result": "Clou
             json={"content": "hello", "force_path": "heavy", "agent_type": "unknown_xyz"},
         )
         assert bad_res.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_doubao_work_hybrid_ark_api_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.delenv("KIKI_DOUBAO_WORK_BIN", raising=False)
-    monkeypatch.setenv("ARK_API_KEY", "test-ark-secret")
-    monkeypatch.setenv("ARK_ENDPOINT_ID", "ep-test-doubao")
-
-    adapter = DoubaoWorkAdapter()
-    ctx = _make_context(tmp_path, "帮我整理一份架构优化建议")
-
-    fake_response = MagicMock()
-    fake_response.status_code = 200
-    fake_response.raise_for_status = MagicMock()
-    fake_response.json.return_value = {
-        "id": "chatcmpl_ark_01",
-        "choices": [
-            {"message": {"role": "assistant", "content": "豆包工作（火山方舟）已完成架构优化建议整理。"}}
-        ],
-    }
-
-    fake_client = MagicMock()
-    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-    fake_client.__aexit__ = AsyncMock(return_value=None)
-    fake_client.post = AsyncMock(return_value=fake_response)
-
-    with patch.object(adapter, "resolve_binary", return_value=None), patch(
-        "httpx.AsyncClient", return_value=fake_client
-    ):
-        info = adapter.probe()
-        assert info.available is True
-        assert info.binary_path == "ark-http-api"
-
-        result = await adapter.execute(ctx)
-        assert "豆包工作" in result.summary
-        assert result.session_id == "chatcmpl_ark_01"
 
 
 @pytest.mark.asyncio
