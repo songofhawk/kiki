@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from .adapters import AdapterRegistry, create_default_registry
 from .config import Settings, get_settings
 from .db import Database
+from .desktop import DesktopDriver, DesktopTakeoverManager, create_desktop_driver
+from .desktop.routes import create_desktop_router
 from .dream import DreamConsolidator
 from .llm import KikiLLMClient
 from .router import DecisionRouter, FastPathService
@@ -83,6 +85,7 @@ def create_app(
     llm: Optional[KikiLLMClient] = None,
     event_bus: Optional[EventBus] = None,
     adapter_registry: Optional[AdapterRegistry] = None,
+    desktop_driver: Optional[DesktopDriver] = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
     database = db or Database(cfg.database_path)
@@ -144,6 +147,15 @@ def create_app(
         event_bus=bus,
         is_busy_provider=lambda: compute_global_kiki_status() != "idle",
     )
+    resolved_desktop_driver = desktop_driver or create_desktop_driver(cfg.desktop_driver)
+    desktop_manager = DesktopTakeoverManager(
+        driver=resolved_desktop_driver,
+        event_bus=bus,
+        enabled=cfg.desktop_takeover_enabled,
+        idle_timeout_seconds=cfg.desktop_idle_timeout_seconds,
+        default_fps=cfg.desktop_default_fps,
+        default_max_width=cfg.desktop_max_width,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -188,6 +200,7 @@ def create_app(
                 except (ValueError, OSError):
                     pass
             await dream_consolidator.shutdown()
+            await desktop_manager.shutdown()
             await fast_path.shutdown()
             await task_manager.shutdown()
             aclose_fn = getattr(llm_client, "aclose", None)
@@ -213,6 +226,13 @@ def create_app(
     app.state.decision_router = decision_router
     app.state.fast_path = fast_path
     app.state.dream_consolidator = dream_consolidator
+    app.state.desktop_manager = desktop_manager
+    app.include_router(
+        create_desktop_router(
+            desktop_manager,
+            configured_api_token=cfg.api_token.strip(),
+        )
+    )
 
     allowed_origins = [o for o in cfg.cors_origins if o and o != "*"]
     app.add_middleware(
