@@ -158,8 +158,28 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     if (!img) return null;
     const rect = img.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
-    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+
+    const natW = img.naturalWidth || rect.width;
+    const natH = img.naturalHeight || rect.height;
+    const containerAspect = rect.width / rect.height;
+    const imageAspect = natW / natH;
+
+    let renderW = rect.width;
+    let renderH = rect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+    if (containerAspect > imageAspect) {
+      renderH = rect.height;
+      renderW = renderH * imageAspect;
+      offsetX = (rect.width - renderW) / 2;
+    } else {
+      renderW = rect.width;
+      renderH = renderW / imageAspect;
+      offsetY = (rect.height - renderH) / 2;
+    }
+
+    const x = Math.max(0, Math.min(1, (e.clientX - rect.left - offsetX) / renderW));
+    const y = Math.max(0, Math.min(1, (e.clientY - rect.top - offsetY) / renderH));
     return { x, y };
   };
 
@@ -220,7 +240,12 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     sendWs({ type: 'input', payload: { action: 'key_tap', key: e.key, modifiers } });
   };
 
-  const handleUpdateConfig = async (patch: { control_mode?: DesktopControlMode; fps?: number; display_index?: number }) => {
+  const handleUpdateConfig = async (patch: {
+    control_mode?: DesktopControlMode;
+    fps?: number;
+    display_index?: number;
+    max_width?: number;
+  }) => {
     if (!session) return;
     try {
       const updated = await updateDesktopSession(session.id, patch);
@@ -229,6 +254,14 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : '更新桌面配置失败');
     }
+  };
+
+  const handleToggleFullscreen = () => {
+    setIsFullscreen((prev) => {
+      const next = !prev;
+      void handleUpdateConfig({ max_width: next ? 1920 : 1280 });
+      return next;
+    });
   };
 
   const handleSwitchSpace = async (payload: { target_index?: number; direction?: 'prev' | 'next' }) => {
@@ -266,10 +299,14 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-3 sm:p-5">
+    <div
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm ${
+        isFullscreen ? 'p-0' : 'p-3 sm:p-5'
+      }`}
+    >
       <div
-        className={`flex flex-col rounded-2xl bg-[#FDFBF8] border border-[#DFD8CC] shadow-2xl overflow-hidden transition-all ${
-          isFullscreen ? 'w-full h-full' : 'w-full max-w-5xl h-[86vh]'
+        className={`flex flex-col bg-[#FDFBF8] border border-[#DFD8CC] shadow-2xl overflow-hidden transition-all ${
+          isFullscreen ? 'w-full h-full rounded-none border-0' : 'w-full max-w-5xl h-[86vh] rounded-2xl'
         }`}
       >
         <DesktopToolbar
@@ -298,7 +335,7 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
             if (!session) return;
             void setDesktopClipboard(session.id, text).catch(() => {});
           }}
-          onToggleFullscreen={() => setIsFullscreen((v) => !v)}
+          onToggleFullscreen={handleToggleFullscreen}
           onClose={onClose}
         />
 
@@ -343,7 +380,7 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
               onMouseUp={handleMouseUp}
               onDoubleClick={handleDoubleClick}
               onWheel={handleWheel}
-              className={`max-w-full max-h-full object-contain ${
+              className={`w-full h-full object-contain ${
                 canControl ? 'cursor-crosshair' : 'cursor-default'
               }`}
             />
