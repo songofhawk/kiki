@@ -10,6 +10,7 @@ import {
   ShieldAlert,
   Sparkles,
   Terminal,
+  ZoomIn,
 } from 'lucide-react';
 import type {
   Message,
@@ -23,6 +24,11 @@ import KikiAvatar from './KikiAvatar';
 import UserAvatar, { useUserProfile } from './UserAvatar';
 import TopicBadge from './TopicBadge';
 import RunStatusCard from './RunStatusCard';
+import {
+  getArtifactUrl,
+  isImageArtifact,
+  type ArtifactPreviewItem,
+} from './ArtifactPreviewModal';
 
 export interface UnifiedMessageListProps {
   messages: Message[];
@@ -50,6 +56,7 @@ export interface UnifiedMessageListProps {
   onOpenLogDrawer: (runId: string) => void;
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
+  onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
   onStarterPrompt: (prompt: string) => void;
 }
 
@@ -266,6 +273,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   onOpenLogDrawer,
   onResumeRun,
   onCancelRun,
+  onPreviewArtifact,
   onStarterPrompt,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -918,14 +926,9 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           const isInterimHeavyMsg = msg.metadata?.source === 'heavy_agent_interim';
           const inlineImageArtifacts =
             !isInterimHeavyMsg && candidateRun?.artifacts?.length
-              ? candidateRun.artifacts.filter((art) => {
-                  const t = (art.file_type || '').toLowerCase();
-                  const p = (art.file_path || '').toLowerCase();
-                  return (
-                    t.includes('image') ||
-                    /\.(png|jpe?g|webp|gif|svg)$/.test(p)
-                  );
-                })
+              ? candidateRun.artifacts.filter((art) =>
+                  isImageArtifact(art.file_type, art.file_path)
+                )
               : [];
 
           return (
@@ -1007,20 +1010,26 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     {renderMarkdownContent(msg.content)}
                   {inlineImageArtifacts.length > 0 && candidateRun && (
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      {inlineImageArtifacts.map((art) => {
-                        const artUrl = `/api/runs/${encodeURIComponent(candidateRun.id)}/artifacts/${encodeURIComponent(art.id)}`;
+                      {inlineImageArtifacts.map((art, artIdx) => {
+                        const artUrl = getArtifactUrl(candidateRun.id, art.id);
                         const fileName = art.file_path.split('/').pop() || art.file_path;
+                        const previewItems: ArtifactPreviewItem[] = inlineImageArtifacts.map(
+                          (artifact) => ({ runId: candidateRun.id, artifact })
+                        );
                         return (
                           <div
                             key={art.id}
                             className="rounded-xl overflow-hidden border border-[#E8E2D9] bg-[#FAF8F5]"
                           >
-                            <a
-                              href={artUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              title="点击在新标签页查看原图"
-                              className="block"
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                if (selectionMode) return;
+                                e.stopPropagation();
+                                onPreviewArtifact?.(previewItems, artIdx);
+                              }}
+                              title="点击放大预览"
+                              className="group/img relative block w-full bg-white cursor-zoom-in focus:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7A95]"
                             >
                               <img
                                 src={artUrl}
@@ -1028,7 +1037,11 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                                 className="w-full max-h-80 object-contain bg-white"
                                 loading="lazy"
                               />
-                            </a>
+                              <span className="pointer-events-none absolute bottom-2 right-2 inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#1F1E1C]/75 text-[11px] font-medium text-[#FAF8F5] opacity-0 group-hover/img:opacity-100 transition-opacity backdrop-blur-sm shadow-sm">
+                                <ZoomIn className="w-3 h-3" />
+                                <span>预览</span>
+                              </span>
+                            </button>
                             <div className="px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] text-[#7A7269] border-t border-[#EFEAE2]">
                               <span className="truncate" title={art.description || fileName}>
                                 {art.description || fileName}
@@ -1036,6 +1049,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                               <a
                                 href={`${artUrl}?download=true`}
                                 download
+                                onClick={(e) => e.stopPropagation()}
                                 className="shrink-0 text-[#5B7A95] hover:underline font-medium"
                               >
                                 下载
@@ -1064,6 +1078,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     onOpenLogDrawer={onOpenLogDrawer}
                     onResumeRun={onResumeRun}
                     onCancelRun={onCancelRun}
+                    onPreviewArtifact={onPreviewArtifact}
                   />
                 )}
               </div>

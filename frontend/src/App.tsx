@@ -48,6 +48,9 @@ import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
 import WorkspaceModal from './components/WorkspaceModal';
+import ArtifactPreviewModal, {
+  type ArtifactPreviewItem,
+} from './components/ArtifactPreviewModal';
 
 type PathOption = 'auto' | 'fast' | 'heavy';
 
@@ -371,6 +374,10 @@ export const App: React.FC = () => {
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [workspaceTargetTopic, setWorkspaceTargetTopic] = useState<Topic | null>(null);
+  const [artifactPreview, setArtifactPreview] = useState<{
+    items: ArtifactPreviewItem[];
+    index: number;
+  } | null>(null);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -1303,7 +1310,7 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (!selectionMode && !quotedMessage) return;
+    if ((!selectionMode && !quotedMessage) || artifactPreview) return;
     const handleEsc = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (selectionMode) {
@@ -1315,7 +1322,16 @@ export const App: React.FC = () => {
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [selectionMode, quotedMessage, exitSelectionMode]);
+  }, [selectionMode, quotedMessage, artifactPreview, exitSelectionMode]);
+
+  const handlePreviewArtifact = useCallback(
+    (items: ArtifactPreviewItem[], initialIndex: number) => {
+      if (items.length === 0) return;
+      const safeIndex = Math.max(0, Math.min(items.length - 1, initialIndex));
+      setArtifactPreview({ items, index: safeIndex });
+    },
+    []
+  );
 
   const handleQuoteMessage = useCallback((message: Message) => {
     setQuotedMessage(message);
@@ -1675,6 +1691,7 @@ export const App: React.FC = () => {
           onOpenLogDrawer={handleOpenLogDrawer}
           onResumeRun={handleResumeRun}
           onCancelRun={handleCancelRun}
+          onPreviewArtifact={handlePreviewArtifact}
           onStarterPrompt={(prompt) => handleSend(prompt)}
         />
 
@@ -1932,6 +1949,18 @@ export const App: React.FC = () => {
           setWorkspaceTargetTopic(null);
         }}
       />
+
+      {/* In-Page Artifact Preview Modal */}
+      {artifactPreview && (
+        <ArtifactPreviewModal
+          items={artifactPreview.items}
+          activeIndex={artifactPreview.index}
+          onChangeIndex={(nextIndex) =>
+            setArtifactPreview((prev) => (prev ? { ...prev, index: nextIndex } : null))
+          }
+          onClose={() => setArtifactPreview(null)}
+        />
+      )}
 
       {/* L3 Geek Log Drawer */}
       <LogDrawer

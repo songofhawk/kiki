@@ -18,6 +18,10 @@ import {
 } from 'lucide-react';
 import type { HitlOption, ResumeRunPayload, SessionRun } from '../types';
 import KikiAvatar from './KikiAvatar';
+import {
+  getArtifactUrl,
+  type ArtifactPreviewItem,
+} from './ArtifactPreviewModal';
 
 export interface RunStatusCardProps {
   sessionRun: SessionRun;
@@ -25,6 +29,7 @@ export interface RunStatusCardProps {
   onOpenLogDrawer: (runId: string) => void;
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
+  onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
 }
 
 function parseTimestamp(ts?: string | null): number {
@@ -42,21 +47,6 @@ function formatElapsed(ms: number): string {
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-}
-
-function isImageArtifact(fileType: string, filePath: string): boolean {
-  const t = (fileType || '').toLowerCase();
-  const p = (filePath || '').toLowerCase();
-  return (
-    t.includes('image') ||
-    t.includes('png') ||
-    t.includes('jpg') ||
-    t.includes('jpeg') ||
-    t.includes('webp') ||
-    t.includes('gif') ||
-    t.includes('svg') ||
-    /\.(png|jpe?g|webp|gif|svg)$/.test(p)
-  );
 }
 
 function getArtifactIcon(fileType: string) {
@@ -93,13 +83,11 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   onOpenLogDrawer,
   onResumeRun,
   onCancelRun,
+  onPreviewArtifact,
 }) => {
   const [expanded, setExpanded] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [hitlComment, setHitlComment] = useState('');
-  const [previewArtifactId, setPreviewArtifactId] = useState<string | null>(null);
-  const [previewContent, setPreviewContent] = useState<Record<string, string>>({});
-  const [previewLoading, setPreviewLoading] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
   const isActive =
@@ -137,33 +125,12 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
     }
   };
 
-  const handleToggleArtifactPreview = async (artifactId: string, isImage = false) => {
-    if (previewArtifactId === artifactId) {
-      setPreviewArtifactId(null);
-      return;
-    }
-    setPreviewArtifactId(artifactId);
-    if (isImage) return;
-    if (previewContent[artifactId] !== undefined) return;
-    setPreviewLoading(true);
-    try {
-      const res = await fetch(
-        `/api/runs/${encodeURIComponent(sessionRun.id)}/artifacts/${encodeURIComponent(artifactId)}`
-      );
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      setPreviewContent((prev) => ({
-        ...prev,
-        [artifactId]: text.length > 8000 ? `${text.slice(0, 8000)}\n... (已截断，请点击下载完整文件)` : text,
-      }));
-    } catch {
-      setPreviewContent((prev) => ({
-        ...prev,
-        [artifactId]: '无法预览该产物内容，请尝试下载查看。',
-      }));
-    } finally {
-      setPreviewLoading(false);
-    }
+  const handleOpenArtifactPreview = (index: number) => {
+    if (!onPreviewArtifact || artifacts.length === 0) return;
+    onPreviewArtifact(
+      artifacts.map((artifact) => ({ runId: sessionRun.id, artifact })),
+      index
+    );
   };
 
   const handleCancel = async (e: React.MouseEvent) => {
@@ -367,36 +334,41 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                   生成产物 ({artifacts.length})
                 </div>
                 <div className="space-y-1.5">
-                  {artifacts.map((art) => {
-                    const artUrl = `/api/runs/${encodeURIComponent(sessionRun.id)}/artifacts/${encodeURIComponent(art.id)}`;
-                    const isImage = isImageArtifact(art.file_type, art.file_path);
-                    const isPreviewOpen = previewArtifactId === art.id;
+                  {artifacts.map((art, artIdx) => {
+                    const artUrl = getArtifactUrl(sessionRun.id, art.id);
                     return (
                       <div
                         key={art.id}
                         className="rounded-xl bg-white border border-[#E8E2D9] overflow-hidden"
                       >
                         <div className="flex items-start gap-2.5 px-2.5 py-2">
-                          {getArtifactIcon(art.file_type)}
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs font-mono font-medium text-[#262422] truncate">
-                              {art.file_path}
-                            </div>
-                            {art.description && (
-                              <div className="text-[11px] text-[#7A7269] mt-0.5">
-                                {art.description}
+                          <button
+                            type="button"
+                            onClick={() => handleOpenArtifactPreview(artIdx)}
+                            title="点击弹窗预览产物"
+                            className="flex items-start gap-2.5 min-w-0 flex-1 text-left group/art"
+                          >
+                            {getArtifactIcon(art.file_type)}
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-mono font-medium text-[#262422] group-hover/art:text-[#456B8A] truncate transition-colors">
+                                {art.file_path}
                               </div>
-                            )}
-                          </div>
+                              {art.description && (
+                                <div className="text-[11px] text-[#7A7269] mt-0.5">
+                                  {art.description}
+                                </div>
+                              )}
+                            </div>
+                          </button>
                           <div className="flex items-center gap-1 shrink-0">
                             <button
                               type="button"
-                              onClick={() => void handleToggleArtifactPreview(art.id, isImage)}
-                              title="在线预览产物"
+                              onClick={() => handleOpenArtifactPreview(artIdx)}
+                              title="弹窗预览产物"
                               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-[#FAF8F5] hover:bg-[#EFEAE2] border border-[#E8E2D9] text-[#4E4842] transition-colors"
                             >
                               <Eye className="w-3 h-3 text-[#5B7A95]" />
-                              <span>{isPreviewOpen ? '收起' : '预览'}</span>
+                              <span>预览</span>
                             </button>
                             <a
                               href={`${artUrl}?download=true`}
@@ -409,25 +381,6 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                             </a>
                           </div>
                         </div>
-                        {isPreviewOpen && (
-                          <div className="border-t border-[#EFEAE2] bg-[#FAF8F5] px-3 py-2 max-h-80 overflow-auto">
-                            {isImage ? (
-                              <a href={artUrl} target="_blank" rel="noopener noreferrer" className="block">
-                                <img
-                                  src={artUrl}
-                                  alt={art.description || art.file_path}
-                                  className="max-h-72 max-w-full rounded-lg border border-[#E8E2D9] object-contain mx-auto bg-white"
-                                />
-                              </a>
-                            ) : previewLoading && previewContent[art.id] === undefined ? (
-                              <span className="text-[11px] text-[#8C8378]">正在加载产物内容...</span>
-                            ) : (
-                              <pre className="text-[11px] font-mono text-[#2E2B28] whitespace-pre-wrap break-words leading-relaxed">
-                                {previewContent[art.id] ?? ''}
-                              </pre>
-                            )}
-                          </div>
-                        )}
                       </div>
                     );
                   })}
