@@ -908,6 +908,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                         onOpenLogDrawer={onOpenLogDrawer}
                         onResumeRun={onResumeRun}
                         onCancelRun={onCancelRun}
+                        onPreviewArtifact={onPreviewArtifact}
                         onOpenDesktopTakeover={onOpenDesktopTakeover}
                       />
                     </div>

@@ -455,3 +455,38 @@ class CodexAdapter(SubprocessCLIAdapter):
                 )
             except OSError:
                 continue
+
+        # 3. Scan artifacts_dir for image files saved directly by shell/browser tools during this run
+        started_at = float(state.extra.get("started_at") or 0.0)
+        if ctx.artifacts_dir and ctx.artifacts_dir.is_dir():
+            run_sub = ctx.artifacts_dir / ctx.run_id
+            scan_dirs = [ctx.artifacts_dir] + ([run_sub] if run_sub.is_dir() else [])
+            for scan_dir in scan_dirs:
+                try:
+                    entries = sorted(scan_dir.iterdir(), key=lambda p: p.name)
+                except OSError:
+                    continue
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    if not entry.name.lower().endswith(_IMAGE_EXTENSIONS):
+                        continue
+                    try:
+                        st = entry.stat()
+                        if started_at > 0 and st.st_mtime < started_at - 1.0:
+                            continue
+                        raw_bytes = entry.read_bytes()
+                        if len(raw_bytes) < 64:
+                            continue
+                        digest = hashlib.sha256(raw_bytes).hexdigest()
+                        if digest in seen_hashes:
+                            continue
+                        seen_hashes.add(digest)
+                        ctx.register_binary_artifact(
+                            filename=entry.name,
+                            data=raw_bytes,
+                            file_type="image",
+                            description=f"Codex 截图/图片 {entry.name}",
+                        )
+                    except OSError:
+                        continue

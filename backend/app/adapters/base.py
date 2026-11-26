@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional
@@ -173,6 +174,10 @@ class AdapterContext:
         if self.topic_dir is not None:
             lines.append(f"- 当前话题目录: {self.topic_dir}")
             lines.append(f"- 话题产物目录 (artifacts): {self.artifacts_dir}")
+            lines.append(
+                f"- 图片/截图交付约定: 如需向用户展示截图、登录二维码或生成的图片，"
+                f"请直接保存为图片文件（.png/.jpg）到 {self.artifacts_dir}，切勿在回复中输出 base64 编码。"
+            )
         if self.shared_dir is not None:
             lines.append(f"- 共享资源目录 (shared): {self.shared_dir}")
         if self.rules_dir is not None:
@@ -256,6 +261,9 @@ class AdapterContext:
         line: str,
         stream: Literal["stdout", "stderr", "ndjson"] = "stdout",
     ) -> None:
+        max_len = 8192
+        if len(line) > max_len:
+            line = f"{line[:max_len]}… [truncated {len(line) - max_len} chars]"
         self.event_bus.append_raw_log(self.run_id, line, stream=stream)
 
     def emit_event_log(self, payload: dict[str, Any]) -> None:
@@ -639,7 +647,10 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         stripped = line.strip()
         if not stripped:
             return
-        state.stdout_lines.append(stripped)
+        max_keep = 8192
+        state.stdout_lines.append(
+            stripped if len(stripped) <= max_keep else f"{stripped[:max_keep]}…"
+        )
 
         if stripped.startswith("{") and stripped.endswith("}"):
             try:
@@ -690,27 +701,35 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self.build_env(ctx, profile),
+            limit=4 * 1024 * 1024,
         )
         self._active_procs[ctx.run_id] = proc
 
-        async def _drain_stdout() -> None:
-            if proc.stdout is None:
+        async def _iter_lines(stream: Optional[asyncio.StreamReader]) -> Any:
+            if stream is None:
                 return
+            buf = bytearray()
             while True:
-                raw = await proc.stdout.readline()
-                if not raw:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    if buf:
+                        yield bytes(buf).decode("utf-8", errors="replace").rstrip("\r\n")
                     break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    raw_line = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    yield raw_line.decode("utf-8", errors="replace").rstrip("\r")
+
+        async def _drain_stdout() -> None:
+            async for line in _iter_lines(proc.stdout):
                 self.parse_stdout_line(line, state, ctx)
 
         async def _drain_stderr() -> None:
-            if proc.stderr is None:
-                return
-            while True:
-                raw = await proc.stderr.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            async for line in _iter_lines(proc.stderr):
                 self.parse_stderr_line(line, state, ctx)
 
         try:
@@ -790,6 +809,7 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         )
 
         state = StreamParseState()
+        state.extra["started_at"] = time.time()
         argv = self.build_command(binary, ctx, profile)
         returncode = await self._run_process(argv, ctx, profile, state)
 

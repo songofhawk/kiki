@@ -802,6 +802,126 @@ async def test_task_manager_shutdown_distinguishes_reload_cancel_reason(tmp_path
     assert r2["error_message"] == "服务重启/热重载中断"
 
 
+@pytest.mark.asyncio
+async def test_subprocess_adapter_handles_large_stdout_lines_and_truncates_raw_log(
+    tmp_path: Path,
+) -> None:
+    import sys
+    from app.adapters.base import ExecutionProfile, StreamParseState, SubprocessCLIAdapter
+
+    class EchoBigJSONAdapter(SubprocessCLIAdapter):
+        agent_type = "echo_big"
+        display_name = "Echo Big"
+        vendor = "Test"
+        description = "Emits a >200KB JSONL line"
+        binary_candidates = (sys.executable,)
+
+        def build_command(self, binary: str, ctx: Any, profile: ExecutionProfile) -> list[str]:
+            code = (
+                "import json; "
+                "print(json.dumps({'type': 'mcp_tool_call', 'blob': 'A' * 220000}), flush=True); "
+                "print(json.dumps({'type': 'result', 'result': 'ok-after-big-line'}), flush=True)"
+            )
+            return [binary, "-c", code]
+
+    ctx = _make_context(tmp_path)
+    adapter = EchoBigJSONAdapter()
+    state = StreamParseState()
+    profile = ExecutionProfile(model="test", thinking_level="low", reason="test")
+    rc = await adapter._run_process(
+        adapter.build_command(sys.executable, ctx, profile),
+        ctx,
+        profile,
+        state,
+    )
+    assert rc == 0
+    assert state.best_summary() == "ok-after-big-line"
+    raw_logs = ctx.event_bus.get_raw_logs(ctx.run_id)
+    assert any("[truncated" in entry["line"] for entry in raw_logs)
+
+
+@pytest.mark.asyncio
+async def test_codex_after_process_success_registers_artifacts_dir_images(
+    tmp_path: Path,
+) -> None:
+    import time
+    from app.adapters.base import StreamParseState
+    from app.adapters.codex import CodexAdapter
+
+    ctx = _make_context(tmp_path)
+    state = StreamParseState()
+    state.extra["started_at"] = time.time() - 0.5
+
+    # Simulate Codex saving a login QR screenshot directly to artifacts_dir via shell/browser tool
+    ctx.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    qr_file = ctx.artifacts_dir / "login_qr.png"
+    qr_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 128)
+
+    adapter = CodexAdapter()
+    await adapter.after_process_success(ctx, state)
+
+    run = ctx.db.get_session_run(ctx.run_id)
+    assert run is not None
+    assert len(run["artifacts"]) == 1
+    assert run["artifacts"][0]["file_type"] == "image"
+    assert run["artifacts"][0]["file_path"].endswith("login_qr.png")
+
+
+def test_workbuddy_model_discovery_and_hy4std_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    WorkBuddyAdapter._MODEL_DISCOVERY_CACHE.clear()
+    monkeypatch.delenv("KIKI_WORKBUDDY_MODEL", raising=False)
+    monkeypatch.setattr(WorkBuddyAdapter, "_read_local_config_model", staticmethod(lambda: None))
+
+    # 1. When binary is unavailable, fall back to hy4std across all tiers
+    monkeypatch.setattr(WorkBuddyAdapter, "resolve_binary", lambda self: None)
+    wb = WorkBuddyAdapter()
+    info = wb.probe()
+    assert info.default_model == "hy4std"
+    assert info.models == {"low": "hy4std", "medium": "hy4std", "high": "hy4std"}
+    assert wb.select_profile("列出 README").model == "hy4std"
+    assert wb.select_profile("实现用户分页查询接口").model == "hy4std"
+    assert wb.select_profile("全仓架构重构与并发死锁根因分析").model == "hy4std"
+
+    # 2. When fake codebuddy CLI reports supported models in --help, select from returned list
+    fake_cli = tmp_path / "fake_codebuddy.py"
+    fake_cli.write_text(
+        f"""#!{sys.executable}
+print("Options:")
+print("  --model <model>  Model for the current session. Currently supported: (hy4std, hy4flash-free, hy4flash, deepseek-v4-pro)")
+""",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(WorkBuddyAdapter, "resolve_binary", lambda self: str(fake_cli))
+    WorkBuddyAdapter._MODEL_DISCOVERY_CACHE.clear()
+
+    info2 = wb.probe()
+    assert info2.available is True
+    assert info2.default_model == "hy4std"
+    assert info2.models == {"low": "hy4flash", "medium": "hy4std", "high": "hy4std"}
+    assert wb.select_profile("列出 README").model == "hy4flash"
+    assert wb.select_profile("实现用户分页查询接口").model == "hy4std"
+    assert wb.select_profile("全仓架构重构与并发死锁根因分析").model == "hy4std"
+
+    # 3. When CLI returns a custom list without hy4std, never pick an unsupported model
+    tiers_custom = WorkBuddyAdapter._select_model_tiers(["deepseek-v4.1-flash", "deepseek-v4-pro"])
+    assert tiers_custom == {
+        "low": "deepseek-v4.1-flash",
+        "medium": "deepseek-v4-pro",
+        "high": "deepseek-v4-pro",
+    }
+
+    # 4. Local config model is respected only when valid in supported list
+    monkeypatch.setattr(WorkBuddyAdapter, "_read_local_config_model", staticmethod(lambda: "deepseek-v4-pro"))
+    assert wb.select_profile("实现用户分页查询接口").model == "deepseek-v4-pro"
+    monkeypatch.setattr(WorkBuddyAdapter, "_read_local_config_model", staticmethod(lambda: "removed-model-xyz"))
+    assert wb.select_profile("实现用户分页查询接口").model == "hy4std"
+
+
+
+
 
 
 

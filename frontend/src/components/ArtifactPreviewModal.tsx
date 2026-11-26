@@ -86,7 +86,28 @@ function clampScale(val: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(val * 100) / 100));
 }
 
-function isBinaryContentType(contentType: string): boolean {
+function isKnownTextArtifact(fileType: string, filePath: string): boolean {
+  const t = (fileType || '').toLowerCase();
+  const p = (filePath || '').toLowerCase();
+  return (
+    t.includes('text') ||
+    t.includes('markdown') ||
+    t.includes('code') ||
+    t.includes('json') ||
+    t.includes('yaml') ||
+    t.includes('xml') ||
+    t.includes('csv') ||
+    /\.(md|markdown|txt|log|json|jsonl|ya?ml|toml|csv|tsv|py|tsx?|jsx?|mjs|cjs|css|scss|less|html?|xml|svg|sql|sh|bash|zsh|ini|cfg|conf|rs|go|java|c|cpp|h|hpp)$/.test(
+      p
+    )
+  );
+}
+
+function isBinaryContentType(
+  contentType: string,
+  fileType = '',
+  filePath = ''
+): boolean {
   const ct = contentType.toLowerCase();
   if (!ct) return false;
   if (
@@ -104,8 +125,10 @@ function isBinaryContentType(contentType: string): boolean {
   ) {
     return false;
   }
+  if (ct.startsWith('application/octet-stream')) {
+    return !isKnownTextArtifact(fileType, filePath);
+  }
   return (
-    ct.startsWith('application/octet-stream') ||
     ct.startsWith('application/zip') ||
     ct.startsWith('application/gzip') ||
     ct.startsWith('application/x-tar') ||
@@ -232,7 +255,13 @@ export const ArtifactPreviewModal: React.FC<ArtifactPreviewModalProps> = ({
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const contentType = res.headers.get('content-type') || '';
-        if (isBinaryContentType(contentType)) {
+        if (
+          isBinaryContentType(
+            contentType,
+            currentArtifact?.file_type ?? '',
+            currentArtifact?.file_path ?? ''
+          )
+        ) {
           setTextState({ loading: false, content: null, binary: true, error: null });
           return;
         }
