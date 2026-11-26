@@ -7,16 +7,23 @@ import {
   ChevronUp,
   Clock,
   Download,
+  ExternalLink,
   Eye,
   File,
   FileCode2,
   FileImage,
   FileText,
   Loader2,
+  Monitor,
   Terminal,
   XCircle,
 } from 'lucide-react';
-import type { HitlOption, ResumeRunPayload, SessionRun } from '../types';
+import type {
+  DesktopTakeoverContext,
+  HitlOption,
+  ResumeRunPayload,
+  SessionRun,
+} from '../types';
 import KikiAvatar from './KikiAvatar';
 import {
   getArtifactUrl,
@@ -30,6 +37,7 @@ export interface RunStatusCardProps {
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
   onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
+  onOpenDesktopTakeover?: (ctx: DesktopTakeoverContext) => void;
 }
 
 function parseTimestamp(ts?: string | null): number {
@@ -84,6 +92,7 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   onResumeRun,
   onCancelRun,
   onPreviewArtifact,
+  onOpenDesktopTakeover,
 }) => {
   const [expanded, setExpanded] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
@@ -404,11 +413,31 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
             <div className="flex-1 min-w-0">
               <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-900">
                 <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                Kiki 需要你拍板
+                {hitl?.kind === 'desktop_takeover'
+                  ? 'Kiki 请求接管服务器桌面'
+                  : 'Kiki 需要你拍板'}
               </div>
               <p className="mt-1 text-sm text-[#2E271E] leading-relaxed">
                 {hitl?.prompt || sessionRun.current_step || '后台任务需要你的确认才能继续执行。'}
               </p>
+
+              {hitl?.kind === 'desktop_takeover' && hitl.instructions && (
+                <p className="mt-1 text-xs text-amber-900/90 leading-relaxed">
+                  {hitl.instructions}
+                </p>
+              )}
+
+              {hitl?.kind === 'desktop_takeover' && hitl.url && (
+                <a
+                  href={hitl.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-flex items-center gap-1 text-xs text-[#456B8A] hover:underline break-all"
+                >
+                  <ExternalLink className="w-3 h-3 shrink-0" />
+                  {hitl.url}
+                </a>
+              )}
 
               <input
                 type="text"
@@ -420,6 +449,25 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
               />
 
               <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                {hitl?.kind === 'desktop_takeover' && onOpenDesktopTakeover && (
+                  <button
+                    type="button"
+                    disabled={actionBusy}
+                    onClick={() =>
+                      onOpenDesktopTakeover({
+                        runId: sessionRun.id,
+                        topicId: sessionRun.topic_id,
+                        reason: hitl.prompt,
+                        instructions: hitl.instructions,
+                        url: hitl.url,
+                      })
+                    }
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-[#262422] hover:bg-[#3B3734] text-white border border-transparent shadow-sm transition-all active:scale-[0.98] disabled:opacity-50"
+                  >
+                    <Monitor className="w-3.5 h-3.5" />
+                    接管服务器桌面
+                  </button>
+                )}
                 {(hitl?.options && hitl.options.length > 0
                   ? hitl.options
                   : FALLBACK_HITL_OPTIONS

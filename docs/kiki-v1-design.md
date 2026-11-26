@@ -225,11 +225,14 @@ CREATE TABLE IF NOT EXISTS workspace_mounts (
 * **L3 极客层（点击右上角 `>_` 终端图标）**：
   * 右侧弹出 Log Drawer，展示后台 Agent 原生的 Terminal NDJSON/Shell 标准输出流。
 
-### 5. HITL 人工拍板卡片
+### 5. HITL 人工拍板与服务器桌面接管卡片
 当 `status == 'waiting_input'` 时：
-* 触发高亮黄色边框卡片，卡片左侧为举爪 Kiki (`waiting_input`)。
-* 提示文本：“Kiki 需要你拍板：是否允许重启 3 个异常容器？”
-* 卡片底部渲染快捷选项按钮（如 `[ 同意重启 ]` `[ 拒绝并终止 ]`）。用户点击按钮直接推送 `--resume` 信号，无需手打文本。
+* **常规审批拍板（`kind == 'approval'`）**：触发高亮黄色边框卡片，卡片左侧为举爪 Kiki (`waiting_input`)，展示提示文本与快捷选项按钮（如 `[ 同意重启 ]` `[ 拒绝并终止 ]`），点击直接推送 `/resume` 信号。
+* **服务器桌面接管（`kind == 'desktop_takeover'`，模仿 Grok Bot）**：
+  * 当内置 Agent 遇到登录/2FA、图形验证码、OAuth 授权或桌面弹窗等必须人工介入的场景时，调用 `request_desktop_takeover` 挂起任务，并在卡片上渲染 `[ 接管服务器桌面 ]` 主按钮与操作指引；
+  * 用户也可随时点击顶部工具栏「桌面接管」按钮主动查看或接管 Kiki 服务器桌面；
+  * 后端通过 `/api/desktop/status`、`/api/desktop/sessions` 及 `/api/desktop/sessions/{id}/ws` 提供独占会话锁、短时令牌鉴权、只读/控制模式切换、多显示器与 FPS 调节、剪贴板同步及空闲自动回收（V1 原生支持 macOS CoreGraphics + `screencapture` 与测试用 Mock 驱动）；
+  * 在接管弹窗内处理完毕后点击 `[ 我已处理完成，交还给 Kiki ]`，自动结束接管会话并恢复挂起的 `SessionRun`。
 
 ### 6. 跨话题异步通知
 当用户正在 Topic B 聊天，而后台 Topic A 的 `SessionRun` 完成时：

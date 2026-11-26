@@ -57,6 +57,7 @@ export interface UnifiedMessageListProps {
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
   onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
+  onOpenDesktopTakeover?: (ctx: import('../types').DesktopTakeoverContext) => void;
   onStarterPrompt: (prompt: string) => void;
 }
 
@@ -274,6 +275,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   onResumeRun,
   onCancelRun,
   onPreviewArtifact,
+  onOpenDesktopTakeover,
   onStarterPrompt,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -906,6 +908,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                         onOpenLogDrawer={onOpenLogDrawer}
                         onResumeRun={onResumeRun}
                         onCancelRun={onCancelRun}
+                        onOpenDesktopTakeover={onOpenDesktopTakeover}
                       />
                     </div>
                   )}
@@ -1079,6 +1082,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     onResumeRun={onResumeRun}
                     onCancelRun={onCancelRun}
                     onPreviewArtifact={onPreviewArtifact}
+                    onOpenDesktopTakeover={onOpenDesktopTakeover}
                   />
                 )}
               </div>

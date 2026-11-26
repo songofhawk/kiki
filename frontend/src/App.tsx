@@ -8,6 +8,7 @@ import {
   GitBranchPlus,
   Lock,
   Menu,
+  Monitor,
   Send,
   Sparkles,
   X,
@@ -31,6 +32,7 @@ import {
 import type {
   AdapterInfo,
   BatchReassignTopicPayload,
+  DesktopTakeoverContext,
   HealthResponse,
   KikiStatus,
   Message,
@@ -48,6 +50,7 @@ import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
 import WorkspaceModal from './components/WorkspaceModal';
+import DesktopTakeoverModal from './components/DesktopTakeoverModal';
 import ArtifactPreviewModal, {
   type ArtifactPreviewItem,
 } from './components/ArtifactPreviewModal';
@@ -374,6 +377,9 @@ export const App: React.FC = () => {
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [workspaceTargetTopic, setWorkspaceTargetTopic] = useState<Topic | null>(null);
+  const [desktopModalOpen, setDesktopModalOpen] = useState(false);
+  const [desktopContext, setDesktopContext] = useState<DesktopTakeoverContext | null>(null);
+  const [desktopSessionActive, setDesktopSessionActive] = useState(false);
   const [artifactPreview, setArtifactPreview] = useState<{
     items: ArtifactPreviewItem[];
     index: number;
@@ -877,6 +883,9 @@ export const App: React.FC = () => {
             t.id === payload.topic_id ? { ...t, unread: true } : t
           )
         );
+      },
+      onDesktopSessionUpdated: (payload) => {
+        setDesktopSessionActive(Boolean(payload.active));
       },
     });
 
@@ -1635,6 +1644,21 @@ export const App: React.FC = () => {
             <button
               type="button"
               onClick={() => {
+                setDesktopContext(null);
+                setDesktopModalOpen(true);
+              }}
+              title="接管 Kiki 服务器桌面（实时画面与远程操控）"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-[#5A534C] bg-white hover:bg-[#F3EFE9] border border-[#E5DED4] transition-colors"
+            >
+              <Monitor className="w-3.5 h-3.5 text-[#D97706]" />
+              <span className="hidden sm:inline">桌面接管</span>
+              {desktopSessionActive && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setWorkspaceTargetTopic(focusedTopic);
                 setWorkspaceModalOpen(true);
               }}
@@ -1692,6 +1716,10 @@ export const App: React.FC = () => {
           onResumeRun={handleResumeRun}
           onCancelRun={handleCancelRun}
           onPreviewArtifact={handlePreviewArtifact}
+          onOpenDesktopTakeover={(ctx) => {
+            setDesktopContext(ctx);
+            setDesktopModalOpen(true);
+          }}
           onStarterPrompt={(prompt) => handleSend(prompt)}
         />
 
@@ -1948,6 +1976,17 @@ export const App: React.FC = () => {
           setWorkspaceModalOpen(false);
           setWorkspaceTargetTopic(null);
         }}
+      />
+
+      {/* Server Desktop Takeover Modal */}
+      <DesktopTakeoverModal
+        open={desktopModalOpen}
+        context={desktopContext}
+        onClose={() => {
+          setDesktopModalOpen(false);
+          setDesktopContext(null);
+        }}
+        onResumeRun={handleResumeRun}
       />
 
       {/* In-Page Artifact Preview Modal */}
