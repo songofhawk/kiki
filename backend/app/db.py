@@ -947,22 +947,34 @@ class Database:
         self,
         limit: int = 10,
         topic_id: Optional[str] = None,
+        exclude_interim: bool = False,
     ) -> list[dict[str, Any]]:
+        interim_clause = (
+            " AND COALESCE(json_extract(metadata, '$.source'), '') != 'heavy_agent_interim'"
+            if exclude_interim
+            else ""
+        )
         with self._connect() as conn:
             if topic_id:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM messages
-                    WHERE topic_id = ?
+                    WHERE topic_id = ?{interim_clause}
                     ORDER BY rowid DESC
                     LIMIT ?
                     """,
                     (topic_id, limit),
                 ).fetchall()
             else:
+                where_clause = (
+                    "WHERE COALESCE(json_extract(metadata, '$.source'), '') != 'heavy_agent_interim'"
+                    if exclude_interim
+                    else ""
+                )
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM messages
+                    {where_clause}
                     ORDER BY rowid DESC
                     LIMIT ?
                     """,

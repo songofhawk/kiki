@@ -1,8 +1,9 @@
-import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   Check,
   ChevronUp,
+  CornerUpLeft,
   GripVertical,
   Loader2,
   MessageCircle,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import type {
   Message,
+  QuotedMessageSnapshot,
   ReassignTopicPayload,
   ResumeRunPayload,
   SessionRun,
@@ -39,6 +41,7 @@ export interface UnifiedMessageListProps {
   selectedMessageIds?: Set<string>;
   onToggleSelectMessage?: (messageId: string, shiftKey?: boolean) => void;
   onStartMultiSelect?: (messageId: string) => void;
+  onQuoteMessage?: (message: Message) => void;
   onSelectTopic: (topicId: string) => void;
   onReassignMessage: (
     messageId: string,
@@ -257,6 +260,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   selectedMessageIds,
   onToggleSelectMessage,
   onStartMultiSelect,
+  onQuoteMessage,
   onSelectTopic,
   onReassignMessage,
   onOpenLogDrawer,
@@ -266,8 +270,76 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const messageRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const highlightTimerRef = useRef<number | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const touchStartPosRef = useRef<{ x: number; y: number } | null>(null);
+  const longPressTriggeredRef = useRef<boolean>(false);
   const [userProfile] = useUserProfile();
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+
+  const messagesById = useMemo(() => {
+    const map: Record<string, Message> = {};
+    for (const m of messages) {
+      map[m.id] = m;
+    }
+    return map;
+  }, [messages]);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    touchStartPosRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearLongPressTimer();
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, [clearLongPressTimer]);
+
+  const handleJumpToMessage = useCallback((targetId: string) => {
+    const targetEl = messageRowRefs.current[targetId];
+    if (!targetEl) return;
+    targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setHighlightedMessageId(targetId);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedMessageId((prev) => (prev === targetId ? null : prev));
+      highlightTimerRef.current = null;
+    }, 1600);
+  }, []);
+
+  const getQuotedSnapshot = useCallback(
+    (msg: Message): QuotedMessageSnapshot | null => {
+      const snap = msg.metadata?.quoted_message;
+      if (snap && typeof snap === 'object' && typeof snap.id === 'string') {
+        return snap;
+      }
+      const qId = msg.metadata?.quoted_message_id;
+      if (typeof qId === 'string' && messagesById[qId]) {
+        const refMsg = messagesById[qId];
+        return {
+          id: refMsg.id,
+          role: refMsg.role,
+          content: refMsg.content,
+          topic_id: refMsg.topic_id,
+          topic_title: topicsById[refMsg.topic_id]?.title ?? refMsg.topic?.title ?? null,
+          created_at: refMsg.created_at,
+        };
+      }
+      return null;
+    },
+    [messagesById, topicsById]
+  );
 
   const viewKey = focusTopicId ?? '__all__';
   const prevViewKeyRef = useRef<string>(viewKey);
@@ -590,6 +662,124 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             onToggleSelectMessage(msg.id, e.shiftKey);
           };
 
+          const msgIsStreaming = Boolean(msg.streaming ?? msg.metadata?.streaming);
+          const isQuotable =
+            !isSystem &&
+            !msg.metadata?.optimistic &&
+            !(msgIsStreaming && !msg.content.trim()) &&
+            Boolean(onQuoteMessage);
+          const isHighlighted = highlightedMessageId === msg.id;
+          const quotedSnapshot = getQuotedSnapshot(msg);
+
+          const handleTouchStart = (e: React.TouchEvent) => {
+            if (selectionMode || !isQuotable || !onQuoteMessage) return;
+            if (e.touches.length !== 1) return;
+            const touch = e.touches[0];
+            touchStartPosRef.current = { x: touch.clientX, y: touch.clientY };
+            longPressTriggeredRef.current = false;
+            clearLongPressTimer();
+            longPressTimerRef.current = window.setTimeout(() => {
+              longPressTimerRef.current = null;
+              longPressTriggeredRef.current = true;
+              if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+                try {
+                  navigator.vibrate(15);
+                } catch {
+                  // ignore unsupported vibrate
+                }
+              }
+              try {
+                window.getSelection()?.removeAllRanges();
+              } catch {
+                // ignore
+              }
+              onQuoteMessage(msg);
+              window.setTimeout(() => {
+                longPressTriggeredRef.current = false;
+              }, 500);
+            }, 450);
+          };
+
+          const handleTouchMove = (e: React.TouchEvent) => {
+            if (!touchStartPosRef.current || e.touches.length !== 1) {
+              clearLongPressTimer();
+              return;
+            }
+            const touch = e.touches[0];
+            const dx = Math.abs(touch.clientX - touchStartPosRef.current.x);
+            const dy = Math.abs(touch.clientY - touchStartPosRef.current.y);
+            if (dx > 10 || dy > 10) {
+              clearLongPressTimer();
+            }
+          };
+
+          const handleTouchEndOrCancel = () => {
+            clearLongPressTimer();
+          };
+
+          const handleBubbleContextMenu = (e: React.MouseEvent) => {
+            if (longPressTriggeredRef.current) {
+              e.preventDefault();
+            }
+          };
+
+          const renderQuotedBlock = (forUserBubble: boolean) => {
+            if (!quotedSnapshot) return null;
+            const quotedSender =
+              quotedSnapshot.role === 'user'
+                ? userProfile.name
+                : quotedSnapshot.role === 'assistant'
+                  ? 'Kiki'
+                  : '系统';
+            const canJump = Boolean(messagesById[quotedSnapshot.id]);
+            const preview = quotedSnapshot.content.replace(/\s+/g, ' ').trim() || '（空消息）';
+            return (
+              <button
+                type="button"
+                onClick={(e) => {
+                  if (selectionMode) return;
+                  e.stopPropagation();
+                  if (canJump) {
+                    handleJumpToMessage(quotedSnapshot.id);
+                  }
+                }}
+                title={canJump ? '点击定位到被引用的原消息' : '被引用的历史消息'}
+                className={`mb-2 w-full text-left rounded-xl px-2.5 py-1.5 border-l-2 transition-colors ${
+                  forUserBubble
+                    ? 'bg-white/10 border-[#8FB3D1] text-[#E8E2D9] hover:bg-white/15'
+                    : 'bg-[#F5F1EB] border-[#5B7A95] text-[#5A534C] hover:bg-[#EFE9E0]'
+                } ${canJump && !selectionMode ? 'cursor-pointer' : 'cursor-default'}`}
+              >
+                <div className="flex items-center gap-1.5 text-[11px] font-medium opacity-85">
+                  <CornerUpLeft className="w-3 h-3 shrink-0" />
+                  <span className="truncate">{quotedSender}</span>
+                </div>
+                <div className="mt-0.5 text-xs opacity-85 line-clamp-2 break-words leading-snug">
+                  {preview}
+                </div>
+              </button>
+            );
+          };
+
+          const renderQuoteButton = () => {
+            if (selectionMode || !isQuotable || !onQuoteMessage) return null;
+            return (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onQuoteMessage(msg);
+                }}
+                title="引用此消息并归属到其所属话题"
+                aria-label="引用此消息"
+                className="hidden sm:inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium text-[#7A7269] hover:text-[#3B5972] bg-white/90 hover:bg-[#EAF0F5] border border-[#E5DED4] hover:border-[#CFE0EC] shadow-sm opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all shrink-0 self-end mb-0.5"
+              >
+                <CornerUpLeft className="w-3 h-3" />
+                <span>引用</span>
+              </button>
+            );
+          };
+
           const renderCheckbox = () => {
             if (!selectionMode || !isSelectable) return null;
             return (
@@ -628,10 +818,15 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
             return (
               <div
                 key={msg.id}
+                ref={(el) => {
+                  messageRowRefs.current[msg.id] = el;
+                }}
                 onClick={selectionMode ? handleRowSelectClick : undefined}
-                className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
+                className={`group flex items-start justify-end gap-2.5 animate-kiki-fade-up rounded-2xl transition-all ${
                   selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
-                } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''}`}
+                } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''} ${
+                  isHighlighted ? 'bg-[#EAF0F5]/80 ring-2 ring-[#5B7A95]/45 p-1.5 -m-1.5' : ''
+                }`}
               >
                 {renderCheckbox()}
 
@@ -680,8 +875,19 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     </span>
                   </div>
 
-                  <div className="max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words">
-                    {msg.content}
+                  <div className="w-full flex items-end justify-end gap-1.5">
+                    {renderQuoteButton()}
+                    <div
+                      onTouchStart={handleTouchStart}
+                      onTouchMove={handleTouchMove}
+                      onTouchEnd={handleTouchEndOrCancel}
+                      onTouchCancel={handleTouchEndOrCancel}
+                      onContextMenu={handleBubbleContextMenu}
+                      className="max-w-[85%] sm:max-w-[78%] rounded-2xl rounded-tr-sm bg-[#34312E] text-[#FAF8F5] px-4 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap break-words"
+                    >
+                      {renderQuotedBlock(true)}
+                      {msg.content}
+                    </div>
                   </div>
 
                   {sessionRun && (
@@ -708,7 +914,6 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           // Assistant message:
           // Completed messages stay completely static (`animated={false}`);
           // Only the actively streaming message animates (`thinking`).
-          const msgIsStreaming = Boolean(msg.streaming ?? msg.metadata?.streaming);
           const isActivelyStreaming = Boolean(msgIsStreaming && msg.id === latestStreamingMsgId);
           const isInterimHeavyMsg = msg.metadata?.source === 'heavy_agent_interim';
           const inlineImageArtifacts =
@@ -726,10 +931,15 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           return (
             <div
               key={msg.id}
+              ref={(el) => {
+                messageRowRefs.current[msg.id] = el;
+              }}
               onClick={selectionMode ? handleRowSelectClick : undefined}
-              className={`group flex items-start gap-2.5 animate-kiki-fade-up rounded-2xl transition-colors ${
+              className={`group flex items-start gap-2.5 animate-kiki-fade-up rounded-2xl transition-all ${
                 selectionMode && isSelectable ? 'cursor-pointer p-1.5 -m-1.5' : ''
-              } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''}`}
+              } ${isSelected ? 'bg-[#EAF0F5]/65 ring-1 ring-[#5B7A95]/30' : ''} ${
+                isHighlighted ? 'bg-[#EAF0F5]/80 ring-2 ring-[#5B7A95]/45 p-1.5 -m-1.5' : ''
+              }`}
             >
               {renderCheckbox()}
 
@@ -784,8 +994,17 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                   ) : null}
                 </div>
 
-                <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
-                  {renderMarkdownContent(msg.content)}
+                <div className="flex items-end gap-1.5">
+                  <div
+                    onTouchStart={handleTouchStart}
+                    onTouchMove={handleTouchMove}
+                    onTouchEnd={handleTouchEndOrCancel}
+                    onTouchCancel={handleTouchEndOrCancel}
+                    onContextMenu={handleBubbleContextMenu}
+                    className="flex-1 min-w-0 rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words"
+                  >
+                    {renderQuotedBlock(false)}
+                    {renderMarkdownContent(msg.content)}
                   {inlineImageArtifacts.length > 0 && candidateRun && (
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       {inlineImageArtifacts.map((art) => {
@@ -834,6 +1053,8 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:300ms]" />
                     </span>
                   )}
+                  </div>
+                  {renderQuoteButton()}
                 </div>
 
                 {sessionRun && (

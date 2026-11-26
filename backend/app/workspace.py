@@ -167,9 +167,9 @@ class WorkspaceManager:
                 return None
             try:
                 p = normalize_directory_path(raw)
-            except ValueError:
+                return p if p.is_dir() else None
+            except (ValueError, OSError):
                 return None
-            return p if p.is_dir() else None
 
         primary_dir: Optional[Path] = None
 

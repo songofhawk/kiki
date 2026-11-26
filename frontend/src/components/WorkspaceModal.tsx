@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowUp,
@@ -69,17 +69,20 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
   const [showHiddenDirs, setShowHiddenDirs] = useState(false);
   const [browseData, setBrowseData] = useState<DirectoryBrowseResponse | null>(null);
 
+  const focusTopicId = focusTopic?.id ?? null;
+  const loadSeqRef = useRef(0);
+
   useEffect(() => {
     if (open) {
-      setActiveTab(focusTopic ? 'topic' : 'global');
+      setActiveTab(focusTopicId ? 'topic' : 'global');
       setError(null);
       setNewPath('');
       setNewLabel('');
-      setNewIsPrimary(Boolean(focusTopic));
+      setNewIsPrimary(Boolean(focusTopicId));
       setBrowserOpen(false);
       setBrowserError(null);
     }
-  }, [open, focusTopic]);
+  }, [open, focusTopicId]);
 
   const loadBrowseDir = useCallback(
     async (targetPath?: string, hiddenOverride?: boolean) => {
@@ -116,23 +119,27 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
 
   const loadData = useCallback(async () => {
     if (!open) return;
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     setError(null);
+    setTopicWs(null);
     try {
-      const g = await fetchGlobalWorkspace();
+      const [g, t] = await Promise.all([
+        fetchGlobalWorkspace(),
+        focusTopicId ? fetchTopicWorkspace(focusTopicId) : Promise.resolve(null),
+      ]);
+      if (seq !== loadSeqRef.current) return;
       setGlobalWs(g);
-      if (focusTopic) {
-        const t = await fetchTopicWorkspace(focusTopic.id);
-        setTopicWs(t);
-      } else {
-        setTopicWs(null);
-      }
+      setTopicWs(t);
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       setError(err instanceof Error ? err.message : '加载工作空间信息失败');
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
-  }, [open, focusTopic]);
+  }, [open, focusTopicId]);
 
   useEffect(() => {
     void loadData();
@@ -381,12 +388,13 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
             </div>
           )}
 
-          {loading ? (
+          {loading || (activeTab === 'topic' && focusTopic && !topicWs && !error) ? (
             <div className="py-10 flex items-center justify-center text-xs text-[#8C8378] gap-2">
               <Loader2 className="w-4 h-4 animate-spin" />
               正在加载目录信息...
             </div>
-          ) : activeTab === 'topic' && focusTopic && topicWs ? (
+          ) : activeTab === 'topic' && focusTopic ? (
+            topicWs ? (
             <>
               <div className="space-y-2">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-[#8C8378]">
@@ -433,6 +441,7 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
                 </div>
               )}
             </>
+            ) : null
           ) : globalWs ? (
             <>
               <div className="space-y-2">

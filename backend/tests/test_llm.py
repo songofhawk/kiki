@@ -785,3 +785,127 @@ async def test_explain_run_failure_uses_llm_and_returns_none_when_unavailable(
         is None
     )
 
+
+def test_derive_topic_title_strips_agent_boilerplate_and_urls() -> None:
+    title = KikiLLMClient._derive_topic_title_from_text(
+        "请调用 codex，帮我打开浏览器，发布一篇公众号草稿：https://doco.page/doc/doc_12345"
+    )
+    assert title == "发布一篇公众号草稿"
+
+    title2 = KikiLLMClient._derive_topic_title_from_text("那你先帮我发小红书吧")
+    assert title2 == "发小红书吧"
+
+
+def test_recent_messages_exclude_interim_for_routing(tmp_path: Path) -> None:
+    from app.db import Database
+
+    db = Database(tmp_path / "interim.db")
+    db.init_db()
+    topic = db.create_topic(title="发布公众号草稿")
+    m1 = db.create_message(topic_id=topic["id"], role="user", content="帮我发公众号草稿")
+    db.create_message(
+        topic_id=topic["id"],
+        role="assistant",
+        content="::browser-complete{title=\"已检查浏览器状态\"}",
+        metadata={"source": "heavy_agent_interim", "reply_to": m1["id"]},
+    )
+    m3 = db.create_message(
+        topic_id=topic["id"],
+        role="assistant",
+        content="当前无法打开公众号后台。",
+        metadata={"source": "heavy_agent", "reply_to": m1["id"]},
+    )
+
+    all_recent = db.get_recent_messages_with_topic(limit=10)
+    assert len(all_recent) == 3
+
+    filtered = db.get_recent_messages_with_topic(limit=10, exclude_interim=True)
+    assert [m["id"] for m in filtered] == [m1["id"], m3["id"]]
+
+    formatted = KikiLLMClient._format_context_lines(all_recent)
+    assert "::browser-complete" not in formatted
+    assert "当前无法打开公众号后台" in formatted
+
+
+@pytest.mark.asyncio
+async def test_jev_low_confidence_create_guards_recent_followup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        jev_api_key="jev-test-key",
+        jev_model="jev-latest",
+    )
+    llm = KikiLLMClient(settings)
+    captured_payloads: list[dict[str, Any]] = []
+    next_response: dict[str, Any] = {}
+
+    async def fake_jev_post(payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
+        captured_payloads.append(payload)
+        return next_response
+
+    monkeypatch.setattr(llm, "_jev_post_systemone", fake_jev_post)
+
+    topics = [{"id": "topic-wx", "title": "请调用 codex，帮我打…", "summary": None}]
+    recent_messages = [
+        {
+            "id": "msg-1",
+            "topic_id": "topic-wx",
+            "topic_title": "请调用 codex，帮我打…",
+            "role": "user",
+            "content": "请调用 codex，帮我打开浏览器，发布一篇公众号草稿：https://doco.page/doc/123",
+            "created_at": "2026-11-26T03:44:07Z",
+        },
+        {
+            "id": "msg-2",
+            "topic_id": "topic-wx",
+            "topic_title": "请调用 codex，帮我打…",
+            "role": "assistant",
+            "content": "目前看不到公众号后台的登录二维码，无法自动发布。",
+            "created_at": "2026-11-26T03:45:55Z",
+        },
+    ]
+
+    # Case 1: Uncertain create (0.59) with meaningful reuse probability + continuation cue -> reuse
+    next_response = {
+        "model": "jev-1.14.0",
+        "answers": {
+            "path": {"type": "choice", "choice": "heavy", "probabilities": {"fast": 0.05, "heavy": 0.95}},
+            "topic_action": {"type": "choice", "choice": "create", "probabilities": {"none": 0.02, "reuse": 0.39, "create": 0.59}},
+            "topic_id": {"type": "choice", "choice": "__none__", "probabilities": {"topic-wx": 0.42, "__none__": 0.58}},
+            "agent_type": {"type": "choice", "choice": "none", "probabilities": {"none": 0.9}},
+        },
+    }
+    d1 = await llm.route_message(
+        "那你先帮我发小红书吧",
+        active_topics=topics,
+        recent_messages=recent_messages,
+    )
+    assert d1.topic_action == "reuse"
+    assert d1.topic_id == "topic-wx"
+    assert d1.new_topic_title is None
+    # Verify topic_criteria backfilled context snippet for summary-less topic
+    topic_criteria = captured_payloads[0]["questions"]["topic_id"]["criteria"]
+    assert "发布一篇公众号草稿" in topic_criteria["topic-wx"]
+
+    # Case 2: High-confidence create (0.92) for an unrelated new task -> keep create
+    next_response = {
+        "model": "jev-1.14.0",
+        "answers": {
+            "path": {"type": "choice", "choice": "heavy", "probabilities": {"fast": 0.05, "heavy": 0.95}},
+            "topic_action": {"type": "choice", "choice": "create", "probabilities": {"none": 0.01, "reuse": 0.07, "create": 0.92}},
+            "topic_id": {"type": "choice", "choice": "__none__", "probabilities": {"topic-wx": 0.05, "__none__": 0.95}},
+            "agent_type": {"type": "choice", "choice": "none", "probabilities": {"none": 0.9}},
+        },
+    }
+    d2 = await llm.route_message(
+        "帮我查一下明天上海的航班价格",
+        active_topics=topics,
+        recent_messages=recent_messages,
+    )
+    assert d2.topic_action == "create"
+    assert d2.topic_id is None
+    assert d2.new_topic_title == "查一下明天上海的航班价格"
+
+

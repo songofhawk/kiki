@@ -272,6 +272,7 @@ class AdapterInfoResponse(BaseModel):
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1)
     focus_topic_id: Optional[str] = None
+    quoted_message_id: Optional[str] = None
     force_path: Optional[Literal["fast", "heavy"]] = None
     agent_type: Optional[str] = None
     model: Optional[str] = None

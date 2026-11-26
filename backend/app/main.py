@@ -59,6 +59,23 @@ def _enrich_message(msg: dict[str, Any], event_bus: EventBus) -> dict[str, Any]:
     return msg
 
 
+def _build_quoted_prompt_content(
+    user_content: str,
+    quoted_msg: dict[str, Any],
+) -> str:
+    role = quoted_msg.get("role")
+    sender = "用户自己" if role == "user" else ("Kiki" if role == "assistant" else "系统")
+    raw = str(quoted_msg.get("content") or "").strip()
+    excerpt = raw[:1200] + "…（内容已截断）" if len(raw) > 1200 else raw
+    quoted_lines = "\n".join(f"> {line}" for line in excerpt.splitlines()) or "> （空消息）"
+    return (
+        f"[用户引用了 {sender} 的历史消息]\n"
+        f"{quoted_lines}\n\n"
+        f"[用户的新消息]\n"
+        f"{user_content}"
+    )
+
+
 def create_app(
     *,
     settings: Optional[Settings] = None,
@@ -594,10 +611,42 @@ def create_app(
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest) -> ChatResponse:
         dream_consolidator.notify_activity()
+
+        quoted_msg: Optional[dict[str, Any]] = None
+        quoted_topic_id: Optional[str] = None
+        quoted_snapshot: Optional[dict[str, Any]] = None
+        effective_content = req.content
+
+        if req.quoted_message_id:
+            quoted_msg = database.get_message(req.quoted_message_id)
+            if quoted_msg is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Quoted message not found: {req.quoted_message_id}",
+                )
+            quoted_topic_id = quoted_msg["topic_id"]
+            quoted_topic = database.get_topic(quoted_topic_id)
+            raw_q_content = str(quoted_msg.get("content") or "").strip()
+            preview_q_content = (
+                raw_q_content[:240] + "…"
+                if len(raw_q_content) > 240
+                else raw_q_content
+            )
+            quoted_snapshot = {
+                "id": quoted_msg["id"],
+                "role": quoted_msg["role"],
+                "content": preview_q_content,
+                "topic_id": quoted_topic_id,
+                "topic_title": quoted_topic["title"] if quoted_topic else None,
+                "created_at": quoted_msg.get("created_at"),
+            }
+            effective_content = _build_quoted_prompt_content(req.content, quoted_msg)
+
         try:
             decision, topic, created, reassigned_messages = await decision_router.route(
-                content=req.content,
+                content=effective_content,
                 focus_topic_id=req.focus_topic_id,
+                quoted_topic_id=quoted_topic_id,
                 force_path=req.force_path,
                 force_agent_type=req.agent_type,
             )
@@ -605,13 +654,16 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         dream_consolidator.notify_activity(topic_created=created)
 
-        user_meta = {
+        user_meta: dict[str, Any] = {
             "path": decision.path,
             "topic_action": decision.topic_action,
             "confidence": decision.confidence,
             "reasoning": decision.reasoning,
             "focus_mode": bool(req.focus_topic_id),
         }
+        if quoted_snapshot is not None:
+            user_meta["quoted_message_id"] = quoted_snapshot["id"]
+            user_meta["quoted_message"] = quoted_snapshot
         user_msg = database.create_message(
             topic_id=topic["id"],
             role="user",
@@ -661,7 +713,7 @@ def create_app(
                 session_run = task_manager.enqueue_run(
                     topic_id=topic["id"],
                     trigger_message_id=user_msg["id"],
-                    user_content=req.content,
+                    user_content=effective_content,
                     agent_type=resolved_agent_type,
                     model_override=req.model,
                     thinking_override=req.thinking_level,
@@ -675,7 +727,7 @@ def create_app(
         else:
             assistant_msg = fast_path.start_reply(
                 topic=topic,
-                user_content=req.content,
+                user_content=effective_content,
                 user_message_id=user_msg["id"],
             )
 

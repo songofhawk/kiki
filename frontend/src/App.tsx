@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft,
   Check,
+  CornerUpLeft,
   FolderInput,
   FolderOpen,
   GitBranchPlus,
@@ -33,6 +34,7 @@ import type {
   HealthResponse,
   KikiStatus,
   Message,
+  QuotedMessageSnapshot,
   RawLogLine,
   ReassignTopicPayload,
   ResumeRunPayload,
@@ -355,6 +357,7 @@ export const App: React.FC = () => {
   const [sseConnected, setSseConnected] = useState(false);
   const [pendingSendCount, setPendingSendCount] = useState(0);
   const [inputText, setInputText] = useState('');
+  const [quotedMessage, setQuotedMessage] = useState<Message | null>(null);
   const [pathOption] = useState<PathOption>('auto');
   const [showAllTopicTags, setShowAllTopicTags] = useState<boolean>(() => {
     try {
@@ -1089,13 +1092,34 @@ export const App: React.FC = () => {
       if (!content) return;
 
       const currentFocusTopicId = focusTopicId;
+      const currentQuotedMessage = overrideText ? null : quotedMessage;
       const currentPathOption = pathOption;
       const currentAgentType = selectedAgentType;
+
+      const effectiveTopicId =
+        currentQuotedMessage?.topic_id ?? currentFocusTopicId ?? null;
+      const effectiveTopic = effectiveTopicId
+        ? topicsById[effectiveTopicId] ?? currentQuotedMessage?.topic ?? null
+        : null;
+      const quotedSnapshot: QuotedMessageSnapshot | undefined = currentQuotedMessage
+        ? {
+            id: currentQuotedMessage.id,
+            role: currentQuotedMessage.role,
+            content: currentQuotedMessage.content,
+            topic_id: currentQuotedMessage.topic_id,
+            topic_title:
+              topicsById[currentQuotedMessage.topic_id]?.title ??
+              currentQuotedMessage.topic?.title ??
+              null,
+            created_at: currentQuotedMessage.created_at,
+          }
+        : undefined;
 
       setPendingSendCount((count) => count + 1);
       setErrorBanner(null);
       if (!overrideText) {
         setInputText('');
+        setQuotedMessage(null);
         if (textareaRef.current) {
           textareaRef.current.style.height = 'auto';
         }
@@ -1104,20 +1128,26 @@ export const App: React.FC = () => {
       const tempId = `temp-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const optimisticUser: Message = {
         id: tempId,
-        topic_id: currentFocusTopicId ?? '__routing__',
+        topic_id: effectiveTopicId ?? '__routing__',
         role: 'user',
         content,
         created_at: new Date().toISOString(),
         metadata: {
           optimistic: true,
-          routing: !currentFocusTopicId,
+          routing: !effectiveTopicId,
+          ...(quotedSnapshot
+            ? {
+                quoted_message_id: quotedSnapshot.id,
+                quoted_message: quotedSnapshot,
+              }
+            : {}),
         },
-        topic: currentFocusTopicId ? topicsById[currentFocusTopicId] ?? null : null,
+        topic: effectiveTopic,
       };
       pendingOptimisticRef.current.push({
         tempId,
         content,
-        focusTopicId: currentFocusTopicId,
+        focusTopicId: effectiveTopicId,
       });
       setStreamsByKey((prev) => {
         const next: Record<string, StreamPageState> = { ...prev };
@@ -1133,6 +1163,16 @@ export const App: React.FC = () => {
             messages: [...prev[ALL_STREAM_KEY].messages, optimisticUser],
           };
         }
+        if (
+          effectiveTopicId &&
+          effectiveTopicId !== activeKey &&
+          prev[effectiveTopicId]?.loaded
+        ) {
+          next[effectiveTopicId] = {
+            ...prev[effectiveTopicId],
+            messages: [...prev[effectiveTopicId].messages, optimisticUser],
+          };
+        }
         return next;
       });
 
@@ -1140,6 +1180,7 @@ export const App: React.FC = () => {
         const res = await sendChat({
           content,
           focus_topic_id: currentFocusTopicId,
+          quoted_message_id: currentQuotedMessage?.id ?? null,
           force_path: currentPathOption === 'auto' ? null : currentPathOption,
           agent_type: currentAgentType === 'auto' ? null : currentAgentType,
         });
@@ -1213,12 +1254,15 @@ export const App: React.FC = () => {
         );
         if (!overrideText) {
           setInputText((prev) => (prev.trim() ? prev : content));
+          if (currentQuotedMessage) {
+            setQuotedMessage((prev) => prev ?? currentQuotedMessage);
+          }
         }
       } finally {
         setPendingSendCount((count) => Math.max(0, count - 1));
       }
     },
-    [inputText, focusTopicId, pathOption, selectedAgentType, topicsById]
+    [inputText, focusTopicId, quotedMessage, pathOption, selectedAgentType, topicsById]
   );
 
   const handleReassignMessage = useCallback(
@@ -1259,17 +1303,29 @@ export const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (!selectionMode) return;
+    if (!selectionMode && !quotedMessage) return;
     const handleEsc = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        exitSelectionMode();
+        if (selectionMode) {
+          exitSelectionMode();
+        } else if (quotedMessage) {
+          setQuotedMessage(null);
+        }
       }
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [selectionMode, exitSelectionMode]);
+  }, [selectionMode, quotedMessage, exitSelectionMode]);
+
+  const handleQuoteMessage = useCallback((message: Message) => {
+    setQuotedMessage(message);
+    window.setTimeout(() => {
+      textareaRef.current?.focus();
+    }, 0);
+  }, []);
 
   const handleStartMultiSelect = useCallback((messageId: string) => {
+    setQuotedMessage(null);
     setSelectionMode(true);
     setSelectedMessageIds(new Set([messageId]));
     setBatchMoveOpen(false);
@@ -1613,6 +1669,7 @@ export const App: React.FC = () => {
           selectedMessageIds={selectedMessageIds}
           onToggleSelectMessage={handleToggleSelectMessage}
           onStartMultiSelect={handleStartMultiSelect}
+          onQuoteMessage={handleQuoteMessage}
           onSelectTopic={handleSelectTopic}
           onReassignMessage={handleReassignMessage}
           onOpenLogDrawer={handleOpenLogDrawer}
@@ -1783,34 +1840,82 @@ export const App: React.FC = () => {
             </div>
 
             {/* Input Container */}
-            <div className="rounded-2xl bg-white border border-[#E4DDD2] focus-within:border-[#5B7A95] focus-within:ring-2 focus-within:ring-[#5B7A95]/15 shadow-sm transition-all flex items-end gap-2 px-3.5 py-2.5">
-              <textarea
-                id="kiki-chat-input"
-                name="message"
-                ref={textareaRef}
-                rows={1}
-                value={inputText}
-                onChange={handleTextareaChange}
-                onKeyDown={handleKeyDown}
-                placeholder={
-                  focusedTopic
-                    ? `在 #${focusedTopic.title} 中继续对话...`
-                    : activeRunCount > 0
-                      ? '后台任务并行执行中，随时继续发新消息或开启新话题...'
-                      : '和 Kiki 聊点什么，或直接交办一个后台任务...'
-                }
-                className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
-              />
+            <div className="rounded-2xl bg-white border border-[#E4DDD2] focus-within:border-[#5B7A95] focus-within:ring-2 focus-within:ring-[#5B7A95]/15 shadow-sm transition-all overflow-hidden">
+              {quotedMessage && (() => {
+                const quotedTopic =
+                  topicsById[quotedMessage.topic_id] ?? quotedMessage.topic ?? null;
+                const quotedSender =
+                  quotedMessage.role === 'user'
+                    ? '我的消息'
+                    : quotedMessage.role === 'assistant'
+                      ? 'Kiki'
+                      : '系统消息';
+                const quotedPreview =
+                  quotedMessage.content.replace(/\s+/g, ' ').trim() || '（空消息）';
+                return (
+                  <div className="px-3.5 pt-2.5 pb-2 bg-[#F8F5F0] border-b border-[#EAE3D9] flex items-start justify-between gap-2.5">
+                    <div className="min-w-0 flex-1 pl-2.5 border-l-2 border-[#5B7A95]">
+                      <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+                        <CornerUpLeft className="w-3 h-3 text-[#5B7A95] shrink-0" />
+                        <span className="font-semibold text-[#3B5972]">
+                          引用 {quotedSender}
+                        </span>
+                        {quotedTopic && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[#EAF0F5] text-[#3B5972] border border-[#CFE0EC] max-w-[180px] truncate">
+                            #{quotedTopic.title}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-[#8C8378] hidden sm:inline">
+                          发送后自动归属此话题
+                        </span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-[#655E56] line-clamp-2 break-words">
+                        {quotedPreview}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setQuotedMessage(null)}
+                      aria-label="取消引用"
+                      title="取消引用 (Esc)"
+                      className="p-1 rounded-lg text-[#8C8378] hover:text-[#262422] hover:bg-[#EDE7DE] transition-colors shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })()}
+              <div className="flex items-end gap-2 px-3.5 py-2.5">
+                <textarea
+                  id="kiki-chat-input"
+                  name="message"
+                  ref={textareaRef}
+                  rows={1}
+                  value={inputText}
+                  onChange={handleTextareaChange}
+                  onKeyDown={handleKeyDown}
+                  placeholder={
+                    quotedMessage
+                      ? `回复引用消息（自动归属至 #${(topicsById[quotedMessage.topic_id] ?? quotedMessage.topic)?.title ?? '原话题'}）...`
+                      : focusedTopic
+                        ? `在 #${focusedTopic.title} 中继续对话...`
+                        : activeRunCount > 0
+                          ? '后台任务并行执行中，随时继续发新消息或开启新话题...'
+                          : '和 Kiki 聊点什么，或直接交办一个后台任务...'
+                  }
+                  className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
+                />
 
-              <button
-                type="button"
-                disabled={!inputText.trim()}
-                onClick={() => handleSend()}
-                aria-label="发送消息"
-                className="w-9 h-9 rounded-xl bg-[#5B7A95] hover:bg-[#4B6882] text-white flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40 disabled:hover:bg-[#5B7A95]"
-              >
-                <Send className="w-4 h-4" />
-              </button>
+                <button
+                  type="button"
+                  disabled={!inputText.trim()}
+                  onClick={() => handleSend()}
+                  aria-label="发送消息"
+                  className="w-9 h-9 rounded-xl bg-[#5B7A95] hover:bg-[#4B6882] text-white flex items-center justify-center shrink-0 transition-all active:scale-95 disabled:opacity-40 disabled:hover:bg-[#5B7A95]"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </div>
             </div>
               </>
             )}

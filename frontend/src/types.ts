@@ -133,12 +133,23 @@ export interface SessionRun {
   hitl_request?: HitlRequest | null;
 }
 
+export interface QuotedMessageSnapshot {
+  id: string;
+  role: MessageRole;
+  content: string;
+  topic_id: string;
+  topic_title?: string | null;
+  created_at?: string | null;
+}
+
 export interface MessageMetadata {
   confidence?: number;
   reasoning?: string;
   path?: 'fast' | 'heavy';
   session_run_id?: string;
   streaming?: boolean;
+  quoted_message_id?: string;
+  quoted_message?: QuotedMessageSnapshot;
   [key: string]: unknown;
 }
 
@@ -180,6 +191,7 @@ export interface AdapterInfo {
 export interface ChatRequest {
   content: string;
   focus_topic_id?: string | null;
+  quoted_message_id?: string | null;
   force_path?: 'fast' | 'heavy' | null;
   agent_type?: string | null;
   model?: string | null;

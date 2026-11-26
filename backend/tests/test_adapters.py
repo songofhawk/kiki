@@ -740,5 +740,68 @@ async def test_antigravity_step_update_result_dict_and_image_artifact_extraction
     assert run["artifacts"][0]["file_path"].endswith("lulu_portrait_123.jpg")
 
 
+@pytest.mark.asyncio
+async def test_task_manager_shutdown_distinguishes_reload_cancel_reason(tmp_path: Path) -> None:
+    import asyncio
+    from app.adapters import AdapterInfo, AdapterRegistry, AdapterResult, HeavyTaskAdapter
+    from app.db import Database
+    from app.sse import EventBus
+    from app.task_manager import TaskManager
+    from app.tools import WorkspaceToolExecutor
+
+    started = asyncio.Event()
+
+    class BlockingAdapter(HeavyTaskAdapter):
+        agent_type = "blocking_test"
+        display_name = "Blocking Test"
+        vendor = "Test"
+        description = "Blocks until cancelled"
+
+        def probe(self) -> AdapterInfo:
+            return AdapterInfo(
+                id=self.agent_type,
+                name=self.display_name,
+                vendor=self.vendor,
+                description=self.description,
+                available=True,
+                default_model="test",
+            )
+
+        async def execute(self, ctx: Any) -> AdapterResult:
+            started.set()
+            await asyncio.sleep(60)
+            return AdapterResult(summary="done")
+
+    db = Database(tmp_path / "shutdown.db")
+    db.init_db()
+    bus = EventBus()
+    reg = AdapterRegistry()
+    reg.register(BlockingAdapter())
+    tools = WorkspaceToolExecutor(workspace_root=tmp_path, artifacts_dir=tmp_path / "artifacts", db=db, event_bus=bus)
+    tm = TaskManager(db=db, llm=None, event_bus=bus, tool_executor=tools, adapter_registry=reg)  # type: ignore[arg-type]
+
+    topic = db.create_topic(title="重载中断测试")
+    msg1 = db.create_message(topic_id=topic["id"], role="user", content="手动取消测试")
+    run1 = tm.enqueue_run(topic_id=topic["id"], trigger_message_id=msg1["id"], user_content=msg1["content"], agent_type="blocking_test")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await tm.cancel_run(run1["id"])
+    r1 = db.get_session_run(run1["id"])
+    assert r1 is not None
+    assert r1["status"] == "cancelled"
+    assert r1["current_step"] == "任务已取消"
+
+    started.clear()
+    msg2 = db.create_message(topic_id=topic["id"], role="user", content="热重载中断测试")
+    run2 = tm.enqueue_run(topic_id=topic["id"], trigger_message_id=msg2["id"], user_content=msg2["content"], agent_type="blocking_test")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await tm.shutdown()
+    r2 = db.get_session_run(run2["id"])
+    assert r2 is not None
+    assert r2["status"] == "cancelled"
+    assert r2["current_step"] == "服务重启/热重载中断"
+    assert r2["error_message"] == "服务重启/热重载中断"
+
+
+
 
 

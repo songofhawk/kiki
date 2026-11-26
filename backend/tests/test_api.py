@@ -1399,3 +1399,93 @@ async def test_reuse_topic_heavy_inherits_prior_available_agent_when_unspecified
             assert data["route_decision"]["agent_type"] == "codex"
             assert data["session_run"]["agent_type"] == "codex"
 
+
+@pytest.mark.asyncio
+async def test_chat_quote_user_and_assistant_message_locks_target_topic(tmp_path: Path):
+    app, db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+    captured_fast_contents: list[str] = []
+    orig_stream_fast_reply = fake_llm.stream_fast_reply
+
+    async def _recording_stream_fast_reply(
+        content: str, history: list[dict[str, Any]], topic_title: str
+    ):
+        captured_fast_contents.append(content)
+        async for chunk in orig_stream_fast_reply(content, history, topic_title):
+            yield chunk
+
+    fake_llm.stream_fast_reply = _recording_stream_fast_reply  # type: ignore[method-assign]
+
+    async with app.router.lifespan_context(app):
+        topic_a = db.create_topic(title="旅行规划")
+        topic_b = db.create_topic(title="报销整理")
+        user_a = db.create_message(topic_a["id"], "user", "我想下周去成都玩三天")
+        assistant_a = db.create_message(
+            topic_a["id"],
+            "assistant",
+            "成都三天可以安排熊猫基地和宽窄巷子喵~",
+            metadata={"reply_to": user_a["id"]},
+        )
+
+        # Even if the router would otherwise create a new topic, quoting locks to topic_a
+        fake_llm.next_decision = RouteDecision(
+            path="fast",
+            topic_action="create",
+            topic_id=None,
+            new_topic_title="不应该被创建的话题",
+            confidence=0.9,
+            reasoning="测试默认分流",
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # 1. Quote Kiki's message from All Stream
+            res1 = await client.post(
+                "/api/chat",
+                json={
+                    "content": "熊猫基地上午几点去人最少？",
+                    "quoted_message_id": assistant_a["id"],
+                },
+            )
+            assert res1.status_code == 200
+            d1 = res1.json()
+            assert d1["topic"]["id"] == topic_a["id"]
+            assert d1["user_message"]["topic_id"] == topic_a["id"]
+            assert d1["assistant_message"]["topic_id"] == topic_a["id"]
+            assert d1["user_message"]["content"] == "熊猫基地上午几点去人最少？"
+            assert d1["user_message"]["metadata"]["quoted_message_id"] == assistant_a["id"]
+            assert d1["user_message"]["metadata"]["quoted_message"]["role"] == "assistant"
+            assert "熊猫基地" in d1["user_message"]["metadata"]["quoted_message"]["content"]
+            await asyncio.sleep(0.05)
+            assert captured_fast_contents
+            assert "熊猫基地和宽窄巷子" in captured_fast_contents[-1]
+            assert "熊猫基地上午几点去人最少？" in captured_fast_contents[-1]
+
+            # 2. Quote user's own message even when focus_topic_id points elsewhere
+            res2 = await client.post(
+                "/api/chat",
+                json={
+                    "content": "改成四天也行",
+                    "focus_topic_id": topic_b["id"],
+                    "quoted_message_id": user_a["id"],
+                },
+            )
+            assert res2.status_code == 200
+            d2 = res2.json()
+            assert d2["topic"]["id"] == topic_a["id"]
+            assert d2["user_message"]["topic_id"] == topic_a["id"]
+            assert d2["user_message"]["metadata"]["quoted_message_id"] == user_a["id"]
+            assert d2["user_message"]["metadata"]["quoted_message"]["role"] == "user"
+            await asyncio.sleep(0.05)
+            assert "我想下周去成都玩三天" in captured_fast_contents[-1]
+
+            # 3. Unknown quoted_message_id returns 404
+            res_missing = await client.post(
+                "/api/chat",
+                json={
+                    "content": "测试不存在的引用",
+                    "quoted_message_id": "msg-does-not-exist",
+                },
+            )
+            assert res_missing.status_code == 404
+

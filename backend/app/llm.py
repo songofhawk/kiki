@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import re
@@ -51,6 +52,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 5. 若最近上下文显示某条用户消息带有 `[后台任务执行失败...]`、`[后台任务已取消...]` 或 `[后台任务等待人工确认...]` 等状态，而用户随后发送“再试一次”“再生成一次”“重试”“继续”等明确要求重新执行的指令，应 `reuse` 该原话题并选择 `heavy`。但若用户**只是在询问原因或讨论状态**（例如“为什么任务被取消了？”“刚才为什么失败了？”），并未要求重新执行或调用工具，应 `reuse` 原话题且判为 `path: "fast"`、`agent_type: null`，由 Kiki 结合上下文直接解答，切勿无故重新启动后台引擎。
 6. `agent_type` 判别规则：{agent_selection_rule}
 7. 若用户正在纠正执行引擎并要求完成/重跑任务（例如“不是，我是让你用豆包工作来生成图，你为什么用 Codex？”），**必须**判为 `path: "heavy"`、`topic_action: "reuse"`，并将 `agent_type` 设为**用户期望使用的目标引擎**，绝不能判为 `fast` 闲聊。
+8. 若用户消息带有承接/转折/备选语气（例如“那你先帮我发小红书吧”“那就换个方式”“改发到另一平台”“不然先做…”）或**省略了核心处理对象**（未说明要发布什么内容、修改什么文件，必须结合最近对话上下文才能理解），属于同一事项下的方案切换或延续，应优先 `reuse` 最近相关的活跃话题，切勿拆分为新的独立话题。
 """
 
 BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手。
@@ -885,11 +887,16 @@ class KikiLLMClient:
             return "（无）"
         lines: list[str] = []
         for msg in messages:
+            meta = msg.get("metadata")
+            if isinstance(meta, dict) and meta.get("source") == "heavy_agent_interim":
+                continue
             role_label = "用户" if msg.get("role") == "user" else "Kiki"
             topic_title = msg.get("topic_title")
             prefix = f"[{msg['id']}] " if include_id and msg.get("id") else ""
             topic_tag = f"(#{topic_title}) " if topic_title else ""
             content = " ".join(str(msg.get("content") or "").split())
+            if content.startswith("::browser-complete{"):
+                continue
             if len(content) > 240:
                 content = content[:239] + "…"
             run_note = KikiLLMClient._format_session_run_note(
@@ -916,14 +923,68 @@ class KikiLLMClient:
 
     @staticmethod
     def _derive_topic_title_from_text(content: str) -> str:
-        cleaned = " ".join((content or "").strip().split())
-        for prefix in ("请帮我", "帮我", "麻烦", "请问", "我想", "我要", "哎，", "哎,", "那个"):
-            if cleaned.startswith(prefix):
-                cleaned = cleaned[len(prefix) :].lstrip("，,：: ")
-        cleaned = cleaned.strip("？?！!。.,，、\"'“”")
-        if len(cleaned) > 14:
-            return cleaned[:13] + "…"
+        raw = " ".join((content or "").strip().split())
+        if not raw:
+            return "新话题"
+        # Strip bare URLs so they don't consume the short title budget
+        cleaned = re.sub(r"https?://\S+", "", raw).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        boilerplate_patterns = (
+            r"^(?:那你先|那就先|那先|那你|那就|请帮我|麻烦帮我|帮我|请先|麻烦|请问|我想|我要|可以帮我|能不能帮我|哎[，,\s]*|那个[，,\s]*)",
+            r"^(?:请)?(?:调用|使用|用|让|切换成|换成)\s*(?:codex|claude[\s_-]?code|internal[\s_-]?agent|antigravity|deepseek(?:[\s_-]?harness)?|zcode|kcode|qoder|workbuddy|豆包)\s*[，,：:\s]*",
+            r"^(?:帮我|请)?(?:打开浏览器|启动浏览器)\s*[，,：:\s]*",
+        )
+        for _ in range(4):
+            prev = cleaned
+            for pat in boilerplate_patterns:
+                cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).lstrip("，,：:、 ")
+            if cleaned == prev:
+                break
+        cleaned = cleaned.strip("？?！!。.,，、:：\"'“”")
+        if not cleaned:
+            cleaned = raw.strip("？?！!。.,，、:：\"'“”")
+        if len(cleaned) > 16:
+            return cleaned[:15] + "…"
         return cleaned or "新话题"
+
+    @staticmethod
+    def _has_continuation_cue(content: str) -> bool:
+        text = (content or "").strip()
+        return bool(
+            re.match(
+                r"^(?:那你先|那就先|那先|那你|那就|那|不然|要不|算了|改发|改成|换个|换成|还是|接着|继续|再|顺便)",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _find_recent_non_general_topic_id(
+        recent_messages: Optional[list[dict[str, Any]]],
+        valid_topic_ids: set[str],
+        *,
+        max_age_seconds: float = 600.0,
+    ) -> tuple[Optional[str], bool]:
+        """Return (topic_id, is_fresh) for the most recent non-general message in context."""
+        if not recent_messages:
+            return None, False
+        now = datetime.now(timezone.utc)
+        for msg in reversed(recent_messages):
+            tid = msg.get("topic_id")
+            if not tid or tid == "topic-general" or tid not in valid_topic_ids:
+                continue
+            created_raw = msg.get("created_at")
+            is_fresh = False
+            if isinstance(created_raw, str) and created_raw.strip():
+                try:
+                    dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age = (now - dt).total_seconds()
+                    is_fresh = age <= max_age_seconds
+                except ValueError:
+                    is_fresh = False
+            return str(tid), is_fresh
+        return None, False
 
     async def _route_with_jev(
         self,
@@ -942,6 +1003,21 @@ class KikiLLMClient:
             for t in active_topics
             if t.get("id") != "topic-general"
         ]
+        # Backfill brief context snippet for topics that have no summary yet
+        topic_snippets: dict[str, str] = {}
+        for msg in recent_messages or []:
+            tid = msg.get("topic_id")
+            if not tid or tid == "topic-general":
+                continue
+            meta = msg.get("metadata")
+            if isinstance(meta, dict) and meta.get("source") == "heavy_agent_interim":
+                continue
+            text = " ".join(str(msg.get("content") or "").split())
+            if not text or text.startswith("::browser-complete{"):
+                continue
+            if tid not in topic_snippets or msg.get("role") == "user":
+                topic_snippets[str(tid)] = text[:80] + ("…" if len(text) > 80 else "")
+
         state_obj = {
             "user_message": content,
             "recent_context": self._format_context_lines(recent_messages),
@@ -971,12 +1047,21 @@ class KikiLLMClient:
                 "type": "choice",
                 "instructions": (
                     "Decide how to assign the message to a conversation topic. "
-                    "Never reuse topic-general; use 'none' for pure casual chitchat."
+                    "Never reuse topic-general; use 'none' for pure casual chitchat. "
+                    "IMPORTANT: If the user pivots approach/platform/fallback for the same underlying item "
+                    "(e.g., '那你先帮我发小红书吧' right after failing to publish an article to WeChat) or omits the "
+                    "target object/content so recent_context is needed to understand what to act on, choose 'reuse'."
                 ),
                 "criteria": {
                     "none": "One-off greeting, exclamation, or casual chitchat with no specific ongoing theme",
-                    "reuse": "Clearly continues or relates to one of the existing non-general active_topics",
-                    "create": "Starts a concrete new subject/task not covered by existing active_topics",
+                    "reuse": (
+                        "Continues, follows up on, pivots approach/platform for, or omits the target object "
+                        "(relying on recent_context) of one of the existing non-general active_topics"
+                    ),
+                    "create": (
+                        "Starts a completely independent new subject/task unrelated to recent_context "
+                        "and not covered by existing active_topics"
+                    ),
                 },
             },
         }
@@ -1020,14 +1105,17 @@ class KikiLLMClient:
                 "criteria": agent_criteria,
             }
         if non_general_topics:
-            topic_criteria = {
-                t["id"]: f"{t['title']} ({t['summary']})" if t["summary"] else t["title"]
-                for t in non_general_topics
-            }
+            topic_criteria: dict[str, str] = {}
+            for t in non_general_topics:
+                desc = t["summary"] or topic_snippets.get(t["id"]) or ""
+                topic_criteria[t["id"]] = f"{t['title']} ({desc})" if desc else t["title"]
             topic_criteria["__none__"] = "None of the existing topics match"
             questions["topic_id"] = {
                 "type": "choice",
-                "instructions": "If the message belongs to an existing topic in active_topics, select its ID; otherwise '__none__'.",
+                "instructions": (
+                    "If the message belongs to, follows up on, or pivots from an existing topic in active_topics "
+                    "(including requests with omitted objects relying on recent_context), select its ID; otherwise '__none__'."
+                ),
                 "criteria": topic_criteria,
             }
 
@@ -1049,15 +1137,44 @@ class KikiLLMClient:
         selected_topic_id = topic_ans.get("choice")
         valid_topic_ids = {t["id"] for t in non_general_topics}
 
+        # Use calibrated probability of the chosen topic_action (or path) as confidence
+        probs = action_ans.get("probabilities") or {}
+        raw_prob = probs.get(action_val)
+        if isinstance(raw_prob, (int, float)):
+            confidence = max(0.0, min(1.0, float(raw_prob)))
+        else:
+            path_probs = path_ans.get("probabilities") or {}
+            confidence = float(path_probs.get(path_val, 0.85))
+
         resolved_topic_id: Optional[str] = None
         new_topic_title: Optional[str] = None
+        override_note: Optional[str] = None
+
+        # Low-confidence create guard: when Jev is uncertain (< 0.65) and reuse has meaningful
+        # probability (or topic_id already points to an active topic), prefer continuing the
+        # active topic instead of splitting a follow-up into a disconnected new topic.
+        if action_val == "create" and confidence < 0.65 and valid_topic_ids:
+            reuse_prob = float(probs.get("reuse", 0.0)) if isinstance(probs.get("reuse"), (int, float)) else 0.0
+            if selected_topic_id in valid_topic_ids:
+                action_val = "reuse"
+                resolved_topic_id = str(selected_topic_id)
+                override_note = f"低置信度 create(p={confidence:.2f}) 且 topic_id 指向已有话题，偏向延续"
+            elif reuse_prob >= 0.25:
+                recent_tid, is_fresh = self._find_recent_non_general_topic_id(
+                    recent_messages, valid_topic_ids
+                )
+                if recent_tid and (is_fresh or self._has_continuation_cue(content)):
+                    action_val = "reuse"
+                    resolved_topic_id = recent_tid
+                    override_note = f"低置信度 create(p={confidence:.2f}, reuse={reuse_prob:.2f}) 偏向延续最近话题"
 
         if action_val == "reuse":
-            if selected_topic_id in valid_topic_ids:
-                resolved_topic_id = str(selected_topic_id)
-            else:
-                action_val = "create"
-                new_topic_title = self._derive_topic_title_from_text(content)
+            if resolved_topic_id is None:
+                if selected_topic_id in valid_topic_ids:
+                    resolved_topic_id = str(selected_topic_id)
+                else:
+                    action_val = "create"
+                    new_topic_title = self._derive_topic_title_from_text(content)
         elif action_val == "create":
             new_topic_title = self._derive_topic_title_from_text(content)
 
@@ -1068,18 +1185,15 @@ class KikiLLMClient:
             agent_choice = agent_ans.get("choice")
             agent_type = str(agent_choice) if agent_choice and agent_choice != "none" else None
 
-        # Use calibrated probability of the chosen topic_action (or path) as confidence
-        probs = action_ans.get("probabilities") or {}
-        raw_prob = probs.get(action_val)
-        if isinstance(raw_prob, (int, float)):
-            confidence = max(0.0, min(1.0, float(raw_prob)))
-        else:
-            path_probs = path_ans.get("probabilities") or {}
-            confidence = float(path_probs.get(path_val, 0.85))
-
         used_model = str(data.get("model") or self.jev_model)
         self.last_used_provider = "jev"
         self.last_used_model = used_model
+
+        reasoning = (
+            f"Jev ({used_model}) 判定: path={path_val}, topic={action_val} ({override_note})"
+            if override_note
+            else f"Jev ({used_model}) 判定: path={path_val}, topic={action_val} (p={confidence:.2f})"
+        )
 
         return RouteDecision(
             path=path_val,
@@ -1088,7 +1202,7 @@ class KikiLLMClient:
             new_topic_title=new_topic_title,
             agent_type=agent_type,
             confidence=round(confidence, 3),
-            reasoning=f"Jev ({used_model}) 判定: path={path_val}, topic={action_val} (p={confidence:.2f})",
+            reasoning=reasoning,
         )
 
     async def route_message(

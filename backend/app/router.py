@@ -159,6 +159,7 @@ class DecisionRouter:
         self,
         content: str,
         focus_topic_id: Optional[str] = None,
+        quoted_topic_id: Optional[str] = None,
         force_path: Optional[Literal["fast", "heavy"]] = None,
         force_agent_type: Optional[str] = None,
     ) -> tuple[RouteDecision, dict[str, Any], bool, list[dict[str, Any]]]:
@@ -172,11 +173,14 @@ class DecisionRouter:
             else (force_agent_type.strip() if force_agent_type else None)
         )
         try:
-            # 1. Topic Focus Mode locks topic assignment, while still classifying path when force_path is auto (None)
-            if focus_topic_id:
-                topic = self.db.get_topic(focus_topic_id)
+            # 1. Quoted message or Topic Focus Mode locks topic assignment,
+            # while still classifying path when force_path is auto (None).
+            locked_topic_id = quoted_topic_id or focus_topic_id
+            if locked_topic_id:
+                is_quoted_lock = bool(quoted_topic_id)
+                topic = self.db.get_topic(locked_topic_id)
                 if topic is None:
-                    raise KeyError(f"Topic not found: {focus_topic_id}")
+                    raise KeyError(f"Topic not found: {locked_topic_id}")
                 if force_path is not None:
                     decision = RouteDecision(
                         path=force_path,
@@ -185,15 +189,27 @@ class DecisionRouter:
                         new_topic_title=None,
                         agent_type=explicit_agent if force_path == "heavy" else None,
                         confidence=1.0,
-                        reasoning="Topic Focus Mode 锁定当前话题（手动指定路径）",
+                        reasoning=(
+                            "引用消息自动归属原话题（手动指定路径）"
+                            if is_quoted_lock
+                            else "Topic Focus Mode 锁定当前话题（手动指定路径）"
+                        ),
                     )
                     return decision, topic, False, []
 
                 published_thinking = True
-                self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在判断当前话题内的任务意图...")
+                self.event_bus.publish_kiki_status(
+                    "thinking",
+                    reason=(
+                        "Kiki 正在结合引用消息判断任务意图..."
+                        if is_quoted_lock
+                        else "Kiki 正在判断当前话题内的任务意图..."
+                    ),
+                )
                 topic_recent_messages = self.db.get_recent_messages_with_topic(
                     limit=self.recent_context_limit,
                     topic_id=topic["id"],
+                    exclude_interim=True,
                 )
                 raw_decision = await self._call_route_message(
                     content,
@@ -228,7 +244,8 @@ class DecisionRouter:
             self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在判断意图与话题...")
             active_topics = self.db.list_topics(include_archived=False)
             recent_messages = self.db.get_recent_messages_with_topic(
-                limit=self.recent_context_limit
+                limit=self.recent_context_limit,
+                exclude_interim=True,
             )
             latest_msg = self.db.get_latest_message()
             decision = await self._call_route_message(

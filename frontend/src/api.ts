@@ -53,7 +53,7 @@ export async function fetchHealth(): Promise<HealthResponse> {
 }
 
 export async function fetchGlobalWorkspace(): Promise<GlobalWorkspace> {
-  return requestJson<GlobalWorkspace>('/workspace');
+  return requestJson<GlobalWorkspace>('/workspace', { cache: 'no-store' });
 }
 
 export async function browseDirectories(
@@ -64,11 +64,15 @@ export async function browseDirectories(
   if (path) params.set('path', path);
   if (showHidden) params.set('show_hidden', 'true');
   const qs = params.toString();
-  return requestJson<DirectoryBrowseResponse>(`/workspace/browse${qs ? `?${qs}` : ''}`);
+  return requestJson<DirectoryBrowseResponse>(`/workspace/browse${qs ? `?${qs}` : ''}`, {
+    cache: 'no-store',
+  });
 }
 
 export async function fetchTopicWorkspace(topicId: string): Promise<TopicWorkspace> {
-  return requestJson<TopicWorkspace>(`/topics/${encodeURIComponent(topicId)}/workspace`);
+  return requestJson<TopicWorkspace>(`/topics/${encodeURIComponent(topicId)}/workspace`, {
+    cache: 'no-store',
+  });
 }
 
 export async function addWorkspaceMount(payload: {

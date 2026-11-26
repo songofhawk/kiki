@@ -171,6 +171,7 @@ class TaskManager:
         self._run_states: dict[str, str] = {}
         self._hitl_events: dict[str, asyncio.Event] = {}
         self._hitl_decisions: dict[str, dict[str, Any]] = {}
+        self._shutting_down: bool = False
 
     def set_status_provider(
         self,
@@ -492,15 +493,26 @@ class TaskManager:
             await adapter.cancel(run_id)
             self._run_states.pop(run_id, None)
             self.event_bus.clear_hitl_request(run_id)
+            is_shutdown = self._shutting_down
+            cancel_step = "服务重启/热重载中断" if is_shutdown else "任务已取消"
             self.db.update_session_run(
                 run_id,
                 status="cancelled",
-                current_step="任务已取消",
+                current_step=cancel_step,
+                error_message=cancel_step if is_shutdown else None,
             )
             self._publish_run_update(run_id)
             self.event_bus.append_raw_log(
                 run_id,
-                json.dumps({"event": "run_cancelled", "run_id": run_id}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "event": "run_cancelled",
+                        "run_id": run_id,
+                        "reason": "shutdown" if is_shutdown else "cancelled",
+                        "detail": cancel_step,
+                    },
+                    ensure_ascii=False,
+                ),
                 stream="ndjson",
             )
             self._publish_kiki_status()
@@ -643,6 +655,7 @@ class TaskManager:
         return self.event_bus.enrich_run(updated) if updated else None
 
     async def shutdown(self) -> None:
+        self._shutting_down = True
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()
