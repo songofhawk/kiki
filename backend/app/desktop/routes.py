@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
@@ -172,6 +173,8 @@ def create_desktop_router(
         session_id: str,
         token: str = Query(default=""),
         api_token: str = Query(default=""),
+        binary: bool = Query(default=False),
+        ack: bool = Query(default=False),
     ) -> None:
         if configured_api_token:
             auth_header = websocket.headers.get("authorization", "")
@@ -193,6 +196,9 @@ def create_desktop_router(
         manager.set_ws_connected(session_id, True)
         force_refresh = asyncio.Event()
         force_refresh.set()
+        ack_event = asyncio.Event()
+        ack_event.set()
+        last_input_ts = 0.0
 
         await websocket.send_json({"type": "session", "session": sess.to_public_dict()})
 
@@ -205,26 +211,47 @@ def create_desktop_router(
                     await websocket.close(code=4404, reason="Desktop session ended")
                     return
 
+                if ack:
+                    try:
+                        await asyncio.wait_for(ack_event.wait(), timeout=4.0)
+                    except asyncio.TimeoutError:
+                        pass
+
                 try:
                     frame = await manager.capture_frame(session_id)
                     if force_refresh.is_set() or frame.sha1 != last_sha1:
                         force_refresh.clear()
                         last_sha1 = frame.sha1
-                        await websocket.send_json(
-                            {
-                                "type": "frame",
-                                "mime_type": frame.mime_type,
-                                "width": frame.width,
-                                "height": frame.height,
-                                "display_index": frame.display_index,
-                                "captured_at": frame.captured_at,
-                                "data": base64.b64encode(frame.data).decode("ascii"),
-                            }
-                        )
+                        if ack:
+                            ack_event.clear()
+                        if binary:
+                            await websocket.send_bytes(frame.data)
+                        else:
+                            await websocket.send_json(
+                                {
+                                    "type": "frame",
+                                    "mime_type": frame.mime_type,
+                                    "width": frame.width,
+                                    "height": frame.height,
+                                    "display_index": frame.display_index,
+                                    "captured_at": frame.captured_at,
+                                    "data": base64.b64encode(frame.data).decode("ascii"),
+                                }
+                            )
                 except Exception as exc:
+                    if ack:
+                        ack_event.set()
                     await websocket.send_json({"type": "error", "message": f"画面捕获失败: {exc}"})
 
-                interval = 1.0 / max(1, min(15, active.fps))
+                now = time.monotonic()
+                idle_for = now - last_input_ts if last_input_ts > 0 else 999.0
+                if idle_for < 2.0:
+                    eff_fps = min(12, max(active.fps, 8))
+                elif idle_for > 5.0:
+                    eff_fps = min(active.fps, 2)
+                else:
+                    eff_fps = active.fps
+                interval = 1.0 / max(1, min(15, eff_fps))
                 try:
                     await asyncio.wait_for(force_refresh.wait(), timeout=interval)
                 except asyncio.TimeoutError:
@@ -235,7 +262,10 @@ def create_desktop_router(
             while True:
                 msg = await websocket.receive_json()
                 msg_type = str(msg.get("type") or "")
-                if msg_type == "input":
+                if msg_type == "frame_ack":
+                    ack_event.set()
+                elif msg_type == "input":
+                    last_input_ts = time.monotonic()
                     try:
                         await manager.handle_input(session_id, msg.get("payload") or {})
                         force_refresh.set()

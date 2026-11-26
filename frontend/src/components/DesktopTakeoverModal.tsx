@@ -46,6 +46,9 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
   const imgRef = useRef<HTMLImageElement | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const lastMoveSentRef = useRef<number>(0);
+  const blobUrlRef = useRef<string | null>(null);
+  const activeButtonRef = useRef<'left' | 'right' | 'middle' | null>(null);
+  const lastCoordsRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
 
   const sendWs = useCallback((msg: Record<string, unknown>) => {
     const ws = wsRef.current;
@@ -69,6 +72,11 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
         // ignore if already ended
       }
     }
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    activeButtonRef.current = null;
     setSession(null);
     setFrameSrc(null);
   }, []);
@@ -95,6 +103,7 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
         }
         const sess = await startDesktopSession({
           control_mode: st.supports_control ? 'control' : 'view',
+          quality: 65,
           run_id: context?.runId,
           topic_id: context?.topicId,
           reason: context?.reason,
@@ -109,12 +118,24 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
         setSession(sess);
 
         const ws = new WebSocket(buildDesktopWsUrl(sess.id, sess.ws_token || ''));
+        ws.binaryType = 'blob';
         wsRef.current = ws;
         ws.onopen = () => !cancelled && setConnected(true);
         ws.onclose = () => !cancelled && setConnected(false);
         ws.onerror = () => !cancelled && setErrorMsg('桌面流 WebSocket 连接异常，请确认后端服务正常运行。');
         ws.onmessage = (ev) => {
           if (cancelled) return;
+          if (ev.data instanceof Blob) {
+            const nextUrl = URL.createObjectURL(ev.data);
+            const prevUrl = blobUrlRef.current;
+            blobUrlRef.current = nextUrl;
+            setFrameSrc(nextUrl);
+            setLoading(false);
+            if (prevUrl) {
+              URL.revokeObjectURL(prevUrl);
+            }
+            return;
+          }
           try {
             const msg = JSON.parse(ev.data as string);
             if (msg.type === 'frame' && msg.data) {
@@ -188,13 +209,32 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
 
   const canControl = Boolean(session && session.control_mode === 'control' && connected);
 
+  useEffect(() => {
+    if (!open) return;
+    const handleGlobalMouseUp = () => {
+      if (!activeButtonRef.current) return;
+      const btn = activeButtonRef.current;
+      activeButtonRef.current = null;
+      sendWs({
+        type: 'input',
+        payload: { action: 'mouse_up', ...lastCoordsRef.current, button: btn },
+      });
+    };
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+  }, [open, sendWs]);
+
   const handleMouseMove = (e: React.MouseEvent<HTMLImageElement>) => {
     if (!canControl) return;
     const now = performance.now();
-    if (now - lastMoveSentRef.current < 45) return;
+    const minInterval = activeButtonRef.current ? 30 : 45;
+    if (now - lastMoveSentRef.current < minInterval) return;
     lastMoveSentRef.current = now;
     const pt = mapPointerCoords(e);
-    if (pt) sendWs({ type: 'input', payload: { action: 'mouse_move', ...pt } });
+    if (pt) {
+      lastCoordsRef.current = pt;
+      sendWs({ type: 'input', payload: { action: 'mouse_move', ...pt } });
+    }
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLImageElement>) => {
@@ -202,14 +242,24 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     e.preventDefault();
     (e.currentTarget as HTMLElement).focus();
     const pt = mapPointerCoords(e);
-    if (pt) sendWs({ type: 'input', payload: { action: 'mouse_down', ...pt, button: mapButton(e.button) } });
+    if (pt) {
+      const btn = mapButton(e.button);
+      activeButtonRef.current = btn;
+      lastCoordsRef.current = pt;
+      sendWs({ type: 'input', payload: { action: 'mouse_down', ...pt, button: btn } });
+    }
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLImageElement>) => {
     if (!canControl) return;
     e.preventDefault();
     const pt = mapPointerCoords(e);
-    if (pt) sendWs({ type: 'input', payload: { action: 'mouse_up', ...pt, button: mapButton(e.button) } });
+    const btn = mapButton(e.button);
+    activeButtonRef.current = null;
+    if (pt) {
+      lastCoordsRef.current = pt;
+      sendWs({ type: 'input', payload: { action: 'mouse_up', ...pt, button: btn } });
+    }
   };
 
   const handleDoubleClick = (e: React.MouseEvent<HTMLImageElement>) => {
@@ -374,6 +424,8 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
               src={frameSrc}
               alt="Kiki Server Desktop"
               draggable={false}
+              onLoad={() => sendWs({ type: 'frame_ack' })}
+              onError={() => sendWs({ type: 'frame_ack' })}
               onContextMenu={(e) => e.preventDefault()}
               onMouseMove={handleMouseMove}
               onMouseDown={handleMouseDown}

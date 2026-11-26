@@ -86,6 +86,7 @@ class MacOSDesktopDriver:
     def __init__(self) -> None:
         self._cg: Any = None
         self._ax: Any = None
+        self._pressed_buttons: set[str] = set()
         self._screencapture = shutil.which("screencapture") or "/usr/sbin/screencapture"
         self._sips = shutil.which("sips") or "/usr/bin/sips"
         self._load_frameworks()
@@ -283,13 +284,21 @@ class MacOSDesktopDriver:
                    "middle": (_EVT_OTHER_DOWN, _EVT_OTHER_UP, _KCG_MOUSE_CENTER)}
 
         if act == "mouse_move":
-            self._post_and_release(self._cg.CGEventCreateMouseEvent(None, _EVT_MOUSE_MOVED, self._point_for_event(event), _KCG_MOUSE_LEFT))
+            if "left" in self._pressed_buttons:
+                evt_type, btn_code = _EVT_LEFT_DRAG, _KCG_MOUSE_LEFT
+            elif "right" in self._pressed_buttons:
+                evt_type, btn_code = _EVT_RIGHT_DRAG, _KCG_MOUSE_RIGHT
+            else:
+                evt_type, btn_code = _EVT_MOUSE_MOVED, _KCG_MOUSE_LEFT
+            self._post_and_release(self._cg.CGEventCreateMouseEvent(None, evt_type, self._point_for_event(event), btn_code))
         elif act in ("mouse_down", "mouse_up", "mouse_click", "mouse_double_click"):
             pt = self._point_for_event(event)
             down_t, up_t, btn_code = btn_map[event.button]
             if act == "mouse_down":
+                self._pressed_buttons.add(event.button)
                 self._post_and_release(self._cg.CGEventCreateMouseEvent(None, down_t, pt, btn_code))
             elif act == "mouse_up":
+                self._pressed_buttons.discard(event.button)
                 self._post_and_release(self._cg.CGEventCreateMouseEvent(None, up_t, pt, btn_code))
             else:
                 clicks = 2 if act == "mouse_double_click" else 1

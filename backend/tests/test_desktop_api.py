@@ -171,3 +171,35 @@ def test_desktop_multi_display_and_space_switching(tmp_path: Path) -> None:
         prev_res = client.post(f"/api/desktop/sessions/{sid}/space", json={"direction": "prev"}).json()
         d1_spaces = [s for s in prev_res["spaces"] if s["display_index"] == 1]
         assert d1_spaces[1]["is_active"] is True
+
+
+def test_desktop_ws_binary_frames_and_ack_backpressure(tmp_path: Path) -> None:
+    driver = MockDesktopDriver()
+    driver.dynamic_frames = True
+    app = _make_test_app(tmp_path, driver=driver)
+
+    with TestClient(app) as client:
+        created = client.post("/api/desktop/sessions", json={"fps": 10}).json()
+        sid = created["session"]["id"]
+        ws_token = created["session"]["ws_token"]
+
+        with client.websocket_connect(
+            f"/api/desktop/sessions/{sid}/ws?token={ws_token}&binary=1&ack=1"
+        ) as ws:
+            init_msg = ws.receive_json()
+            assert init_msg["type"] == "session"
+
+            raw1 = ws.receive_bytes()
+            assert raw1.startswith(b"\x89PNG\r\n\x1a\n")
+
+            # Send ack + drag sequence -> receive next binary frame
+            ws.send_json({"type": "frame_ack"})
+            ws.send_json({"type": "input", "payload": {"action": "mouse_down", "x": 0.2, "y": 0.5, "button": "left"}})
+            ws.send_json({"type": "input", "payload": {"action": "mouse_move", "x": 0.6, "y": 0.5}})
+            ws.send_json({"type": "input", "payload": {"action": "mouse_up", "x": 0.6, "y": 0.5, "button": "left"}})
+
+            raw2 = ws.receive_bytes()
+            assert raw2.startswith(b"\x89PNG\r\n\x1a\n")
+            assert raw2 != raw1
+
+        assert [e.action for e in driver.recorded_events] == ["mouse_down", "mouse_move", "mouse_up"]

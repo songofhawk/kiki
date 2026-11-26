@@ -474,7 +474,7 @@ export async function switchDesktopSpace(
 
 export function buildDesktopWsUrl(sessionId: string, wsToken: string): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const params = new URLSearchParams({ token: wsToken });
+  const params = new URLSearchParams({ token: wsToken, binary: '1', ack: '1' });
   return `${proto}//${window.location.host}${API_BASE}/desktop/sessions/${encodeURIComponent(
     sessionId
   )}/ws?${params.toString()}`;
