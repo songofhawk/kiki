@@ -94,7 +94,7 @@ class DeepSeekHarnessAdapter(SubprocessCLIAdapter):
             self._resolve_profile(),
             "--model",
             profile.model,
-            ctx.user_content,
+            ctx.build_task_prompt(),
         ]
 
     def build_resume_command(

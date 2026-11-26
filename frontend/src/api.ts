@@ -5,6 +5,7 @@ import type {
   BatchReassignTopicResponse,
   ChatRequest,
   ChatResponse,
+  GlobalWorkspace,
   HealthResponse,
   HitlRequest,
   KikiStatus,
@@ -17,6 +18,8 @@ import type {
   SessionRun,
   StepLog,
   Topic,
+  TopicWorkspace,
+  WorkspaceMount,
 } from './types';
 
 const API_BASE = '/api';
@@ -46,6 +49,53 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function fetchHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>('/health');
+}
+
+export async function fetchGlobalWorkspace(): Promise<GlobalWorkspace> {
+  return requestJson<GlobalWorkspace>('/workspace');
+}
+
+export async function fetchTopicWorkspace(topicId: string): Promise<TopicWorkspace> {
+  return requestJson<TopicWorkspace>(`/topics/${encodeURIComponent(topicId)}/workspace`);
+}
+
+export async function addWorkspaceMount(payload: {
+  scope: 'global' | 'topic';
+  topic_id?: string | null;
+  path: string;
+  label?: string;
+  is_primary?: boolean;
+}): Promise<WorkspaceMount> {
+  return requestJson<WorkspaceMount>('/workspace/mounts', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateWorkspaceMount(
+  mountId: string,
+  payload: { label?: string; is_primary?: boolean }
+): Promise<WorkspaceMount> {
+  return requestJson<WorkspaceMount>(`/workspace/mounts/${encodeURIComponent(mountId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteWorkspaceMount(mountId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workspace/mounts/${encodeURIComponent(mountId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const data = await res.json();
+      detail = data?.detail || data?.message || detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
 }
 
 export async function fetchAdapters(): Promise<AdapterInfo[]> {

@@ -28,6 +28,7 @@ export interface UnifiedMessageListProps {
   allTopics: Topic[];
   runsById: Record<string, SessionRun>;
   focusTopicId: string | null;
+  showAllTopicTags?: boolean;
   hasMore?: boolean;
   loadingInitial?: boolean;
   loadingOlder?: boolean;
@@ -245,6 +246,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   allTopics,
   runsById,
   focusTopicId,
+  showAllTopicTags = false,
   hasMore = false,
   loadingInitial = false,
   loadingOlder = false,
@@ -433,7 +435,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     <div className="text-sm font-semibold text-[#262422] group-hover:text-[#44637D] transition-colors">
                       {item.title}
                     </div>
-                    <p className="text-xs text-[#787067] line-clamp-3 leading-relaxed">
+                    <p className="text-xs text-[#787067] leading-relaxed">
                       {item.prompt}
                     </p>
                   </div>
@@ -646,16 +648,24 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                       </div>
                     )}
                     {topic ? (
-                      <TopicBadge
-                        topic={topic}
-                        messageId={msg.id}
-                        confidence={confidence}
-                        allTopics={allTopics}
-                        onSelectTopic={onSelectTopic}
-                        onReassign={onReassignMessage}
-                        onStartMultiSelect={onStartMultiSelect}
-                        compact
-                      />
+                      <div
+                        className={
+                          showAllTopicTags
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity'
+                        }
+                      >
+                        <TopicBadge
+                          topic={topic}
+                          messageId={msg.id}
+                          confidence={confidence}
+                          allTopics={allTopics}
+                          onSelectTopic={onSelectTopic}
+                          onReassign={onReassignMessage}
+                          onStartMultiSelect={onStartMultiSelect}
+                          compact
+                        />
+                      </div>
                     ) : msg.metadata?.optimistic ? (
                       <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269]">
                         <Loader2 className="w-3 h-3 text-[#5B7A95] animate-spin" />
@@ -700,6 +710,18 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
           // Only the actively streaming message animates (`thinking`).
           const msgIsStreaming = Boolean(msg.streaming ?? msg.metadata?.streaming);
           const isActivelyStreaming = Boolean(msgIsStreaming && msg.id === latestStreamingMsgId);
+          const isInterimHeavyMsg = msg.metadata?.source === 'heavy_agent_interim';
+          const inlineImageArtifacts =
+            !isInterimHeavyMsg && candidateRun?.artifacts?.length
+              ? candidateRun.artifacts.filter((art) => {
+                  const t = (art.file_type || '').toLowerCase();
+                  const p = (art.file_path || '').toLowerCase();
+                  return (
+                    t.includes('image') ||
+                    /\.(png|jpe?g|webp|gif|svg)$/.test(p)
+                  );
+                })
+              : [];
 
           return (
             <div
@@ -741,21 +763,70 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                   </div>
 
                   {topic ? (
-                    <TopicBadge
-                      topic={topic}
-                      messageId={msg.id}
-                      confidence={confidence}
-                      allTopics={allTopics}
-                      onSelectTopic={onSelectTopic}
-                      onReassign={onReassignMessage}
-                      onStartMultiSelect={onStartMultiSelect}
-                      compact
-                    />
+                    <div
+                      className={
+                        showAllTopicTags
+                          ? 'opacity-100'
+                          : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity'
+                      }
+                    >
+                      <TopicBadge
+                        topic={topic}
+                        messageId={msg.id}
+                        confidence={confidence}
+                        allTopics={allTopics}
+                        onSelectTopic={onSelectTopic}
+                        onReassign={onReassignMessage}
+                        onStartMultiSelect={onStartMultiSelect}
+                        compact
+                      />
+                    </div>
                   ) : null}
                 </div>
 
                 <div className="rounded-2xl rounded-tl-sm bg-white border border-[#E8E2D9] px-4 py-3 text-sm text-[#262422] leading-relaxed shadow-sm shadow-stone-900/[0.02] whitespace-pre-wrap break-words">
                   {renderMarkdownContent(msg.content)}
+                  {inlineImageArtifacts.length > 0 && candidateRun && (
+                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {inlineImageArtifacts.map((art) => {
+                        const artUrl = `/api/runs/${encodeURIComponent(candidateRun.id)}/artifacts/${encodeURIComponent(art.id)}`;
+                        const fileName = art.file_path.split('/').pop() || art.file_path;
+                        return (
+                          <div
+                            key={art.id}
+                            className="rounded-xl overflow-hidden border border-[#E8E2D9] bg-[#FAF8F5]"
+                          >
+                            <a
+                              href={artUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="点击在新标签页查看原图"
+                              className="block"
+                            >
+                              <img
+                                src={artUrl}
+                                alt={art.description || fileName}
+                                className="w-full max-h-80 object-contain bg-white"
+                                loading="lazy"
+                              />
+                            </a>
+                            <div className="px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px] text-[#7A7269] border-t border-[#EFEAE2]">
+                              <span className="truncate" title={art.description || fileName}>
+                                {art.description || fileName}
+                              </span>
+                              <a
+                                href={`${artUrl}?download=true`}
+                                download
+                                className="shrink-0 text-[#5B7A95] hover:underline font-medium"
+                              >
+                                下载
+                              </a>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                   {msgIsStreaming && (
                     <span className="inline-flex items-center gap-1 ml-1.5 align-middle">
                       <span className="w-1.5 h-1.5 rounded-full bg-[#5B7A95] animate-bounce [animation-delay:0ms]" />

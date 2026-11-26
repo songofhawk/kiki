@@ -84,7 +84,7 @@ class KCodeAdapter(SubprocessCLIAdapter):
         return [
             binary,
             "-p",
-            ctx.user_content,
+            ctx.build_task_prompt(),
             "--output-format",
             "stream-json",
             "--model",

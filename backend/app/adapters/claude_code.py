@@ -81,7 +81,7 @@ class ClaudeCodeAdapter(SubprocessCLIAdapter):
         argv = [
             binary,
             "-p",
-            ctx.user_content,
+            ctx.build_task_prompt(),
             "--output-format",
             "stream-json",
             "--verbose",
@@ -95,6 +95,9 @@ class ClaudeCodeAdapter(SubprocessCLIAdapter):
         allowed_tools = os.getenv("KIKI_CLAUDE_ALLOWED_TOOLS", "").strip()
         if allowed_tools:
             argv.extend(["--allowedTools", allowed_tools])
+        for extra_dir in ctx.extra_dirs:
+            if extra_dir.is_dir():
+                argv.extend(["--add-dir", str(extra_dir)])
         if os.getenv("KIKI_CLAUDE_SKIP_PERMISSIONS", "").strip() == "1":
             argv.append("--dangerously-skip-permissions")
         return argv

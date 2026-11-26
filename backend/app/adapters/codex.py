@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import base64
+import glob
+import hashlib
 import json
 import os
 import tomllib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
+
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+
+
+def _detect_image_ext(data: bytes, mime_hint: str = "") -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    hint = mime_hint.lower()
+    if "jpeg" in hint or "jpg" in hint:
+        return "jpg"
+    if "webp" in hint:
+        return "webp"
+    if "gif" in hint:
+        return "gif"
+    return "png"
 
 from .base import (
     AdapterContext,
@@ -179,10 +203,13 @@ class CodexAdapter(SubprocessCLIAdapter):
         env_model = os.getenv(self.env_model_var, "").strip() if self.env_model_var else ""
         if ctx.model_override or env_model:
             cmd.extend(["--model", profile.model])
+        for extra_dir in ctx.extra_dirs:
+            if extra_dir.is_dir():
+                cmd.extend(["--add-dir", str(extra_dir)])
         cmd.extend([
             "-c",
             f"model_reasoning_effort={profile.thinking_level}",
-            ctx.user_content,
+            ctx.build_task_prompt(),
         ])
         return cmd
 
@@ -250,7 +277,10 @@ class CodexAdapter(SubprocessCLIAdapter):
                 if item_type == "agent_message":
                     msg_text = _extract_item_text(item)
                     if msg_text:
-                        state.final_text_parts.append(msg_text)
+                        # Keep only the latest agent_message as final summary so pre-tool
+                        # commentary is never glued onto the final completion reply.
+                        state.final_text_parts = [msg_text]
+                        ctx.emit_interim_message(msg_text)
 
                 if item_type in (
                     "command_execution",
@@ -270,6 +300,15 @@ class CodexAdapter(SubprocessCLIAdapter):
                         or bool(item.get("error"))
                         or (isinstance(exit_code, int) and exit_code != 0)
                     )
+                    if item_type == "file_change" and not is_failed:
+                        changes = item.get("changes")
+                        if isinstance(changes, list):
+                            img_files: list[str] = state.extra.setdefault("codex_image_files", [])
+                            for entry in changes:
+                                if isinstance(entry, dict) and entry.get("path"):
+                                    p_str = str(entry["path"]).strip()
+                                    if p_str.lower().endswith(_IMAGE_EXTENSIONS) and p_str not in img_files:
+                                        img_files.append(p_str)
                     _, completed_detail = _describe_codex_item(item_type, item)
 
                     if step_id is not None:
@@ -308,3 +347,111 @@ class CodexAdapter(SubprocessCLIAdapter):
             return
 
         super().parse_json_event(event, state, ctx)
+
+    @staticmethod
+    def _find_rollout_files(session_id: str) -> list[Path]:
+        if not session_id:
+            return []
+        codex_home = Path(os.getenv("CODEX_HOME", os.path.expanduser("~/.codex")))
+        sessions_dir = codex_home / "sessions"
+        if not sessions_dir.is_dir():
+            return []
+        pattern = str(sessions_dir / "**" / f"*{session_id}*.jsonl")
+        return [Path(p) for p in sorted(glob.glob(pattern, recursive=True))]
+
+    async def after_process_success(
+        self,
+        ctx: AdapterContext,
+        state: StreamParseState,
+    ) -> None:
+        seen_hashes: set[str] = set()
+        img_index = 0
+
+        # 1. Extract images emitted by Codex built-in imagegen tool from its rollout JSONL
+        for rollout_path in self._find_rollout_files(state.session_id or ""):
+            try:
+                with rollout_path.open("r", encoding="utf-8", errors="replace") as fh:
+                    for raw_line in fh:
+                        if "image" not in raw_line.lower():
+                            continue
+                        try:
+                            obj = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        ev_type = obj.get("type")
+                        payload = obj.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+
+                        candidates: list[tuple[str, str, str]] = []  # (b64_data, mime_hint, desc)
+                        if ev_type == "event_msg" and payload.get("type") == "item_completed":
+                            item = payload.get("item")
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "Extension"
+                                and "image" in str(item.get("kind") or "").lower()
+                                and isinstance(item.get("result"), str)
+                                and item["result"].strip()
+                            ):
+                                desc = str(item.get("revisedPrompt") or "Codex 生成图片").strip()
+                                candidates.append((item["result"].strip(), "image/png", desc))
+                        elif ev_type == "response_item" and payload.get("type") == "custom_tool_call_output":
+                            output = payload.get("output")
+                            if isinstance(output, list):
+                                for entry in output:
+                                    if not isinstance(entry, dict):
+                                        continue
+                                    image_url = entry.get("image_url")
+                                    if (
+                                        isinstance(image_url, str)
+                                        and image_url.startswith("data:image/")
+                                        and ";base64," in image_url
+                                    ):
+                                        header, b64_part = image_url.split(";base64,", 1)
+                                        candidates.append((b64_part.strip(), header, "Codex 生成图片"))
+
+                        for b64_data, mime_hint, desc in candidates:
+                            try:
+                                raw_bytes = base64.b64decode(b64_data, validate=False)
+                            except Exception:
+                                continue
+                            if len(raw_bytes) < 64:
+                                continue
+                            digest = hashlib.sha256(raw_bytes).hexdigest()
+                            if digest in seen_hashes:
+                                continue
+                            seen_hashes.add(digest)
+                            img_index += 1
+                            ext = _detect_image_ext(raw_bytes, mime_hint)
+                            ctx.register_binary_artifact(
+                                filename=f"codex_image_{img_index}.{ext}",
+                                data=raw_bytes,
+                                file_type="image",
+                                description=_truncate(desc, limit=120),
+                            )
+            except OSError:
+                continue
+
+        # 2. Register any workspace image files written via file_change
+        for rel_path in state.extra.get("codex_image_files", []):
+            candidate = Path(rel_path)
+            full_path = candidate if candidate.is_absolute() else (ctx.workspace_root / candidate)
+            try:
+                resolved = full_path.resolve()
+                if not resolved.is_file():
+                    continue
+                raw_bytes = resolved.read_bytes()
+                digest = hashlib.sha256(raw_bytes).hexdigest()
+                if digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
+                ctx.register_binary_artifact(
+                    filename=resolved.name,
+                    data=raw_bytes,
+                    file_type="image",
+                    description=f"Codex 生成图片 {resolved.name}",
+                )
+            except OSError:
+                continue

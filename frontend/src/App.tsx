@@ -3,15 +3,14 @@ import {
   ArrowLeft,
   Check,
   FolderInput,
+  FolderOpen,
   GitBranchPlus,
   Lock,
   Menu,
   Send,
   Sparkles,
+  Tag,
   X,
-  Zap,
-  Cpu,
-  Compass,
 } from 'lucide-react';
 import {
   batchReassignMessageTopics,
@@ -47,6 +46,7 @@ import type { KikiPose } from './components/KikiAvatar';
 import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
+import WorkspaceModal from './components/WorkspaceModal';
 
 type PathOption = 'auto' | 'fast' | 'heavy';
 
@@ -356,10 +356,18 @@ export const App: React.FC = () => {
   const [sseConnected, setSseConnected] = useState(false);
   const [pendingSendCount, setPendingSendCount] = useState(0);
   const [inputText, setInputText] = useState('');
-  const [pathOption, setPathOption] = useState<PathOption>('auto');
+  const [pathOption] = useState<PathOption>('auto');
+  const [showAllTopicTags, setShowAllTopicTags] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('kiki_show_all_topic_tags') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
+  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -1504,11 +1512,51 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {health?.model && (
-              <span className="hidden sm:inline-block text-[11px] font-mono px-2 py-0.5 rounded-md bg-[#F2EDE6] text-[#6E665E] border border-[#E6DFD5]">
-                {health.model}
+            <button
+              type="button"
+              onClick={() =>
+                setShowAllTopicTags((prev) => {
+                  const next = !prev;
+                  try {
+                    localStorage.setItem('kiki_show_all_topic_tags', String(next));
+                  } catch {
+                    // ignore storage errors
+                  }
+                  return next;
+                })
+              }
+              aria-pressed={showAllTopicTags}
+              title={
+                showAllTopicTags
+                  ? '当前：始终显示每条消息的话题标签（点击改为悬停显示）'
+                  : '当前：悬停消息时显示话题标签（点击显示全部标签）'
+              }
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                showAllTopicTags
+                  ? 'bg-[#EAF0F5] text-[#3B5972] border-[#CFE0EC]'
+                  : 'bg-white hover:bg-[#F3EFE9] text-[#5A534C] border-[#E5DED4]'
+              }`}
+            >
+              <Tag className="w-3.5 h-3.5 text-[#5B7A95]" />
+              <span className="hidden sm:inline">
+                {showAllTopicTags ? '显示全部标签' : '悬停显示标签'}
               </span>
-            )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setWorkspaceModalOpen(true)}
+              title={
+                focusedTopic
+                  ? `管理话题 #${focusedTopic.title} 与全局工作空间目录`
+                  : '管理 Kiki 工作空间与主信息流目录'
+              }
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-[#5A534C] bg-white hover:bg-[#F3EFE9] border border-[#E5DED4] transition-colors"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-[#5B7A95]" />
+              <span className="hidden sm:inline">
+                {focusedTopic ? '话题目录' : '工作空间'}
+              </span>
+            </button>
           </div>
         </header>
 
@@ -1533,6 +1581,7 @@ export const App: React.FC = () => {
           allTopics={topics}
           runsById={runsById}
           focusTopicId={focusTopicId}
+          showAllTopicTags={showAllTopicTags}
           hasMore={currentStream.hasMore}
           loadingInitial={currentStream.loadingInitial}
           loadingOlder={currentStream.loadingOlder}
@@ -1675,37 +1724,7 @@ export const App: React.FC = () => {
             {/* Subtle Path Toggle Row */}
             <div className="flex items-center justify-between gap-2 mb-1.5 px-1 flex-wrap">
               <div className="flex items-center gap-2 flex-wrap">
-                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-[#F1ECE5] border border-[#E5DED4]">
-                  {(
-                    [
-                      { id: 'auto', label: '自动路由', icon: Compass },
-                      { id: 'fast', label: '轻量', icon: Zap },
-                      { id: 'heavy', label: '重型', icon: Cpu },
-                    ] as const
-                  ).map((opt) => {
-                    const Icon = opt.icon;
-                    const active = pathOption === opt.id;
-                    return (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => setPathOption(opt.id)}
-                        className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all ${active
-                            ? 'bg-white text-[#262422] shadow-sm'
-                            : 'text-[#7A7269] hover:text-[#262422]'
-                          }`}
-                      >
-                        <Icon
-                          className={`w-3 h-3 ${active ? 'text-[#5B7A95]' : 'text-[#9A9187]'
-                            }`}
-                        />
-                        {opt.label}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {adapters.length > 0 && pathOption !== 'fast' && (
+                {adapters.length > 0 && (
                   <select
                     aria-label="选择重型任务执行器"
                     value={selectedAgentType}
@@ -1777,6 +1796,13 @@ export const App: React.FC = () => {
           </div>
         </div>
       </main>
+
+      {/* Workspace & Directory Mounts Modal */}
+      <WorkspaceModal
+        open={workspaceModalOpen}
+        focusTopic={focusedTopic}
+        onClose={() => setWorkspaceModalOpen(false)}
+      />
 
       {/* L3 Geek Log Drawer */}
       <LogDrawer

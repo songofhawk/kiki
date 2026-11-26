@@ -9,7 +9,7 @@ from .base import AdapterInfo, HeavyTaskAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .deepseek_harness import DeepSeekHarnessAdapter
-from .gemini_agent import GeminiAgentAdapter
+from .internal_agent import InternalAgentAdapter
 from .kcode import KCodeAdapter
 from .qoder import QoderAdapter
 from .workbuddy import WorkBuddyAdapter
@@ -37,7 +37,7 @@ class AdapterRegistry:
         for alias in adapter.aliases:
             self._aliases[_normalize_key(alias)] = canonical
 
-    def resolve_type(self, agent_type: Optional[str], default: str = "gemini_agent") -> str:
+    def resolve_type(self, agent_type: Optional[str], default: str = "internal_agent") -> str:
         raw = (agent_type or "").strip()
         if not raw:
             return _normalize_key(default)
@@ -56,7 +56,7 @@ class AdapterRegistry:
         key = _normalize_key(raw)
         return self._aliases.get(key)
 
-    def get(self, agent_type: Optional[str], default: str = "gemini_agent") -> HeavyTaskAdapter:
+    def get(self, agent_type: Optional[str], default: str = "internal_agent") -> HeavyTaskAdapter:
         canonical = self.resolve_type(agent_type, default=default)
         return self._adapters[canonical]
 
@@ -75,7 +75,7 @@ def create_default_registry(
     """Build the default registry containing all Kiki Heavy-Path adapters."""
     return AdapterRegistry(
         adapters=[
-            GeminiAgentAdapter(
+            InternalAgentAdapter(
                 default_model=gemini_model,
                 api_key_configured=gemini_api_key_configured,
             ),

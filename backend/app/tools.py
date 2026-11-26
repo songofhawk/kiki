@@ -1,4 +1,4 @@
-"""Workspace-scoped safe tools and Gemini Interactions API declarations for gemini_agent."""
+"""Workspace-scoped safe tools and tool declarations for internal_agent."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from .config import load_settings
 from .db import Database
 from .search import WebSearchService
 from .sse import EventBus
+from .workspace import ResolvedWorkspace
 
 IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", "dist", "build"}
 
@@ -37,19 +38,22 @@ BLOCKED_SHELL_PATTERNS = [
 ]
 
 
-def _is_sensitive_path(target: Path, workspace_root: Path) -> bool:
+def _is_sensitive_path(target: Path, allowed_roots: list[Path] | Path) -> bool:
     name = target.name.lower()
     if name == ".env" or (name.startswith(".env.") and name not in _SAFE_ENV_TEMPLATES):
         return True
     if name in _SENSITIVE_BASENAMES or target.suffix.lower() in _SENSITIVE_EXTENSIONS:
         return True
-    try:
-        rel_parts = [p.lower() for p in target.relative_to(workspace_root).parts]
-        if ".git" in rel_parts and name in {"config", "credentials"}:
-            return True
-    except ValueError:
-        return True
-    return False
+    roots = [allowed_roots] if isinstance(allowed_roots, Path) else allowed_roots
+    for root in roots:
+        try:
+            rel_parts = [p.lower() for p in target.relative_to(root).parts]
+            if ".git" in rel_parts and name in {"config", "credentials"}:
+                return True
+            return False
+        except ValueError:
+            continue
+    return True
 
 
 def _sanitized_shell_env() -> dict[str, str]:
@@ -229,33 +233,62 @@ class WorkspaceToolExecutor:
         db: Database,
         event_bus: EventBus,
         search_service: Optional[WebSearchService] = None,
+        extra_roots: Optional[list[Path]] = None,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.artifacts_dir = artifacts_dir.resolve()
         self.db = db
         self.event_bus = event_bus
         self.search_service = search_service or WebSearchService(load_settings())
+        roots: list[Path] = [self.workspace_root]
+        if extra_roots:
+            for r in extra_roots:
+                resolved = Path(r).resolve()
+                if resolved not in roots:
+                    roots.append(resolved)
+        self.allowed_roots: list[Path] = roots
+
+    def for_workspace(self, resolved: ResolvedWorkspace) -> "WorkspaceToolExecutor":
+        """Create a run-scoped executor bound to a resolved topic workspace."""
+        return WorkspaceToolExecutor(
+            workspace_root=resolved.primary_dir,
+            artifacts_dir=resolved.topic_artifacts_dir,
+            db=self.db,
+            event_bus=self.event_bus,
+            search_service=self.search_service,
+            extra_roots=resolved.allowed_roots,
+        )
 
     def _resolve_safe_path(self, rel_path: str) -> Path:
-        candidate = (self.workspace_root / (rel_path or ".")).resolve()
+        raw = (rel_path or ".").strip() or "."
+        expanded = Path(os.path.expanduser(raw))
+        candidate = expanded.resolve() if expanded.is_absolute() else (self.workspace_root / expanded).resolve()
+        for root in self.allowed_roots:
+            try:
+                candidate.relative_to(root)
+                return candidate
+            except ValueError:
+                continue
+        raise PermissionError(f"Access denied outside workspace: {rel_path}")
+
+    def _display_path(self, target: Path) -> str:
         try:
-            candidate.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise PermissionError(f"Access denied outside workspace: {rel_path}") from exc
-        return candidate
+            return str(target.relative_to(self.workspace_root))
+        except ValueError:
+            return str(target)
 
     def list_files(self, path: str = ".") -> str:
         target = self._resolve_safe_path(path)
         if not target.exists():
             return f"Error: path '{path}' does not exist."
         if target.is_file():
-            return str(target.relative_to(self.workspace_root))
+            return self._display_path(target)
 
         entries: list[str] = []
         for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
-            if item.name in IGNORED_DIRS or _is_sensitive_path(item, self.workspace_root):
+            if item.name in IGNORED_DIRS or _is_sensitive_path(item, self.allowed_roots):
                 continue
-            rel = str(item.relative_to(self.workspace_root))
+            rel = self._display_path(item)
             entries.append(f"{rel}/" if item.is_dir() else rel)
             if len(entries) >= 200:
                 entries.append("... (truncated at 200 entries)")
@@ -264,7 +297,7 @@ class WorkspaceToolExecutor:
 
     def read_file(self, path: str, max_lines: int = 120) -> str:
         target = self._resolve_safe_path(path)
-        if _is_sensitive_path(target, self.workspace_root):
+        if _is_sensitive_path(target, self.allowed_roots):
             raise PermissionError(f"Access denied to sensitive file: {path}")
         if not target.exists() or not target.is_file():
             return f"Error: file '{path}' not found."
@@ -309,6 +342,37 @@ class WorkspaceToolExecutor:
         )
         self.event_bus.publish("artifact_created", {"run_id": run_id, "artifact": artifact})
         return f"Artifact saved at {display_path} (id={artifact['id']})"
+
+    def write_binary_artifact(
+        self,
+        run_id: str,
+        filename: str,
+        data: bytes,
+        file_type: str = "image",
+        description: str = "",
+    ) -> dict[str, Any]:
+        safe_name = Path(filename).name
+        if not safe_name or safe_name in {".", ".."}:
+            safe_name = "artifact.bin"
+
+        run_dir = self.artifacts_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        out_path = (run_dir / safe_name).resolve()
+        out_path.write_bytes(data)
+
+        try:
+            display_path = str(out_path.relative_to(self.workspace_root))
+        except ValueError:
+            display_path = str(out_path)
+
+        artifact = self.db.add_artifact(
+            run_id=run_id,
+            file_path=display_path,
+            file_type=file_type or "image",
+            description=description or f"产出文件 {safe_name}",
+        )
+        self.event_bus.publish("artifact_created", {"run_id": run_id, "artifact": artifact})
+        return artifact
 
     async def run_shell(self, run_id: str, command: str, timeout_sec: float = 20.0) -> str:
         cmd = (command or "").strip()

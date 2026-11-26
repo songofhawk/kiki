@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS topics (
     summary TEXT,
     status TEXT CHECK(status IN ('active', 'archived', 'deleted')) DEFAULT 'active',
     unread INTEGER DEFAULT 0,
+    workspace_dir TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -75,6 +76,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
     FOREIGN KEY(run_id) REFERENCES session_runs(id) ON DELETE CASCADE
 );
 
+-- 6. 工作空间目录挂载表 (WorkspaceMounts)
+CREATE TABLE IF NOT EXISTS workspace_mounts (
+    id TEXT PRIMARY KEY,
+    scope TEXT CHECK(scope IN ('global', 'topic')) NOT NULL,
+    topic_id TEXT,
+    path TEXT NOT NULL,
+    label TEXT,
+    is_primary INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(topic_id) REFERENCES topics(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_session_runs_topic_id ON session_runs(topic_id);
@@ -82,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_session_runs_topic_status ON session_runs(topic_i
 CREATE INDEX IF NOT EXISTS idx_session_runs_trigger_msg ON session_runs(trigger_message_id);
 CREATE INDEX IF NOT EXISTS idx_step_logs_run_id ON step_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_mounts_scope_topic ON workspace_mounts(scope, topic_id);
 """
 
 
@@ -112,16 +126,50 @@ class Database:
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
+        self._workspace_manager: Optional[Any] = None
+
+    def set_workspace_manager(self, workspace_manager: Optional[Any]) -> None:
+        self._workspace_manager = workspace_manager
+
+    def ensure_all_topic_workspaces(self) -> int:
+        """Backfill workspace_dir and on-disk directories for any pre-existing topics."""
+        if self._workspace_manager is None:
+            return 0
+        updated = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, workspace_dir FROM topics WHERE status != 'deleted'"
+            ).fetchall()
+            for row in rows:
+                tid = row["id"]
+                existing_dir = row["workspace_dir"]
+                if existing_dir:
+                    target = Path(existing_dir).expanduser().resolve()
+                    target.mkdir(parents=True, exist_ok=True)
+                    (target / "artifacts").mkdir(parents=True, exist_ok=True)
+                    (target / "files").mkdir(parents=True, exist_ok=True)
+                else:
+                    created_dir = self._workspace_manager.ensure_topic_dir(tid)
+                    conn.execute(
+                        "UPDATE topics SET workspace_dir = ? WHERE id = ?",
+                        (str(created_dir), tid),
+                    )
+                    updated += 1
+            if updated:
+                conn.commit()
+        return updated
 
     def init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA_SQL)
-            # Ensure unread column exists on pre-existing DBs
+            # Ensure unread & workspace_dir columns exist on pre-existing DBs
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(topics)").fetchall()}
             if "unread" not in cols:
                 conn.execute("ALTER TABLE topics ADD COLUMN unread INTEGER DEFAULT 0")
+            if "workspace_dir" not in cols:
+                conn.execute("ALTER TABLE topics ADD COLUMN workspace_dir TEXT")
             conn.commit()
 
     def close(self) -> None:
@@ -204,6 +252,7 @@ class Database:
             "summary": row["summary"],
             "status": row["status"],
             "unread": bool(row["unread"]),
+            "workspace_dir": row["workspace_dir"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "message_count": int(row["message_count"] or 0),
@@ -290,16 +339,20 @@ class Database:
         title: str,
         summary: Optional[str] = None,
         topic_id: Optional[str] = None,
+        workspace_dir: Optional[str] = None,
     ) -> dict[str, Any]:
         tid = topic_id or _new_id("topic")
+        resolved_ws_dir = workspace_dir
+        if resolved_ws_dir is None and self._workspace_manager is not None:
+            resolved_ws_dir = str(self._workspace_manager.ensure_topic_dir(tid))
         now = utc_now_iso()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO topics (id, title, summary, status, unread, created_at, updated_at)
-                VALUES (?, ?, ?, 'active', 0, ?, ?)
+                INSERT INTO topics (id, title, summary, status, unread, workspace_dir, created_at, updated_at)
+                VALUES (?, ?, ?, 'active', 0, ?, ?, ?)
                 """,
-                (tid, title.strip(), summary, now, now),
+                (tid, title.strip(), summary, resolved_ws_dir, now, now),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM topics WHERE id = ?", (tid,)).fetchone()
@@ -325,6 +378,7 @@ class Database:
         summary: Optional[str] = None,
         status: Optional[str] = None,
         unread: Optional[bool] = None,
+        workspace_dir: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         fields: list[str] = []
         values: list[Any] = []
@@ -340,6 +394,9 @@ class Database:
         if unread is not None:
             fields.append("unread = ?")
             values.append(1 if unread else 0)
+        if workspace_dir is not None:
+            fields.append("workspace_dir = ?")
+            values.append(workspace_dir)
 
         if not fields:
             return self.get_topic(topic_id)
@@ -400,7 +457,7 @@ class Database:
         self,
         topic_id: str,
         trigger_message_id: str,
-        agent_type: str = "gemini_agent",
+        agent_type: str = "internal_agent",
         status: str = "queued",
         current_step: Optional[str] = None,
         run_id: Optional[str] = None,
@@ -462,6 +519,21 @@ class Database:
     def get_session_run(self, run_id: str) -> Optional[dict[str, Any]]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM session_runs WHERE id = ?", (run_id,)).fetchone()
+            if not row:
+                return None
+            return self._hydrate_run_row(conn, row)
+
+    def get_latest_topic_run(self, topic_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM session_runs
+                WHERE topic_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (topic_id,),
+            ).fetchone()
             if not row:
                 return None
             return self._hydrate_run_row(conn, row)
@@ -1136,3 +1208,171 @@ class Database:
                     (json.dumps(meta, ensure_ascii=False), row["id"]),
                 )
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Workspace Mounts (Main Stream / Topic Custom Directories)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _mount_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "scope": row["scope"],
+            "topic_id": row["topic_id"],
+            "path": row["path"],
+            "label": row["label"],
+            "is_primary": bool(row["is_primary"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_workspace_mounts(
+        self,
+        *,
+        scope: Optional[str] = None,
+        topic_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if topic_id is not None:
+            clauses.append("topic_id = ?")
+            params.append(topic_id)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM workspace_mounts
+                {where_sql}
+                ORDER BY is_primary DESC, created_at ASC, rowid ASC
+                """,
+                params,
+            ).fetchall()
+            return [self._mount_row_to_dict(r) for r in rows]
+
+    def get_workspace_mount(self, mount_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM workspace_mounts WHERE id = ?",
+                (mount_id,),
+            ).fetchone()
+            return self._mount_row_to_dict(row) if row else None
+
+    def add_workspace_mount(
+        self,
+        scope: str,
+        path: str,
+        *,
+        topic_id: Optional[str] = None,
+        label: Optional[str] = None,
+        is_primary: bool = False,
+        mount_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if scope not in ("global", "topic"):
+            raise ValueError(f"Invalid mount scope: {scope}")
+        if scope == "global":
+            topic_id = None
+        elif not topic_id:
+            raise ValueError("topic_id is required when scope='topic'")
+
+        cleaned_label = (label or "").strip() or None
+        now = utc_now_iso()
+
+        with self._connect() as conn:
+            if scope == "global":
+                existing = conn.execute(
+                    "SELECT * FROM workspace_mounts WHERE scope = 'global' AND path = ?",
+                    (path,),
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    "SELECT * FROM workspace_mounts WHERE scope = 'topic' AND topic_id = ? AND path = ?",
+                    (topic_id, path),
+                ).fetchone()
+
+            if is_primary:
+                if scope == "global":
+                    conn.execute(
+                        "UPDATE workspace_mounts SET is_primary = 0 WHERE scope = 'global'"
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE workspace_mounts SET is_primary = 0 WHERE scope = 'topic' AND topic_id = ?",
+                        (topic_id,),
+                    )
+
+            if existing:
+                mid = existing["id"]
+                new_label = cleaned_label if cleaned_label is not None else existing["label"]
+                new_primary = 1 if (is_primary or bool(existing["is_primary"])) else 0
+                conn.execute(
+                    "UPDATE workspace_mounts SET label = ?, is_primary = ? WHERE id = ?",
+                    (new_label, new_primary, mid),
+                )
+            else:
+                mid = mount_id or _new_id("mnt")
+                conn.execute(
+                    """
+                    INSERT INTO workspace_mounts (id, scope, topic_id, path, label, is_primary, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (mid, scope, topic_id, path, cleaned_label, 1 if is_primary else 0, now),
+                )
+            conn.commit()
+            row = conn.execute("SELECT * FROM workspace_mounts WHERE id = ?", (mid,)).fetchone()
+            return self._mount_row_to_dict(row)
+
+    def update_workspace_mount(
+        self,
+        mount_id: str,
+        *,
+        label: Optional[str] = None,
+        is_primary: Optional[bool] = None,
+    ) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM workspace_mounts WHERE id = ?",
+                (mount_id,),
+            ).fetchone()
+            if not existing:
+                return None
+
+            if is_primary is True:
+                if existing["scope"] == "global":
+                    conn.execute(
+                        "UPDATE workspace_mounts SET is_primary = 0 WHERE scope = 'global'"
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE workspace_mounts SET is_primary = 0 WHERE scope = 'topic' AND topic_id = ?",
+                        (existing["topic_id"],),
+                    )
+
+            fields: list[str] = []
+            values: list[Any] = []
+            if label is not None:
+                fields.append("label = ?")
+                values.append(label.strip() or None)
+            if is_primary is not None:
+                fields.append("is_primary = ?")
+                values.append(1 if is_primary else 0)
+
+            if fields:
+                values.append(mount_id)
+                conn.execute(
+                    f"UPDATE workspace_mounts SET {', '.join(fields)} WHERE id = ?",
+                    values,
+                )
+                conn.commit()
+
+            row = conn.execute(
+                "SELECT * FROM workspace_mounts WHERE id = ?",
+                (mount_id,),
+            ).fetchone()
+            return self._mount_row_to_dict(row) if row else None
+
+    def delete_workspace_mount(self, mount_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM workspace_mounts WHERE id = ?", (mount_id,))
+            conn.commit()
+            return cur.rowcount > 0

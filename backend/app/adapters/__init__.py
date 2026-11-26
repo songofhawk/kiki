@@ -15,7 +15,7 @@ from .base import (
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .deepseek_harness import DeepSeekHarnessAdapter
-from .gemini_agent import GeminiAgentAdapter
+from .internal_agent import InternalAgentAdapter
 from .kcode import KCodeAdapter
 from .qoder import QoderAdapter
 from .registry import AdapterRegistry, create_default_registry
@@ -32,8 +32,8 @@ __all__ = [
     "CodexAdapter",
     "DeepSeekHarnessAdapter",
     "ExecutionProfile",
-    "GeminiAgentAdapter",
     "HeavyTaskAdapter",
+    "InternalAgentAdapter",
     "KCodeAdapter",
     "QoderAdapter",
     "StreamParseState",

@@ -81,7 +81,7 @@ class ZCodeAdapter(SubprocessCLIAdapter):
         return [
             binary,
             "-p",
-            ctx.user_content,
+            ctx.build_task_prompt(),
             "--json",
             "--cwd",
             str(ctx.workspace_root),

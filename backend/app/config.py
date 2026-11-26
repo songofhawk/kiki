@@ -62,7 +62,7 @@ class Settings:
     jev_api_key: str = ""
     jev_model: str = DEFAULT_JEV_MODEL
     jev_base_url: str = DEFAULT_JEV_BASE_URL
-    default_heavy_agent: str = "gemini_agent"
+    default_heavy_agent: str = "internal_agent"
     tavily_api_key: str = ""
     serper_api_key: str = ""
     exa_api_key: str = ""
@@ -128,17 +128,24 @@ def load_settings() -> Settings:
     if ENV_FILE.exists():
         load_dotenv(dotenv_path=ENV_FILE, override=False)
 
-    workspace_root = Path(os.getenv("KIKI_WORKSPACE_ROOT", str(REPO_ROOT))).resolve()
+    raw_workspace = os.getenv("KIKI_WORKSPACE_ROOT", "").strip()
+    if raw_workspace:
+        workspace_root = Path(os.path.expandvars(os.path.expanduser(raw_workspace))).resolve()
+    else:
+        workspace_root = (Path.home() / ".kiki" / "workspace").expanduser().resolve()
 
     raw_db_path = os.getenv("KIKI_DATABASE_PATH") or os.getenv("DATABASE_PATH") or "data/kiki.db"
-    db_path = Path(raw_db_path)
+    db_path = Path(os.path.expandvars(os.path.expanduser(raw_db_path)))
     if not db_path.is_absolute():
-        db_path = (workspace_root / db_path).resolve()
+        db_path = (REPO_ROOT / db_path).resolve()
 
-    raw_artifacts_dir = os.getenv("KIKI_ARTIFACTS_DIR") or "data/artifacts"
-    artifacts_dir = Path(raw_artifacts_dir)
-    if not artifacts_dir.is_absolute():
-        artifacts_dir = (workspace_root / artifacts_dir).resolve()
+    raw_artifacts_dir = os.getenv("KIKI_ARTIFACTS_DIR") or ""
+    if raw_artifacts_dir.strip():
+        artifacts_dir = Path(os.path.expandvars(os.path.expanduser(raw_artifacts_dir.strip())))
+        if not artifacts_dir.is_absolute():
+            artifacts_dir = (workspace_root / artifacts_dir).resolve()
+    else:
+        artifacts_dir = (workspace_root / "artifacts").resolve()
 
     raw_fallback_models = os.getenv("GEMINI_FALLBACK_MODELS", "").strip()
     raw_single_fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
@@ -180,7 +187,7 @@ def load_settings() -> Settings:
         jev_api_key=os.getenv("JEV_KEY") or os.getenv("JEV_API_KEY", ""),
         jev_model=os.getenv("JEV_MODEL", DEFAULT_JEV_MODEL),
         jev_base_url=os.getenv("JEV_BASE_URL", DEFAULT_JEV_BASE_URL).rstrip("/"),
-        default_heavy_agent=os.getenv("KIKI_DEFAULT_HEAVY_AGENT", "gemini_agent"),
+        default_heavy_agent=os.getenv("KIKI_DEFAULT_HEAVY_AGENT", "internal_agent"),
         workspace_root=workspace_root,
         database_path=db_path,
         artifacts_dir=artifacts_dir,

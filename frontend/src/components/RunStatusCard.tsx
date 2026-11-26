@@ -44,6 +44,21 @@ function formatElapsed(ms: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+function isImageArtifact(fileType: string, filePath: string): boolean {
+  const t = (fileType || '').toLowerCase();
+  const p = (filePath || '').toLowerCase();
+  return (
+    t.includes('image') ||
+    t.includes('png') ||
+    t.includes('jpg') ||
+    t.includes('jpeg') ||
+    t.includes('webp') ||
+    t.includes('gif') ||
+    t.includes('svg') ||
+    /\.(png|jpe?g|webp|gif|svg)$/.test(p)
+  );
+}
+
 function getArtifactIcon(fileType: string) {
   const t = fileType.toLowerCase();
   if (t.includes('code') || t.includes('py') || t.includes('ts') || t.includes('js') || t.includes('json')) {
@@ -122,12 +137,13 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
     }
   };
 
-  const handleToggleArtifactPreview = async (artifactId: string) => {
+  const handleToggleArtifactPreview = async (artifactId: string, isImage = false) => {
     if (previewArtifactId === artifactId) {
       setPreviewArtifactId(null);
       return;
     }
     setPreviewArtifactId(artifactId);
+    if (isImage) return;
     if (previewContent[artifactId] !== undefined) return;
     setPreviewLoading(true);
     try {
@@ -243,7 +259,7 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
               <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-md bg-[#EFEAE2] text-[#575049] shrink-0">
                 {sessionRun.agent_type}
               </span>
-              <span className="text-xs font-medium text-[#262422] truncate">
+              <span className="text-xs font-medium text-[#262422] break-words">
                 {sessionRun.current_step || DEFAULT_STEP_TEXT[sessionRun.status]}
               </span>
               {stepLogs.length > 0 && (
@@ -353,6 +369,7 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                 <div className="space-y-1.5">
                   {artifacts.map((art) => {
                     const artUrl = `/api/runs/${encodeURIComponent(sessionRun.id)}/artifacts/${encodeURIComponent(art.id)}`;
+                    const isImage = isImageArtifact(art.file_type, art.file_path);
                     const isPreviewOpen = previewArtifactId === art.id;
                     return (
                       <div
@@ -374,7 +391,7 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                           <div className="flex items-center gap-1 shrink-0">
                             <button
                               type="button"
-                              onClick={() => void handleToggleArtifactPreview(art.id)}
+                              onClick={() => void handleToggleArtifactPreview(art.id, isImage)}
                               title="在线预览产物"
                               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-[#FAF8F5] hover:bg-[#EFEAE2] border border-[#E8E2D9] text-[#4E4842] transition-colors"
                             >
@@ -393,8 +410,16 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                           </div>
                         </div>
                         {isPreviewOpen && (
-                          <div className="border-t border-[#EFEAE2] bg-[#FAF8F5] px-3 py-2 max-h-60 overflow-auto">
-                            {previewLoading && previewContent[art.id] === undefined ? (
+                          <div className="border-t border-[#EFEAE2] bg-[#FAF8F5] px-3 py-2 max-h-80 overflow-auto">
+                            {isImage ? (
+                              <a href={artUrl} target="_blank" rel="noopener noreferrer" className="block">
+                                <img
+                                  src={artUrl}
+                                  alt={art.description || art.file_path}
+                                  className="max-h-72 max-w-full rounded-lg border border-[#E8E2D9] object-contain mx-auto bg-white"
+                                />
+                              </a>
+                            ) : previewLoading && previewContent[art.id] === undefined ? (
                               <span className="text-[11px] text-[#8C8378]">正在加载产物内容...</span>
                             ) : (
                               <pre className="text-[11px] font-mono text-[#2E2B28] whitespace-pre-wrap break-words leading-relaxed">

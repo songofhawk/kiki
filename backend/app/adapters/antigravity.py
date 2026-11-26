@@ -2,9 +2,35 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
+
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+_LOCAL_IMAGE_PATH_RE = re.compile(
+    r"(?:file://)?(/(?:Users|home|tmp|var|private)/[^\s)\"'>]+\.(?:png|jpe?g|webp|gif|svg))",
+    flags=re.IGNORECASE,
+)
+
+
+def _clean_local_image_markdown(text: str) -> str:
+    """Remove raw local filesystem image/file links that browsers cannot load directly."""
+    cleaned = re.sub(
+        r"!\[[^\]]*\]\((?:file://)?/[^)]+\.(?:png|jpe?g|webp|gif|svg)\)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\n*图片已保存至[：:]\s*\[[^\]]+\]\(file:///[^)]+\)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 from .base import (
     AdapterContext,
@@ -60,12 +86,12 @@ class AntigravityAdapter(SubprocessCLIAdapter):
     binary_candidates = ("agy", "antigravity")
     env_bin_var = "KIKI_ANTIGRAVITY_BIN"
     env_model_var = "KIKI_ANTIGRAVITY_MODEL"
-    install_hint = "安装 Google Antigravity CLI (agy) 并执行 agy auth login"
+    install_hint = "curl -fsSL https://antigravity.google/cli/install.sh | bash"
     aliases = ("anti-gravity", "anti_gravity", "agy")
     model_tiers: dict[ThinkingLevel, str] = {
-        "low": "gemini-3.5-flash-lite",
-        "medium": "gemini-3.8-flash",
-        "high": "gemini-3.8-pro",
+        "low": "gemini-3.8-flash-low",
+        "medium": "gemini-4-neon-medium",
+        "high": "gemini-4-neon-high",
     }
 
     def build_command(
@@ -77,7 +103,7 @@ class AntigravityAdapter(SubprocessCLIAdapter):
         argv = [
             binary,
             "-p",
-            ctx.user_content,
+            ctx.build_task_prompt(),
             "--output-format",
             "stream-json",
             "--model",
@@ -128,6 +154,68 @@ class AntigravityAdapter(SubprocessCLIAdapter):
 
         ev_type = str(event.get("type") or event.get("event") or "").strip().lower()
         tool_steps: dict[str, int] = state.extra.setdefault("agy_tool_steps", {})
+
+        if ev_type == "init":
+            return
+
+        if ev_type == "step_update":
+            su = event.get("step_update")
+            if not isinstance(su, dict):
+                return
+            conv_id = su.get("conversation_id")
+            if isinstance(conv_id, str) and conv_id.strip():
+                state.session_id = conv_id.strip()
+                ctx.session_id = state.session_id
+
+            step_index = su.get("step_index")
+            step_key = f"su_{step_index}" if step_index is not None else ""
+            step_state = str(su.get("state") or "").strip().upper()
+            step_type = str(su.get("step_type") or "").strip().lower()
+
+            if step_type == "agent_response":
+                buffers: dict[str, str] = state.extra.setdefault("agy_resp_buffers", {})
+                delta = su.get("text_delta")
+                if isinstance(delta, str) and delta:
+                    buffers[step_key] = buffers.get(step_key, "") + delta
+                if step_state == "DONE":
+                    raw_text = (buffers.pop(step_key, "") or "").strip()
+                    if raw_text:
+                        all_raw: list[str] = state.extra.setdefault("agy_raw_texts", [])
+                        all_raw.append(raw_text)
+                        display_text = _clean_local_image_markdown(raw_text) or raw_text
+                        state.final_text_parts = [display_text]
+                        ctx.emit_interim_message(display_text)
+                return
+
+            tool_name = str(su.get("tool_name") or "").strip()
+            if step_type == "subagent" or tool_name:
+                if step_state == "ACTIVE" and step_key not in tool_steps:
+                    detail = f"Antigravity 调用 {tool_name or step_type}"
+                    sub_info = su.get("subagent_info")
+                    if isinstance(sub_info, dict) and isinstance(sub_info.get("subagents"), list) and sub_info["subagents"]:
+                        first_sub = sub_info["subagents"][0]
+                        if isinstance(first_sub, dict):
+                            sub_name = first_sub.get("type_name") or first_sub.get("role") or "subagent"
+                            sub_role = first_sub.get("role")
+                            detail = (
+                                f"Antigravity 调用子代理 {sub_name} ({sub_role})"
+                                if sub_role and sub_role != sub_name
+                                else f"Antigravity 调用子代理 {sub_name}"
+                            )
+                    step = ctx.start_step("tool_call", detail)
+                    state.active_step_id = step["id"]
+                    if step_key:
+                        tool_steps[step_key] = step["id"]
+                elif step_state in ("DONE", "COMPLETED", "ERROR", "FAILED"):
+                    step_id = tool_steps.pop(step_key, None) if step_key else state.active_step_id
+                    if step_id is not None:
+                        ctx.finish_step(
+                            step_id,
+                            status="failed" if step_state in ("ERROR", "FAILED") else "success",
+                        )
+                        if state.active_step_id == step_id:
+                            state.active_step_id = None
+            return
 
         if ev_type in ("tool_use", "tool_call"):
             state.extra["agy_delta_idx"] = None
@@ -249,7 +337,17 @@ class AntigravityAdapter(SubprocessCLIAdapter):
 
         if ev_type == "result":
             state.extra["agy_delta_idx"] = None
+            res_obj = event.get("result")
             is_error = bool(event.get("is_error") or event.get("error"))
+            if isinstance(res_obj, dict):
+                conv_id = res_obj.get("conversation_id") or res_obj.get("session_id")
+                if isinstance(conv_id, str) and conv_id.strip():
+                    state.session_id = conv_id.strip()
+                    ctx.session_id = state.session_id
+                status_str = str(res_obj.get("status") or "").strip().upper()
+                if status_str in ("ERROR", "FAILED", "FAILURE"):
+                    is_error = True
+
             if state.active_step_id is not None:
                 ctx.finish_step(
                     state.active_step_id,
@@ -257,17 +355,78 @@ class AntigravityAdapter(SubprocessCLIAdapter):
                 )
                 state.active_step_id = None
 
-            for field_name in ("result", "output_text", "text", "content"):
-                val = event.get(field_name)
-                if isinstance(val, str) and val.strip():
-                    cleaned = val.strip()
-                    if is_error:
-                        ctx.emit_raw_log(f"[antigravity error] {cleaned}", stream="stderr")
-                        state.stderr_lines.append(cleaned)
-                    if not state.final_text_parts or state.final_text_parts[-1].strip() != cleaned:
-                        state.final_text_parts.append(cleaned)
-                    break
+            extracted_text = ""
+            if isinstance(res_obj, dict):
+                for key in ("response", "output_text", "text", "content", "message"):
+                    val = res_obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        extracted_text = val.strip()
+                        break
+            else:
+                for field_name in ("result", "output_text", "text", "content"):
+                    val = event.get(field_name)
+                    if isinstance(val, str) and val.strip():
+                        extracted_text = val.strip()
+                        break
+
+            if extracted_text:
+                all_raw: list[str] = state.extra.setdefault("agy_raw_texts", [])
+                all_raw.append(extracted_text)
+                if is_error:
+                    ctx.emit_raw_log(f"[antigravity error] {extracted_text}", stream="stderr")
+                    state.stderr_lines.append(extracted_text)
+                if not state.final_text_parts:
+                    display_text = _clean_local_image_markdown(extracted_text) or extracted_text
+                    state.final_text_parts.append(display_text)
             return
 
         state.extra["agy_delta_idx"] = None
         super().parse_json_event(event, state, ctx)
+
+    async def after_process_success(
+        self,
+        ctx: AdapterContext,
+        state: StreamParseState,
+    ) -> None:
+        seen_hashes: set[str] = set()
+        candidate_paths: list[Path] = []
+
+        # 1. Scan Antigravity CLI brain directory for this conversation_id
+        if state.session_id:
+            brain_roots = [
+                Path(os.path.expanduser("~/.gemini/antigravity-cli/brain")) / state.session_id,
+                Path(os.path.expanduser("~/.gemini/antigravity/brain")) / state.session_id,
+            ]
+            for brain_dir in brain_roots:
+                if brain_dir.is_dir():
+                    for p in sorted(brain_dir.iterdir()):
+                        if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS:
+                            candidate_paths.append(p)
+
+        # 2. Scan any local image paths referenced in agent response text
+        for text in state.extra.get("agy_raw_texts", []):
+            for match in _LOCAL_IMAGE_PATH_RE.findall(text):
+                p = Path(match)
+                if p not in candidate_paths:
+                    candidate_paths.append(p)
+
+        for img_path in candidate_paths:
+            try:
+                resolved = img_path.resolve()
+                if not resolved.is_file():
+                    continue
+                raw_bytes = resolved.read_bytes()
+                if len(raw_bytes) < 64:
+                    continue
+                digest = hashlib.sha256(raw_bytes).hexdigest()
+                if digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
+                ctx.register_binary_artifact(
+                    filename=resolved.name,
+                    data=raw_bytes,
+                    file_type="image",
+                    description=f"Antigravity 生成图片 {resolved.name}",
+                )
+            except OSError:
+                continue

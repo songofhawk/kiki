@@ -1,4 +1,4 @@
-"""Built-in Gemini Agent adapter (Kiki native Heavy-Path executor)."""
+"""Built-in Internal Agent adapter (Kiki native Heavy-Path executor)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .base import (
     ThinkingLevel,
 )
 
-AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (gemini_agent)。
+AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (internal_agent)。
 你可以使用工作区与联网工具（list_files, read_file, write_artifact, run_shell, web_search, fetch_webpage, request_human_approval）来完成用户的复杂任务。
 
 执行规范：
@@ -63,16 +63,16 @@ def _step_label_for_tool(tool_name: str, args: dict[str, Any]) -> str:
     return f"正在执行工具 {tool_name}..."
 
 
-class GeminiAgentAdapter(HeavyTaskAdapter):
-    """Built-in Kiki agent powered by Google Gemini Interactions API."""
+class InternalAgentAdapter(HeavyTaskAdapter):
+    """Built-in Kiki internal agent."""
 
-    agent_type = "gemini_agent"
-    display_name = "Kiki 内置 (Gemini Agent)"
-    vendor = "Google Gemini"
+    agent_type = "internal_agent"
+    display_name = "Kiki 内置 (Internal Agent)"
+    vendor = "Kiki"
     description = "Kiki 默认内置异步执行引擎，支持受控工作区读写、Shell、产物生成与 HITL 人工拍板。"
     category = "builtin"
     install_hint = "在根目录 .env 中配置 GEMINI_API_KEY 即可使用"
-    aliases = ("gemini", "builtin", "default")
+    aliases = ("internal", "builtin", "default", "gemini_agent", "gemini")
     env_model_var = "GEMINI_MODEL"
     model_tiers: dict[ThinkingLevel, str] = {
         "low": "gemini-3.5-flash-lite",
@@ -132,13 +132,9 @@ class GeminiAgentAdapter(HeavyTaskAdapter):
             }
         )
 
-        if ctx.history:
-            history_text = KikiLLMClient._format_context_lines(ctx.history[-10:])
-            input_data: Any = (
-                f"当前话题：{ctx.topic_title}\n"
-                f"本话题近期对话与任务记录（按时间从早到晚）：\n{history_text}\n\n"
-                f"用户当前任务：{ctx.user_content}"
-            )
+        prompt_text = ctx.build_task_prompt()
+        if prompt_text != ctx.user_content:
+            input_data: Any = prompt_text
         else:
             input_data = f"当前话题：{ctx.topic_title}\n用户任务：{ctx.user_content}"
         previous_interaction_id: Optional[str] = None

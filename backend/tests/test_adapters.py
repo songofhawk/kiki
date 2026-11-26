@@ -459,3 +459,286 @@ print(json.dumps({{
     ctx._hitl_handler = reject_hitl
     with pytest.raises(asyncio.CancelledError):
         await adapter.execute(ctx)
+
+
+def test_cli_adapters_include_topic_history_and_run_status_in_prompt(tmp_path: Path):
+    ctx = _make_context(tmp_path, "嗯，算了，那就还是用 Codex 生成吧")
+    ctx.topic_title = "生成猫猫 lulu 图片"
+    ctx.topic_summary = "围绕生成名为 lulu 的猫猫图片展开的对话。"
+    ctx.history = [
+        {
+            "role": "user",
+            "content": "调用 Codex 帮我生成一张猫猫的图吧，名字叫 lulu",
+            "session_run": {"agent_type": "codex", "status": "cancelled", "current_step": "任务已取消"},
+        },
+        {
+            "role": "assistant",
+            "content": "喵呜，豆包工作还没准备好。",
+        },
+    ]
+
+    adapters = [
+        CodexAdapter(),
+        ClaudeCodeAdapter(),
+        AntigravityAdapter(),
+        DeepSeekHarnessAdapter(),
+        ZCodeAdapter(),
+        KCodeAdapter(),
+        QoderAdapter(),
+        WorkBuddyAdapter(),
+    ]
+    for adapter in adapters:
+        profile = adapter.select_profile(ctx.user_content)
+        cmd = adapter.build_command(adapter.binary_candidates[0], ctx, profile)
+        joined = "\n".join(cmd)
+        assert "生成猫猫 lulu 图片" in joined
+        assert "围绕生成名为 lulu 的猫猫图片展开的对话" in joined
+        assert "名字叫 lulu" in joined
+        assert "后台任务已取消(codex)" in joined
+        assert ctx.user_content in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_interim_messages_and_rollout_image_artifact_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import base64
+
+    codex_home = tmp_path / ".codex"
+    sess_dir = codex_home / "sessions" / "2026" / "11" / "25"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    # Minimal valid PNG bytes (>= 64 bytes)
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 80
+    b64_png = base64.b64encode(png_bytes).decode("ascii")
+    rollout = sess_dir / "rollout-2026-11-25T15-00-00-th_img_01.jsonl"
+    rollout.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "Extension",
+                                "kind": "image_gen.generation",
+                                "revisedPrompt": "Cute cat Lulu portrait",
+                                "result": b64_png,
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "output": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/png;base64,{b64_png}",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = _make_context(tmp_path, "再试一次")
+    emitted: list[str] = []
+    ctx._emit_interim_message = lambda text: (emitted.append(text), {"id": f"m-{len(emitted)}"})[1]
+
+    codex = CodexAdapter()
+    st = StreamParseState()
+    codex.parse_stdout_line(
+        json.dumps({"type": "thread.started", "thread_id": "th_img_01"}), st, ctx
+    )
+    codex.parse_stdout_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "item_0", "type": "agent_message", "text": "我再试一次生成 Lulu 的图片。"},
+            }
+        ),
+        st,
+        ctx,
+    )
+    codex.parse_stdout_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "item_2", "type": "agent_message", "text": "这次生成成功啦！这就是猫猫 Lulu 🐱"},
+            }
+        ),
+        st,
+        ctx,
+    )
+
+    assert emitted == ["我再试一次生成 Lulu 的图片。", "这次生成成功啦！这就是猫猫 Lulu 🐱"]
+    assert st.best_summary() == "这次生成成功啦！这就是猫猫 Lulu 🐱"
+
+    await codex.after_process_success(ctx, st)
+    run = ctx.db.get_session_run(ctx.run_id)
+    assert run is not None
+    assert len(run["artifacts"]) == 1
+    art = run["artifacts"][0]
+    assert art["file_type"] == "image"
+    assert art["file_path"].endswith("codex_image_1.png")
+    assert (tmp_path / art["file_path"]).read_bytes() == png_bytes
+
+
+def test_format_human_failure_reply_prioritizes_missing_cli_over_login_hint():
+    from app.task_manager import _format_human_failure_reply
+
+    msg = _format_human_failure_reply(
+        "Antigravity (agy)",
+        "未检测到 Antigravity (agy) CLI（查找命令: agy, antigravity）。请先安装：安装 Google Antigravity CLI (agy) 并执行 agy auth login",
+    )
+    assert "还没准备好" in msg
+    assert "未检测到 Antigravity (agy) CLI" in msg
+    assert "鉴权失败" not in msg
+
+
+@pytest.mark.asyncio
+async def test_antigravity_step_update_result_dict_and_image_artifact_extraction(
+    tmp_path: Path,
+):
+    img_file = tmp_path / "lulu_portrait_123.jpg"
+    jpg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 80
+    img_file.write_bytes(jpg_bytes)
+
+    ctx = _make_context(tmp_path, "这回再试试，应该有 agy 了")
+    emitted: list[str] = []
+    ctx._emit_interim_message = lambda text: (emitted.append(text), {"id": f"m-{len(emitted)}"})[1]
+
+    agy = AntigravityAdapter()
+    st = StreamParseState()
+
+    agy.parse_stdout_line(
+        json.dumps({"event": "init", "conversation_id": "conv_agy_1"}), st, ctx
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv_agy_1",
+                    "step_index": 2,
+                    "state": "ACTIVE",
+                    "step_type": "subagent",
+                    "tool_name": "invoke_subagent",
+                    "subagent_info": {
+                        "subagents": [{"type_name": "image-generator", "role": "Cat Image Generator"}]
+                    },
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv_agy_1",
+                    "step_index": 2,
+                    "state": "DONE",
+                    "step_type": "subagent",
+                    "tool_name": "invoke_subagent",
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv_agy_1",
+                    "step_index": 3,
+                    "state": "ACTIVE",
+                    "step_type": "agent_response",
+                    "text_delta": "正在为你生成猫猫 Lulu 的图片，请稍候~",
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv_agy_1",
+                    "step_index": 3,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": "\n",
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+    final_raw = (
+        f"Antigravity 帮你生成好猫猫 Lulu 的图片啦！🐱\n\n"
+        f"图片已保存至：[lulu_portrait_123.jpg](file://{img_file})\n\n"
+        f"![Lulu]({img_file})"
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "conv_agy_1",
+                    "step_index": 5,
+                    "state": "DONE",
+                    "step_type": "agent_response",
+                    "text_delta": final_raw,
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+    agy.parse_stdout_line(
+        json.dumps(
+            {
+                "event": "result",
+                "result": {
+                    "conversation_id": "conv_agy_1",
+                    "status": "SUCCESS",
+                    "response": f"正在为你生成猫猫 Lulu 的图片，请稍候~\n{final_raw}",
+                },
+            }
+        ),
+        st,
+        ctx,
+    )
+
+    assert st.session_id == "conv_agy_1"
+    assert len(emitted) == 2
+    assert emitted[0] == "正在为你生成猫猫 Lulu 的图片，请稍候~"
+    assert emitted[1] == "Antigravity 帮你生成好猫猫 Lulu 的图片啦！🐱"
+    assert st.best_summary() == "Antigravity 帮你生成好猫猫 Lulu 的图片啦！🐱"
+    assert '{"event"' not in st.best_summary()
+
+    await agy.after_process_success(ctx, st)
+    run = ctx.db.get_session_run(ctx.run_id)
+    assert run is not None
+    assert len(run["artifacts"]) == 1
+    assert run["artifacts"][0]["file_type"] == "image"
+    assert run["artifacts"][0]["file_path"].endswith("lulu_portrait_123.jpg")
+
+
+
+

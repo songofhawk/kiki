@@ -33,7 +33,7 @@
 
 ---
 
-## 二、 数据库表结构 DDL (5 张核心 SQLite 表)
+## 二、 数据库表结构 DDL (核心 SQLite 表)
 
 ```sql
 -- 1. 话题表 (Topics)
@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS topics (
     title TEXT NOT NULL,
     summary TEXT,
     status TEXT CHECK(status IN ('active', 'archived', 'deleted')) DEFAULT 'active',
+    unread INTEGER DEFAULT 0,
+    workspace_dir TEXT, -- 话题专属自动子目录 (<kiki_workspace>/topics/<topic_id>)
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -94,7 +96,29 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(run_id) REFERENCES session_runs(id) ON DELETE CASCADE
 );
+
+-- 6. 工作空间目录挂载表 (WorkspaceMounts)
+CREATE TABLE IF NOT EXISTS workspace_mounts (
+    id TEXT PRIMARY KEY,
+    scope TEXT CHECK(scope IN ('global', 'topic')) NOT NULL, -- 主信息流或单话题
+    topic_id TEXT,
+    path TEXT NOT NULL,
+    label TEXT,
+    is_primary INTEGER DEFAULT 0, -- 是否作为该作用域下 Agent 的主工作目录 (cwd)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(topic_id) REFERENCES topics(id) ON DELETE CASCADE
+);
 ```
+
+### 工作空间与跨 Agent 目录协同机制
+* **Kiki 专属工作空间根目录**：默认位于 `~/.kiki/workspace`（可通过环境变量 `KIKI_WORKSPACE_ROOT` 覆盖），与 Kiki 源码仓库完全解耦。自动初始化以下布局：
+  * `rules/`：全局规则文件，供 Kiki 与所有外部 Agent 共享遵循；
+  * `shared/`：主信息流及跨话题共享资源；
+  * `topics/<topic_id>/`：每个话题自动创建的专属子目录，内含 `artifacts/`（任务产物）与 `files/`（协作工作文件）。
+* **用户自定义目录挂载**：支持为主信息流（`scope='global'`）及单个话题（`scope='topic'`）添加本地目录。当话题指定了外部目录时，Agent 默认以该外部目录作为主工作目录（`cwd`），同时将话题专属子目录、`shared/`、`rules/` 及其他挂载目录作为附加目录透传。
+* **跨 Agent 透传协议**：
+  1. 内置 `WorkspaceToolExecutor` 按任务动态绑定当前话题的允许目录集，产物归档至话题 `artifacts/`；
+  2. 外部 CLI Agent 通过进程 `cwd`、原生多目录参数（如 Claude Code / Codex 的 `--add-dir`）、标准化环境变量（`KIKI_WORKSPACE_ROOT`、`KIKI_TOPIC_DIR`、`KIKI_ARTIFACTS_DIR`、`KIKI_SHARED_DIR`、`KIKI_RULES_DIR`、`KIKI_PRIMARY_DIR`、`KIKI_EXTRA_DIRS`）以及 Prompt 工作区声明四重透传。
 
 ---
 

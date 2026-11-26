@@ -24,7 +24,7 @@ class RouteDecision(BaseModel):
     )
     agent_type: Optional[str] = Field(
         default=None,
-        description="Explicitly requested Heavy-Path agent ID (e.g. codex, claude_code, gemini_agent) if mentioned by user or continuing a previous agent task, else null",
+        description="Explicitly requested Heavy-Path agent ID (e.g. codex, claude_code, internal_agent) if mentioned by user or continuing a previous agent task, else null",
     )
     confidence: float = Field(
         ge=0.0,
@@ -84,6 +84,53 @@ class HealthResponse(BaseModel):
     model: str
     database_path: str
     api_key_configured: bool
+    workspace_root: Optional[str] = None
+
+
+class WorkspaceMountItem(BaseModel):
+    id: str
+    scope: Literal["global", "topic"]
+    topic_id: Optional[str] = None
+    path: str
+    label: Optional[str] = None
+    is_primary: bool = False
+    exists: bool = True
+    created_at: str
+
+
+class WorkspaceMountCreateRequest(BaseModel):
+    scope: Literal["global", "topic"]
+    topic_id: Optional[str] = None
+    path: str = Field(min_length=1)
+    label: Optional[str] = None
+    is_primary: bool = False
+
+
+class WorkspaceMountUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    is_primary: Optional[bool] = None
+
+
+class GlobalWorkspaceResponse(BaseModel):
+    workspace_root: str
+    rules_dir: str
+    shared_dir: str
+    topics_dir: str
+    global_mounts: list[WorkspaceMountItem] = Field(default_factory=list)
+
+
+class TopicWorkspaceResponse(BaseModel):
+    workspace_root: str
+    rules_dir: str
+    shared_dir: str
+    topic_id: str
+    topic_dir: str
+    topic_files_dir: str
+    topic_artifacts_dir: str
+    primary_dir: str
+    extra_dirs: list[str] = Field(default_factory=list)
+    global_mounts: list[WorkspaceMountItem] = Field(default_factory=list)
+    topic_mounts: list[WorkspaceMountItem] = Field(default_factory=list)
 
 
 class TopicCreateRequest(BaseModel):
@@ -104,6 +151,7 @@ class TopicSummary(BaseModel):
     summary: Optional[str] = None
     status: Literal["active", "archived", "deleted"] = "active"
     unread: bool = False
+    workspace_dir: Optional[str] = None
     created_at: str
     updated_at: str
     message_count: int = 0

@@ -17,6 +17,40 @@ export interface HealthResponse {
   model?: string;
   database_path?: string;
   api_key_configured?: boolean;
+  workspace_root?: string;
+}
+
+export interface WorkspaceMount {
+  id: string;
+  scope: 'global' | 'topic';
+  topic_id?: string | null;
+  path: string;
+  label?: string | null;
+  is_primary: boolean;
+  exists: boolean;
+  created_at: string;
+}
+
+export interface GlobalWorkspace {
+  workspace_root: string;
+  rules_dir: string;
+  shared_dir: string;
+  topics_dir: string;
+  global_mounts: WorkspaceMount[];
+}
+
+export interface TopicWorkspace {
+  workspace_root: string;
+  rules_dir: string;
+  shared_dir: string;
+  topic_id: string;
+  topic_dir: string;
+  topic_files_dir: string;
+  topic_artifacts_dir: string;
+  primary_dir: string;
+  extra_dirs: string[];
+  global_mounts: WorkspaceMount[];
+  topic_mounts: WorkspaceMount[];
 }
 
 export interface Topic {
@@ -24,6 +58,7 @@ export interface Topic {
   title: string;
   summary?: string | null;
   status: TopicStatus;
+  workspace_dir?: string | null;
   created_at: string;
   updated_at: string;
   message_count?: number;

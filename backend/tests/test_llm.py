@@ -480,7 +480,7 @@ def test_recent_messages_with_topic_includes_failed_session_run_in_context(tmp_p
     run = db.create_session_run(
         topic_id=topic["id"],
         trigger_message_id=user_msg["id"],
-        agent_type="gemini_agent",
+        agent_type="internal_agent",
         status="queued",
     )
     db.update_message(user_msg["id"], metadata={"session_run_id": run["id"]})
@@ -724,3 +724,64 @@ async def test_zhipu_only_status_fast_reply_and_agent_turn(
         previous_interaction_id=t1.id,
     )
     assert t2.output_text == "智谱重型任务完成"
+
+
+@pytest.mark.asyncio
+async def test_explain_run_failure_uses_llm_and_returns_none_when_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        gemini_api_key="",
+        deepseek_api_key="",
+        zhipu_api_key="zhipu-test-key",
+        zhipu_model="glm-4-flash",
+    )
+    llm = KikiLLMClient(settings)
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_openai_post(
+        *,
+        base_url: str,
+        api_key: str,
+        payload: dict[str, Any],
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        captured.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "喵呜，本机还没安装 Antigravity CLI（agy），先执行官方安装脚本就可以用啦。"
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(llm, "_openai_post_chat", fake_openai_post)
+    reply = await llm.explain_run_failure(
+        agent_name="Antigravity (agy)",
+        user_content="Antigravity 也给我生成一张吧",
+        error_message="未检测到 Antigravity (agy) CLI",
+    )
+    assert reply is not None
+    assert "没安装" in reply
+    assert len(captured) == 1
+    assert "未检测到 Antigravity (agy) CLI" in captured[0]["messages"][1]["content"]
+
+    # When all providers fail, returns None so TaskManager falls back cleanly
+    async def failing_post(**kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(llm, "_openai_post_chat", failing_post)
+    assert (
+        await llm.explain_run_failure(
+            agent_name="Antigravity (agy)",
+            user_content="test",
+            error_message="some error",
+        )
+        is None
+    )
+

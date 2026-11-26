@@ -50,7 +50,7 @@ export const ToastContainer: React.FC<ToastContainerProps> = ({
               <span className="shrink-0">捷报送达</span>
               <ArrowUpRight className="w-3.5 h-3.5 text-[#8C8378] opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
             </div>
-            <p className="mt-0.5 text-xs text-[#5C554E] line-clamp-2 leading-relaxed">
+            <p className="mt-0.5 text-xs text-[#5C554E] break-words leading-relaxed">
               {toast.summary}
             </p>
           </div>

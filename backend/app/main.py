@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import hmac
+import signal
+import threading
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -24,6 +27,7 @@ from .schemas import (
     BatchMessageTopicReassignResponse,
     ChatRequest,
     ChatResponse,
+    GlobalWorkspaceResponse,
     HealthResponse,
     MessageItem,
     MessagePageResponse,
@@ -35,10 +39,15 @@ from .schemas import (
     TopicCreateRequest,
     TopicSummary,
     TopicUpdateRequest,
+    TopicWorkspaceResponse,
+    WorkspaceMountCreateRequest,
+    WorkspaceMountItem,
+    WorkspaceMountUpdateRequest,
 )
 from .sse import EventBus
 from .tools import WorkspaceToolExecutor
 from .task_manager import TaskManager
+from .workspace import WorkspaceManager, normalize_directory_path
 
 
 def _enrich_message(msg: dict[str, Any], event_bus: EventBus) -> dict[str, Any]:
@@ -65,6 +74,11 @@ def create_app(
         gemini_api_key_configured=cfg.any_llm_configured,
     )
     search_service = WebSearchService(cfg)
+    workspace_manager = WorkspaceManager(
+        workspace_root=cfg.workspace_root,
+        legacy_artifacts_dir=cfg.artifacts_dir,
+    )
+    database.set_workspace_manager(workspace_manager)
     tool_executor = WorkspaceToolExecutor(
         workspace_root=cfg.workspace_root,
         artifacts_dir=cfg.artifacts_dir,
@@ -79,6 +93,7 @@ def create_app(
         tool_executor=tool_executor,
         adapter_registry=registry,
         settings=cfg,
+        workspace_manager=workspace_manager,
     )
     decision_router = DecisionRouter(
         db=database,
@@ -113,18 +128,53 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        workspace_manager.ensure_base_layout()
         database.init_db()
+        database.ensure_all_topic_workspaces()
         database.reconcile_orphaned_state()
         cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
         dream_consolidator.start()
-        yield
-        await dream_consolidator.shutdown()
-        await fast_path.shutdown()
-        await task_manager.shutdown()
-        aclose_fn = getattr(llm_client, "aclose", None)
-        if callable(aclose_fn):
-            await aclose_fn()
-        database.close()
+
+        # Close open SSE streams immediately on SIGTERM/SIGINT so `uvicorn --reload`
+        # never deadlocks waiting for infinite /api/events connections to drain.
+        loop = asyncio.get_running_loop()
+        prev_handlers: dict[int, Any] = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    prev = signal.getsignal(sig)
+                    prev_handlers[sig] = prev
+
+                    def _make_handler(original: Any):
+                        def _handler(signum: int, frame: Any) -> None:
+                            try:
+                                loop.call_soon_threadsafe(bus.close_all)
+                            except RuntimeError:
+                                bus.close_all()
+                            if callable(original):
+                                original(signum, frame)
+                        return _handler
+
+                    signal.signal(sig, _make_handler(prev))
+                except (ValueError, OSError):
+                    pass
+
+        try:
+            yield
+        finally:
+            bus.close_all()
+            for sig, prev in prev_handlers.items():
+                try:
+                    signal.signal(sig, prev)
+                except (ValueError, OSError):
+                    pass
+            await dream_consolidator.shutdown()
+            await fast_path.shutdown()
+            await task_manager.shutdown()
+            aclose_fn = getattr(llm_client, "aclose", None)
+            if callable(aclose_fn):
+                await aclose_fn()
+            database.close()
 
     app = FastAPI(
         title="Kiki V1 Personal Agent API",
@@ -139,6 +189,7 @@ def create_app(
     app.state.event_bus = bus
     app.state.adapter_registry = registry
     app.state.search_service = search_service
+    app.state.workspace_manager = workspace_manager
     app.state.task_manager = task_manager
     app.state.decision_router = decision_router
     app.state.fast_path = fast_path
@@ -188,7 +239,115 @@ def create_app(
             model=cfg.gemini_model,
             database_path=str(cfg.database_path),
             api_key_configured=cfg.any_llm_configured,
+            workspace_root=str(workspace_manager.workspace_root),
         )
+
+    # ------------------------------------------------------------------
+    # Workspace & Custom Directory Mounts
+    # ------------------------------------------------------------------
+    def _decorate_mount(item: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(item)
+        try:
+            decorated["exists"] = Path(str(item["path"])).is_dir()
+        except OSError:
+            decorated["exists"] = False
+        return decorated
+
+    @app.get("/api/workspace", response_model=GlobalWorkspaceResponse)
+    async def get_global_workspace() -> GlobalWorkspaceResponse:
+        workspace_manager.ensure_base_layout()
+        global_mounts = [
+            _decorate_mount(m)
+            for m in database.list_workspace_mounts(scope="global")
+        ]
+        return GlobalWorkspaceResponse(
+            workspace_root=str(workspace_manager.workspace_root),
+            rules_dir=str(workspace_manager.rules_dir),
+            shared_dir=str(workspace_manager.shared_dir),
+            topics_dir=str(workspace_manager.topics_dir),
+            global_mounts=[WorkspaceMountItem.model_validate(m) for m in global_mounts],
+        )
+
+    @app.get("/api/topics/{topic_id}/workspace", response_model=TopicWorkspaceResponse)
+    async def get_topic_workspace(topic_id: str) -> TopicWorkspaceResponse:
+        topic = database.get_topic(topic_id)
+        if topic is None:
+            raise HTTPException(status_code=404, detail="Topic not found")
+        topic_mounts = [
+            _decorate_mount(m)
+            for m in database.list_workspace_mounts(scope="topic", topic_id=topic_id)
+        ]
+        global_mounts = [
+            _decorate_mount(m)
+            for m in database.list_workspace_mounts(scope="global")
+        ]
+        resolved = workspace_manager.resolve_for_topic(
+            topic_id,
+            topic_mounts=topic_mounts,
+            global_mounts=global_mounts,
+            topic_workspace_dir=topic.get("workspace_dir"),
+            ensure_dirs=True,
+        )
+        if not topic.get("workspace_dir"):
+            database.update_topic(topic_id, workspace_dir=str(resolved.topic_dir))
+        return TopicWorkspaceResponse(
+            workspace_root=str(resolved.workspace_root),
+            rules_dir=str(resolved.rules_dir),
+            shared_dir=str(resolved.shared_dir),
+            topic_id=topic_id,
+            topic_dir=str(resolved.topic_dir),
+            topic_files_dir=str(resolved.topic_files_dir),
+            topic_artifacts_dir=str(resolved.topic_artifacts_dir),
+            primary_dir=str(resolved.primary_dir),
+            extra_dirs=[str(p) for p in resolved.extra_dirs],
+            global_mounts=[WorkspaceMountItem.model_validate(m) for m in global_mounts],
+            topic_mounts=[WorkspaceMountItem.model_validate(m) for m in topic_mounts],
+        )
+
+    @app.post("/api/workspace/mounts", response_model=WorkspaceMountItem, status_code=201)
+    async def add_workspace_mount(req: WorkspaceMountCreateRequest) -> WorkspaceMountItem:
+        if req.scope == "topic":
+            if not req.topic_id:
+                raise HTTPException(status_code=400, detail="topic_id is required for topic mount")
+            if database.get_topic(req.topic_id) is None:
+                raise HTTPException(status_code=404, detail="Topic not found")
+        try:
+            resolved_path = normalize_directory_path(req.path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not resolved_path.exists() or not resolved_path.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail=f"指定目录不存在或不是文件夹: {resolved_path}",
+            )
+        mount = database.add_workspace_mount(
+            scope=req.scope,
+            path=str(resolved_path),
+            topic_id=req.topic_id if req.scope == "topic" else None,
+            label=req.label,
+            is_primary=req.is_primary,
+        )
+        return WorkspaceMountItem.model_validate(_decorate_mount(mount))
+
+    @app.patch("/api/workspace/mounts/{mount_id}", response_model=WorkspaceMountItem)
+    async def update_workspace_mount(
+        mount_id: str,
+        req: WorkspaceMountUpdateRequest,
+    ) -> WorkspaceMountItem:
+        updated = database.update_workspace_mount(
+            mount_id,
+            label=req.label,
+            is_primary=req.is_primary,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Workspace mount not found")
+        return WorkspaceMountItem.model_validate(_decorate_mount(updated))
+
+    @app.delete("/api/workspace/mounts/{mount_id}", status_code=204)
+    async def delete_workspace_mount(mount_id: str) -> None:
+        deleted = database.delete_workspace_mount(mount_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Workspace mount not found")
 
     @app.get("/api/adapters", response_model=list[AdapterInfoResponse])
     async def list_adapters() -> list[AdapterInfoResponse]:
@@ -409,11 +568,30 @@ def create_app(
             requested_agent = (
                 None if (not raw_req_agent or raw_req_agent.lower() == "auto") else raw_req_agent
             )
+            inherited_topic_agent: Optional[str] = None
+            if (
+                not requested_agent
+                and not registry.try_resolve_type(decision.agent_type)
+                and decision.topic_action == "reuse"
+            ):
+                latest_topic_run = database.get_latest_topic_run(topic["id"])
+                prior_agent = (
+                    registry.try_resolve_type(latest_topic_run.get("agent_type"))
+                    if latest_topic_run
+                    else None
+                )
+                if prior_agent:
+                    try:
+                        if registry.get(prior_agent).probe().available:
+                            inherited_topic_agent = prior_agent
+                    except KeyError:
+                        pass
             resolved_agent_type = (
                 requested_agent
                 or registry.try_resolve_type(decision.agent_type)
+                or inherited_topic_agent
                 or cfg.default_heavy_agent
-                or "gemini_agent"
+                or "internal_agent"
             )
             if decision.agent_type != resolved_agent_type:
                 canonical = registry.try_resolve_type(resolved_agent_type)
@@ -508,12 +686,32 @@ def create_app(
             raise HTTPException(status_code=404, detail="Artifact not found")
 
         raw_path = Path(str(artifact["file_path"]))
-        candidate = (
-            raw_path.resolve()
-            if raw_path.is_absolute()
-            else (cfg.workspace_root / raw_path).resolve()
-        )
+        run = database.get_session_run(run_id)
         allowed_roots = [cfg.artifacts_dir.resolve(), cfg.workspace_root.resolve()]
+        primary_root = cfg.workspace_root
+        if run is not None:
+            topic = database.get_topic(run["topic_id"])
+            resolved_ws = workspace_manager.resolve_for_topic(
+                run["topic_id"],
+                topic_mounts=database.list_workspace_mounts(scope="topic", topic_id=run["topic_id"]),
+                global_mounts=database.list_workspace_mounts(scope="global"),
+                topic_workspace_dir=topic.get("workspace_dir") if topic else None,
+                ensure_dirs=False,
+            )
+            primary_root = resolved_ws.primary_dir
+            for r in resolved_ws.allowed_roots:
+                if r not in allowed_roots:
+                    allowed_roots.append(r)
+
+        if raw_path.is_absolute():
+            candidate = raw_path.resolve()
+        else:
+            candidate = (primary_root / raw_path).resolve()
+            if not candidate.is_file():
+                alt = (cfg.workspace_root / raw_path).resolve()
+                if alt.is_file():
+                    candidate = alt
+
         if not any(
             candidate == root or root in candidate.parents for root in allowed_roots
         ):
@@ -530,9 +728,9 @@ def create_app(
     # SSE Stream
     # ------------------------------------------------------------------
     @app.get("/api/events")
-    async def events() -> StreamingResponse:
+    async def events(request: Request) -> StreamingResponse:
         return StreamingResponse(
-            bus.subscribe(heartbeat_interval=15.0),
+            bus.subscribe(heartbeat_interval=15.0, is_disconnected=request.is_disconnected),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

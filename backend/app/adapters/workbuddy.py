@@ -50,7 +50,7 @@ class WorkBuddyAdapter(SubprocessCLIAdapter):
         argv = [
             binary,
             "-p",
-            ctx.user_content,
+            ctx.build_task_prompt(),
             "--output-format",
             "stream-json",
             "--model",

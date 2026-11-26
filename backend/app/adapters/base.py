@@ -16,6 +16,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional
@@ -141,14 +143,79 @@ class AdapterContext:
     model_override: Optional[str] = None
     thinking_override: Optional[ThinkingLevel] = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    topic_summary: Optional[str] = None
+    kiki_workspace_root: Optional[Path] = None
+    topic_dir: Optional[Path] = None
+    shared_dir: Optional[Path] = None
+    rules_dir: Optional[Path] = None
+    extra_dirs: list[Path] = field(default_factory=list)
+    rule_files: list[Path] = field(default_factory=list)
     max_steps: int = 10
     timeout_sec: float = 600.0
     _hitl_handler: Optional[
         Callable[[str, list[dict[str, Any]]], Awaitable[dict[str, Any]]]
     ] = None
     _publish_run_update: Optional[Callable[[str], Optional[dict[str, Any]]]] = None
+    _emit_interim_message: Optional[Callable[[str], Optional[dict[str, Any]]]] = None
     _step_counter: int = 0
     session_id: Optional[str] = None
+    last_emitted_message_id: Optional[str] = None
+    last_emitted_text: Optional[str] = None
+
+    def build_workspace_context_block(self) -> str:
+        """Return a concise workspace directory guide for cross-agent collaboration."""
+        if not (self.topic_dir or self.shared_dir or self.rules_dir or self.extra_dirs):
+            return ""
+        lines: list[str] = [
+            "【Kiki 工作空间与协作目录】",
+            f"- 当前主工作目录 (cwd): {self.workspace_root}",
+        ]
+        if self.topic_dir is not None:
+            lines.append(f"- 当前话题目录: {self.topic_dir}")
+            lines.append(f"- 话题产物目录 (artifacts): {self.artifacts_dir}")
+        if self.shared_dir is not None:
+            lines.append(f"- 共享资源目录 (shared): {self.shared_dir}")
+        if self.rules_dir is not None:
+            if self.rule_files:
+                rule_names = ", ".join(str(p) for p in self.rule_files[:6])
+                lines.append(f"- 规则目录 (rules): {self.rules_dir}（可用规则文件: {rule_names}）")
+            else:
+                lines.append(f"- 规则目录 (rules): {self.rules_dir}")
+        custom_extras = [
+            p
+            for p in self.extra_dirs
+            if p not in {self.topic_dir, self.shared_dir, self.rules_dir, self.workspace_root}
+        ]
+        if custom_extras:
+            lines.append("- 其他已挂载目录: " + ", ".join(str(p) for p in custom_extras))
+        return "\n".join(lines)
+
+    def build_task_prompt(self, max_history: int = 14) -> str:
+        """Build an execution prompt enriched with workspace context and recent topic history."""
+        ws_block = self.build_workspace_context_block()
+        if not self.history:
+            if not ws_block:
+                return self.user_content
+            return (
+                f"当前话题：{self.topic_title}\n"
+                f"{ws_block}\n\n"
+                f"用户当前任务：{self.user_content}"
+            )
+        from ..llm import KikiLLMClient
+
+        history_text = KikiLLMClient._format_context_lines(self.history[-max_history:])
+        header_parts = [f"当前话题：{self.topic_title}"]
+        if self.topic_summary and self.topic_summary.strip():
+            header_parts.append(f"话题摘要：{self.topic_summary.strip()}")
+        if ws_block:
+            header_parts.append(ws_block)
+        header = "\n".join(header_parts)
+        return (
+            f"{header}\n"
+            f"本话题近期对话与任务记录（按时间从早到晚，供理解指代与上下文）：\n"
+            f"{history_text}\n\n"
+            f"用户当前任务：{self.user_content}"
+        )
 
     def next_step_number(self) -> int:
         self._step_counter += 1
@@ -208,6 +275,31 @@ class AdapterContext:
             file_type=file_type,
             description=description,
         )
+
+    def register_binary_artifact(
+        self,
+        filename: str,
+        data: bytes,
+        file_type: str = "image",
+        description: str = "",
+    ) -> dict[str, Any]:
+        return self.tool_executor.write_binary_artifact(
+            run_id=self.run_id,
+            filename=filename,
+            data=data,
+            file_type=file_type,
+            description=description,
+        )
+
+    def emit_interim_message(self, content: str) -> Optional[dict[str, Any]]:
+        cleaned = (content or "").strip()
+        if not cleaned or self._emit_interim_message is None:
+            return None
+        msg = self._emit_interim_message(cleaned)
+        if msg and msg.get("id"):
+            self.last_emitted_message_id = str(msg["id"])
+            self.last_emitted_text = cleaned
+        return msg
 
     async def request_hitl_approval(
         self,
@@ -414,11 +506,70 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         """Build the argv list to resume a session after HITL approval."""
         return None
 
+    @staticmethod
+    def _detect_macos_system_proxies() -> dict[str, str]:
+        """Read macOS system proxy (scutil --proxy) when env proxy vars are absent."""
+        if sys.platform != "darwin":
+            return {}
+        try:
+            proc = subprocess.run(
+                ["scutil", "--proxy"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                return {}
+        except Exception:
+            return {}
+
+        text = proc.stdout
+
+        def _val(key: str) -> Optional[str]:
+            m = re.search(rf"^\s*{re.escape(key)}\s*:\s*(.+)$", text, flags=re.MULTILINE)
+            return m.group(1).strip() if m else None
+
+        proxies: dict[str, str] = {}
+        if _val("HTTPEnable") == "1":
+            host, port = _val("HTTPProxy"), _val("HTTPPort")
+            if host and port:
+                proxies["HTTP_PROXY"] = f"http://{host}:{port}"
+        if _val("HTTPSEnable") == "1":
+            host, port = _val("HTTPSProxy"), _val("HTTPSPort")
+            if host and port:
+                proxies["HTTPS_PROXY"] = f"http://{host}:{port}"
+        if _val("SOCKSEnable") == "1":
+            host, port = _val("SOCKSProxy"), _val("SOCKSPort")
+            if host and port:
+                proxies["ALL_PROXY"] = f"socks5://{host}:{port}"
+        return proxies
+
     def build_env(self, ctx: AdapterContext, profile: ExecutionProfile) -> dict[str, str]:
-        """Construct subprocess environment variables."""
+        """Construct subprocess environment variables with Kiki workspace paths."""
         env = os.environ.copy()
         env.setdefault("NO_COLOR", "1")
         env.setdefault("CI", "1")
+        env["KIKI_TOPIC_ID"] = ctx.topic_id
+        env["KIKI_PRIMARY_DIR"] = str(ctx.workspace_root)
+        env["KIKI_ARTIFACTS_DIR"] = str(ctx.artifacts_dir)
+        if ctx.kiki_workspace_root is not None:
+            env["KIKI_WORKSPACE_ROOT"] = str(ctx.kiki_workspace_root)
+        if ctx.topic_dir is not None:
+            env["KIKI_TOPIC_DIR"] = str(ctx.topic_dir)
+        if ctx.shared_dir is not None:
+            env["KIKI_SHARED_DIR"] = str(ctx.shared_dir)
+        if ctx.rules_dir is not None:
+            env["KIKI_RULES_DIR"] = str(ctx.rules_dir)
+        if ctx.extra_dirs:
+            env["KIKI_EXTRA_DIRS"] = os.pathsep.join(str(p) for p in ctx.extra_dirs)
+        if not any(
+            env.get(k)
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+        ):
+            for k, v in self._detect_macos_system_proxies().items():
+                env.setdefault(k, v)
+                env.setdefault(k.lower(), v)
         return env
 
     def parse_json_event(
@@ -527,6 +678,8 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
                 "event": "cli_spawn",
                 "adapter": self.agent_type,
                 "argv": argv,
+                "cwd": str(ctx.workspace_root),
+                "extra_dirs": [str(p) for p in ctx.extra_dirs],
                 "model": profile.model,
                 "thinking_level": profile.thinking_level,
             }
@@ -595,6 +748,14 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         proc = self._active_procs.get(run_id)
         if proc is not None:
             await self._terminate_proc(proc)
+
+    async def after_process_success(
+        self,
+        ctx: AdapterContext,
+        state: StreamParseState,
+    ) -> None:
+        """Optional hook called after CLI exits with returncode 0 (e.g. artifact extraction)."""
+        return None
 
     async def execute(self, ctx: AdapterContext) -> AdapterResult:
         profile = self.select_profile(
@@ -677,6 +838,8 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
             raise RuntimeError(
                 f"{self.display_name} 退出码 {returncode}: {err_tail or '未知错误'}"
             )
+
+        await self.after_process_success(ctx, state)
 
         summary = state.best_summary() or f"{self.display_name} 已完成任务。"
         return AdapterResult(

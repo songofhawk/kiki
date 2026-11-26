@@ -19,6 +19,7 @@ from .db import Database
 from .llm import KikiLLMClient
 from .sse import EventBus
 from .tools import WorkspaceToolExecutor
+from .workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,16 @@ def _format_human_failure_reply(agent_name: str, err_msg: str) -> str:
     """Translate raw Heavy-Path exception text into a readable Kiki assistant message."""
     raw = " ".join((err_msg or "").split())
     lower = raw.lower()
+
+    # Check missing binary / not-installed errors FIRST so install hints mentioning
+    # "login" or "API_KEY" (e.g. "执行 agy auth login") are never misclassified as auth failures.
+    if (
+        "未检测到" in raw
+        or "command not found" in lower
+        or "no such file or directory" in lower
+        or "enoent" in lower
+    ):
+        return f"喵呜，**{agent_name}** 还没准备好：{_truncate_summary(raw, max_chars=220)}"
 
     if any(
         kw in lower
@@ -89,8 +100,8 @@ def _format_human_failure_reply(agent_name: str, err_msg: str) -> str:
             f"稍等一下再让我重跑一次就好啦。"
         )
 
-    if "未检测到" in raw or "not found" in lower:
-        return f"喵呜，**{agent_name}** 还没准备好：{_truncate_summary(raw, max_chars=180)}"
+    if "not found" in lower:
+        return f"喵呜，**{agent_name}** 还没准备好：{_truncate_summary(raw, max_chars=220)}"
 
     detail = _truncate_summary(raw, max_chars=160) if raw else "未知错误"
     return (
@@ -135,6 +146,7 @@ class TaskManager:
         tool_executor: WorkspaceToolExecutor,
         adapter_registry: Optional[AdapterRegistry] = None,
         settings: Optional[Settings] = None,
+        workspace_manager: Optional[WorkspaceManager] = None,
         max_steps: int = 10,
         status_provider: Optional[Callable[[], Literal["idle", "thinking", "running", "waiting_input"]]] = None,
     ) -> None:
@@ -143,6 +155,10 @@ class TaskManager:
         self.event_bus = event_bus
         self.tool_executor = tool_executor
         self.settings = settings
+        self.workspace_manager = workspace_manager or WorkspaceManager(
+            workspace_root=tool_executor.workspace_root,
+            legacy_artifacts_dir=tool_executor.artifacts_dir,
+        )
         self.adapter_registry = adapter_registry or create_default_registry(
             gemini_model=settings.gemini_model if settings else None,
             gemini_api_key_configured=settings.any_llm_configured if settings else True,
@@ -184,7 +200,7 @@ class TaskManager:
         thinking_override: Optional[ThinkingLevel] = None,
     ) -> dict[str, Any]:
         default_agent = (
-            self.settings.default_heavy_agent if self.settings else "gemini_agent"
+            self.settings.default_heavy_agent if self.settings else "internal_agent"
         )
         canonical_type = self.adapter_registry.resolve_type(agent_type, default=default_agent)
         adapter = self.adapter_registry.get(canonical_type)
@@ -292,7 +308,7 @@ class TaskManager:
         topic_id: str,
         trigger_message_id: str,
         user_content: str,
-        agent_type: str = "gemini_agent",
+        agent_type: str = "internal_agent",
         model_override: Optional[str] = None,
         thinking_override: Optional[ThinkingLevel] = None,
     ) -> None:
@@ -322,37 +338,75 @@ class TaskManager:
 
             topic = self.db.get_topic(topic_id)
             topic_title = topic["title"] if topic else "后台任务"
-            raw_history = self.db.list_messages(topic_id=topic_id, limit=12)
+            topic_summary = topic.get("summary") if topic else None
+            raw_history = self.db.list_messages(topic_id=topic_id, limit=16)
             topic_history = [
                 m
                 for m in raw_history
-                if not (m.get("session_run") and m["session_run"].get("id") == run_id)
+                if m.get("id") != trigger_message_id
+                and not (m.get("session_run") and m["session_run"].get("id") == run_id)
             ]
+
+            def _emit_interim_message(text: str) -> dict[str, Any]:
+                interim_msg = self.db.create_message(
+                    topic_id=topic_id,
+                    role="assistant",
+                    content=text.strip() or "后台任务正在推进中…",
+                    metadata={
+                        "reply_to": trigger_message_id,
+                        "session_run_id": run_id,
+                        "source": "heavy_agent_interim",
+                        "path": "heavy",
+                        "agent_type": adapter.agent_type,
+                    },
+                )
+                self.event_bus.publish("message_created", {"message": interim_msg})
+                return interim_msg
+
+            topic_mounts = self.db.list_workspace_mounts(scope="topic", topic_id=topic_id)
+            global_mounts = self.db.list_workspace_mounts(scope="global")
+            resolved_ws = self.workspace_manager.resolve_for_topic(
+                topic_id,
+                topic_mounts=topic_mounts,
+                global_mounts=global_mounts,
+                topic_workspace_dir=topic.get("workspace_dir") if topic else None,
+                ensure_dirs=True,
+            )
+            scoped_executor = self.tool_executor.for_workspace(resolved_ws)
+            rule_files = self.workspace_manager.list_rule_files(resolved_ws.topic_dir)
 
             ctx = AdapterContext(
                 run_id=run_id,
                 topic_id=topic_id,
                 topic_title=topic_title,
                 user_content=user_content,
-                workspace_root=self.tool_executor.workspace_root,
-                artifacts_dir=self.tool_executor.artifacts_dir,
+                workspace_root=resolved_ws.primary_dir,
+                artifacts_dir=resolved_ws.topic_artifacts_dir,
                 db=self.db,
                 event_bus=self.event_bus,
-                tool_executor=self.tool_executor,
+                tool_executor=scoped_executor,
                 llm=self.llm,
                 settings=self.settings,
                 model_override=model_override,
                 thinking_override=thinking_override,
                 history=topic_history,
+                topic_summary=topic_summary,
+                kiki_workspace_root=resolved_ws.workspace_root,
+                topic_dir=resolved_ws.topic_dir,
+                shared_dir=resolved_ws.shared_dir,
+                rules_dir=resolved_ws.rules_dir,
+                extra_dirs=list(resolved_ws.extra_dirs),
+                rule_files=rule_files,
                 max_steps=self.max_steps,
                 _hitl_handler=lambda prompt, opts: self._await_hitl_decision(
                     run_id, topic_id, prompt, opts
                 ),
                 _publish_run_update=self._publish_run_update,
+                _emit_interim_message=_emit_interim_message,
             )
 
             result = await adapter.execute(ctx)
-            summary = _truncate_summary(result.summary, max_chars=200)
+            summary = result.summary.strip() or "后台任务已完成。"
 
             self._run_states.pop(run_id, None)
             self.event_bus.clear_hitl_request(run_id)
@@ -363,22 +417,47 @@ class TaskManager:
             )
             self._publish_run_update(run_id)
 
-            assistant_msg = self.db.create_message(
-                topic_id=topic_id,
-                role="assistant",
-                content=summary,
-                metadata={
-                    "reply_to": trigger_message_id,
-                    "session_run_id": run_id,
-                    "source": "heavy_agent",
-                    "path": "heavy",
-                    "agent_type": adapter.agent_type,
-                    "model_used": result.model_used,
-                    "thinking_level_used": result.thinking_level_used,
-                    "session_id": result.session_id,
-                },
+            final_metadata = {
+                "reply_to": trigger_message_id,
+                "session_run_id": run_id,
+                "source": "heavy_agent",
+                "path": "heavy",
+                "agent_type": adapter.agent_type,
+                "model_used": result.model_used,
+                "thinking_level_used": result.thinking_level_used,
+                "session_id": result.session_id,
+            }
+            already_emitted_same = bool(
+                ctx.last_emitted_message_id
+                and ctx.last_emitted_text
+                and ctx.last_emitted_text.strip() == summary
             )
-            self.event_bus.publish("message_created", {"message": assistant_msg})
+            if already_emitted_same and ctx.last_emitted_message_id:
+                updated_msg = self.db.update_message(
+                    ctx.last_emitted_message_id,
+                    content=summary,
+                    metadata=final_metadata,
+                )
+                if updated_msg:
+                    if updated_msg.get("session_run"):
+                        updated_msg = dict(updated_msg)
+                        updated_msg["session_run"] = self.event_bus.enrich_run(
+                            updated_msg["session_run"]
+                        )
+                    self.event_bus.publish("message_updated", {"message": updated_msg})
+            else:
+                assistant_msg = self.db.create_message(
+                    topic_id=topic_id,
+                    role="assistant",
+                    content=summary,
+                    metadata=final_metadata,
+                )
+                if assistant_msg.get("session_run"):
+                    assistant_msg = dict(assistant_msg)
+                    assistant_msg["session_run"] = self.event_bus.enrich_run(
+                        assistant_msg["session_run"]
+                    )
+                self.event_bus.publish("message_created", {"message": assistant_msg})
 
             updated_topic = self.db.update_topic(topic_id, unread=True)
             if updated_topic:
@@ -444,7 +523,11 @@ class TaskManager:
                 stream="stderr",
             )
 
-            failure_reply = _format_human_failure_reply(adapter.display_name, err_msg)
+            failure_reply = await self._build_failure_reply(
+                agent_name=adapter.display_name,
+                user_content=user_content,
+                err_msg=err_msg,
+            )
             failure_msg = self.db.create_message(
                 topic_id=topic_id,
                 role="assistant",
@@ -464,6 +547,31 @@ class TaskManager:
                 self.event_bus.publish("topic_updated", {"topic": updated_topic})
 
             self._publish_kiki_status()
+
+    async def _build_failure_reply(
+        self,
+        *,
+        agent_name: str,
+        user_content: str,
+        err_msg: str,
+    ) -> str:
+        """Use the LLM to understand and explain a run failure, with template fallback."""
+        explain_fn = getattr(self.llm, "explain_run_failure", None)
+        if callable(explain_fn):
+            try:
+                explained = await asyncio.wait_for(
+                    explain_fn(
+                        agent_name=agent_name,
+                        user_content=user_content,
+                        error_message=err_msg,
+                    ),
+                    timeout=9.0,
+                )
+                if isinstance(explained, str) and explained.strip():
+                    return explained.strip()
+            except Exception as exc:
+                logger.warning("LLM failure explanation fallback triggered: %s", exc)
+        return _format_human_failure_reply(agent_name, err_msg)
 
     def resume_run(
         self,

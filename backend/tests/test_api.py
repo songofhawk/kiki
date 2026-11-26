@@ -143,11 +143,12 @@ class FakeLLMClient:
 
 def _build_test_app(tmp_path: Path, *, llm: Optional[Any] = None):
     db_path = tmp_path / "kiki_test.db"
+    ws_root = tmp_path / "workspace"
     artifacts_dir = tmp_path / "artifacts"
     settings = Settings(
         gemini_api_key="test-key",
         gemini_model="gemini-3.5-flash-lite",
-        workspace_root=REPO_ROOT,
+        workspace_root=ws_root,
         database_path=db_path,
         artifacts_dir=artifacts_dir,
     )
@@ -328,13 +329,13 @@ async def test_explicit_agent_skips_model_selection_while_auto_uses_decision_mod
             json={
                 "content": "这次用内置引擎再试一次",
                 "focus_topic_id": topic_id,
-                "agent_type": "gemini_agent",
+                "agent_type": "internal_agent",
             },
         )
         assert res2.status_code == 200
         data2 = res2.json()
-        assert data2["route_decision"]["agent_type"] == "gemini_agent"
-        assert data2["session_run"]["agent_type"] == "gemini_agent"
+        assert data2["route_decision"]["agent_type"] == "internal_agent"
+        assert data2["session_run"]["agent_type"] == "internal_agent"
 
         # 3. Literal "auto" is treated identically to None (falls back to Decision Model)
         fake_llm.next_decision = RouteDecision(
@@ -999,7 +1000,7 @@ async def test_messages_cursor_pagination_and_active_runs(tmp_path: Path):
     old_active_run = db.create_session_run(
         topic_id=topic_a["id"],
         trigger_message_id=created_all[0]["id"],
-        agent_type="gemini_agent",
+        agent_type="internal_agent",
         status="running",
         current_step="正在处理旧任务",
     )
@@ -1007,7 +1008,7 @@ async def test_messages_cursor_pagination_and_active_runs(tmp_path: Path):
     db.create_session_run(
         topic_id=topic_b["id"],
         trigger_message_id=created_all[-1]["id"],
-        agent_type="gemini_agent",
+        agent_type="internal_agent",
         status="completed",
     )
 
@@ -1354,3 +1355,47 @@ def test_event_bus_lru_eviction_and_raw_log_backpressure():
 
     items = [q.get_nowait()[0], q.get_nowait()[0]]
     assert items == ["message_completed", "hitl_required"]
+
+
+@pytest.mark.asyncio
+async def test_reuse_topic_heavy_inherits_prior_available_agent_when_unspecified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from app.adapters.codex import CodexAdapter
+
+    # Make Codex appear available in probe() without executing real CLI
+    monkeypatch.setattr(CodexAdapter, "resolve_binary", lambda self: "/usr/local/bin/codex")
+    app, db, _bus, fake_llm, _db_path = _build_test_app(tmp_path)
+
+    async with app.router.lifespan_context(app):
+        topic = db.create_topic(title="生成猫猫 lulu 图片")
+        m1 = db.create_message(topic["id"], "user", "用 Codex 生成猫猫 lulu 图片")
+        db.create_session_run(topic["id"], m1["id"], agent_type="codex", status="completed")
+
+        # Follow-up message does not repeat "Codex"; router returns path="heavy", agent_type=None
+        fake_llm.next_decision = RouteDecision(
+            path="heavy",
+            topic_action="reuse",
+            topic_id=topic["id"],
+            new_topic_title=None,
+            agent_type=None,
+            confidence=0.98,
+            reasoning="继续原话题任务",
+        )
+        # Stub out actual execution so we only verify agent_type inheritance
+        async def _noop_execute(self, ctx):
+            from app.adapters.base import AdapterResult
+            return AdapterResult(summary="完成")
+
+        monkeypatch.setattr(CodexAdapter, "execute", _noop_execute)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            res = await client.post("/api/chat", json={"content": "给我看 Lulu"})
+            assert res.status_code == 200
+            data = res.json()
+            assert data["route_decision"]["path"] == "heavy"
+            assert data["route_decision"]["agent_type"] == "codex"
+            assert data["session_run"]["agent_type"] == "codex"
+

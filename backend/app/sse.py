@@ -29,6 +29,21 @@ class EventBus:
         self._raw_logs: OrderedDict[str, deque[dict[str, Any]]] = OrderedDict()
         self._hitl_requests: dict[str, dict[str, Any]] = {}
         self._current_kiki_status: dict[str, Any] = {"status": "idle"}
+        self._closing: bool = False
+
+    def close_all(self) -> None:
+        """Signal all active SSE subscribers to terminate cleanly (e.g. on server reload/shutdown)."""
+        self._closing = True
+        for queue in list(self._subscribers):
+            try:
+                if queue.full():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                queue.put_nowait(("__close__", {}))
+            except Exception:
+                pass
 
     @property
     def current_kiki_status(self) -> dict[str, Any]:
@@ -111,7 +126,13 @@ class EventBus:
         enriched["hitl_request"] = self.get_hitl_request(run_id)
         return enriched
 
-    async def subscribe(self, heartbeat_interval: float = 15.0) -> AsyncIterator[str]:
+    async def subscribe(
+        self,
+        heartbeat_interval: float = 15.0,
+        is_disconnected: Optional[Any] = None,
+    ) -> AsyncIterator[str]:
+        if self._closing:
+            return
         queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
             maxsize=self._subscriber_queue_size
         )
@@ -121,14 +142,20 @@ class EventBus:
             init_data = json.dumps(self._current_kiki_status, ensure_ascii=False)
             yield f"event: kiki_status\ndata: {init_data}\n\n"
 
-            while True:
+            while not self._closing:
+                if callable(is_disconnected) and await is_disconnected():
+                    break
                 try:
                     event_type, payload = await asyncio.wait_for(
                         queue.get(), timeout=heartbeat_interval
                     )
+                    if event_type == "__close__":
+                        break
                     data = json.dumps(payload, ensure_ascii=False)
                     yield f"event: {event_type}\ndata: {data}\n\n"
                 except asyncio.TimeoutError:
+                    if self._closing:
+                        break
                     yield ": ping\n\n"
         finally:
             self._subscribers.discard(queue)

@@ -38,7 +38,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
   "topic_action": "reuse" | "create" | "none",
   "topic_id": "Existing Topic ID if reuse, else null",
   "new_topic_title": "Short title if create, else null",
-  "agent_type": "Explicitly requested agent ID (e.g. codex, claude_code, gemini_agent, antigravity, deepseek_harness, zcode, kcode, qoder, workbuddy) if specified by user or continuing that agent's task, else null",
+  "agent_type": "Explicitly requested agent ID (e.g. codex, claude_code, internal_agent, antigravity, deepseek_harness, zcode, kcode, qoder, workbuddy) if specified by user or continuing that agent's task, else null",
   "confidence": 0.0 - 1.0,
   "reasoning": "简短判定理由"
 }}
@@ -48,7 +48,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 2. 注意：`topic-general`（日常闲聊）仅用于 `topic_action='none'` 的兜底，切勿对 `topic-general` 返回 `topic_action='reuse'`。若结合最近上下文发现对话已经围绕某个具体主题展开（例如社保、就医、理财、旅行、技术排查等），应选择 `create` 新建简短话题（若已有对应非闲聊话题则 `reuse`）。
 3. 若输入涉及代码重构、长文生成、图片/文件生成、数据分析、多步骤操作、文件读写、命令行排查、调用外部 Agent/工具，或需要联网搜索/实时信息查询/网页资料检索，path 为 'heavy'。
 4. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
-5. 若最近上下文显示某条用户消息带有 `[后台任务执行失败...]`、`[后台任务已取消...]` 或 `[后台任务等待人工确认...]` 等状态，而用户随后发送“再试一次”“再生成一次”“重试”“继续”等追问，应 `reuse` 该原话题，并在需要重新执行任务时选择 `heavy`。
+5. 若最近上下文显示某条用户消息带有 `[后台任务执行失败...]`、`[后台任务已取消...]` 或 `[后台任务等待人工确认...]` 等状态，而用户随后发送“再试一次”“再生成一次”“重试”“继续”等明确要求重新执行的指令，应 `reuse` 该原话题并选择 `heavy`。但若用户**只是在询问原因或讨论状态**（例如“为什么任务被取消了？”“刚才为什么失败了？”），并未要求重新执行或调用工具，应 `reuse` 原话题且判为 `path: "fast"`、`agent_type: null`，由 Kiki 结合上下文直接解答，切勿无故重新启动后台引擎。
 6. `agent_type` 判别规则：{agent_selection_rule}
 7. 若用户正在纠正执行引擎并要求完成/重跑任务（例如“不是，我是让你用豆包工作来生成图，你为什么用 Codex？”），**必须**判为 `path: "heavy"`、`topic_action: "reuse"`，并将 `agent_type` 设为**用户期望使用的目标引擎**，绝不能判为 `fast` 闲聊。
 """
@@ -128,7 +128,16 @@ KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点�
 - 当前所处话题：{topic_title}
 - 重要约束：
   1. 绝不要向用户提及“前台纯对话模式 / Fast-Path / Heavy-Path / 无法切换后台引擎”等内部系统实现细节，也不要让用户自己去点输入框下方切换。
-  2. 你当前这轮对话没有挂载任何外部工具或生图能力；如果用户要求生成图片、运行代码或调用外部工具，严禁假装正在执行或说“稍等马上就好”，只需简洁、礼貌地表示刚才没能成功拉起后台任务，请用户再直接发一句简洁的指令即可。
+  2. 严格以本话题真实的历史对话与任务状态为准，绝不编造与事实不符的借口（例如历史记录明确显示后台任务已完成，就不能谎称“刚才没能拉起后台任务”）；若历史任务显示“已完成但无产物文件”，应如实说明上次任务没有附带可展示的文件/图片，并询问是否需要重新生成。
+  3. 你当前这轮回复没有挂载外部工具或生图能力；如果用户正在发起新的生图、跑代码或工具执行请求，严禁假装正在执行或说“稍等马上就好”，应简洁礼貌地说明当前这轮没能触发执行，请用户再发一句明确指令即可。
+"""
+
+KIKI_FAILURE_EXPLAIN_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖的手绘风蓝灰虎斑小猫个人智能体。
+后台执行引擎刚刚执行任务失败了。请你阅读原始报错信息，准确理解真正的失败原因，用简洁自然的中文向主人解释发生了什么，并给出一条切实可行的下一步建议。
+要求：
+1. 严格忠实于原始报错信息，切勿臆测或张冠李戴（例如报错明确写“未检测到某 CLI”就如实说明未安装/未检测到，绝不要说成鉴权失败）。
+2. 如果报错中包含关键细节（如预计恢复时间、缺失命令、退出码、具体安装命令等），请简明保留。
+3. 控制在 2~3 句话、160 字以内，语气自然亲切，不要提及 Heavy-Path / Fast-Path 等内部架构词。
 """
 
 
@@ -850,13 +859,24 @@ class KikiLLMClient:
                 err = err[:99] + "…"
             return f" [后台任务执行失败({agent_type}): {err}]" if err else f" [后台任务执行失败({agent_type})]"
         if status == "cancelled":
+            step_detail = " ".join(str(session_run.get("current_step") or "").split())
+            if step_detail and step_detail != "任务已取消":
+                return f" [后台任务已取消({agent_type}): {step_detail[:80]}]"
             return f" [后台任务已取消({agent_type})]"
         if status == "waiting_input":
             return f" [后台任务等待人工确认({agent_type})]"
         if status in ("running", "queued"):
             return f" [后台任务进行中({agent_type})]"
         if status == "completed" and role == "user":
-            return f" [已触发后台任务({agent_type}): 已完成]"
+            artifacts = session_run.get("artifacts") or []
+            art_names = [
+                str(a.get("file_path") or "").rsplit("/", 1)[-1]
+                for a in artifacts
+                if isinstance(a, dict) and a.get("file_path")
+            ]
+            if art_names:
+                return f" [已触发后台任务({agent_type}): 已完成, 产物: {', '.join(art_names[:3])}]"
+            return f" [已触发后台任务({agent_type}): 已完成, 无产物文件]"
         return ""
 
     @staticmethod
@@ -931,13 +951,20 @@ class KikiLLMClient:
             "path": {
                 "type": "choice",
                 "instructions": (
-                    "Decide whether the user message should be handled by 'fast' (casual chat, simple greeting) "
+                    "Decide whether the user message should be handled by 'fast' (casual chat, simple greeting, "
+                    "or asking why a previous task failed/cancelled without requesting a new run) "
                     "or 'heavy' (coding, refactoring, file ops, CLI, image/file generation, web search, "
-                    "external agents like codex/claude_code/kcode/workbuddy, or retrying a failed background task)."
+                    "external agents like codex/claude_code/kcode/workbuddy, or explicitly retrying/running a task)."
                 ),
                 "criteria": {
-                    "fast": "Simple greeting, casual chitchat, or pure Q&A without tools/search/agents",
-                    "heavy": "Requires tools, coding, file ops, web search, external agent execution, or task retry",
+                    "fast": (
+                        "Simple greeting, casual chitchat, pure Q&A, or asking why a previous background task "
+                        "was cancelled/failed without asking to run or retry tools/agents"
+                    ),
+                    "heavy": (
+                        "Requires tools, coding, file ops, image/file generation, web search, external agent "
+                        "execution, or explicitly requesting to retry/re-run/continue executing a task"
+                    ),
                 },
             },
             "topic_action": {
@@ -973,7 +1000,7 @@ class KikiLLMClient:
                     {
                         "codex": "OpenAI Codex",
                         "claude_code": "Claude Code",
-                        "gemini_agent": "Gemini Agent",
+                        "internal_agent": "Internal Agent",
                         "antigravity": "Antigravity",
                         "deepseek_harness": "DeepSeek Harness",
                         "zcode": "ZCode",
@@ -985,9 +1012,10 @@ class KikiLLMClient:
             questions["agent_type"] = {
                 "type": "choice",
                 "instructions": (
-                    "Identify the execution agent the user wants to use (handling corrections like "
-                    "'I asked for A, why did you use B' by choosing A), or continuing a prior topic run, "
-                    "or 'none' if not specified."
+                    "ONLY select an agent if the user is requesting to execute, retry, or switch to that agent "
+                    "(handling corrections like 'I asked for A, why did you use B' by choosing A). "
+                    "If the user is only asking a question or chatting (e.g. 'why was the task cancelled?') "
+                    "without asking to run an agent, choose 'none'."
                 ),
                 "criteria": agent_criteria,
             }
@@ -1110,14 +1138,14 @@ class KikiLLMClient:
             agent_selection_rule = (
                 "当 path='heavy' 时，请结合用户语义、历史任务上下文以及上述可用引擎列表（含 aliases 与 description）"
                 "综合判别最合适的 `agent_type`：若用户明确点名或纠正为某引擎（或延续该话题先前使用的引擎），输出对应引擎 `id`；"
-                "若无特定引擎偏好，可输出 `gemini_agent`（或 `null`）。当 path='fast' 时输出 `null`。"
+                "若无特定引擎偏好，可输出 `internal_agent`（或 `null`）。当 path='fast' 时输出 `null`。"
             )
         system_instruction = DECISION_SYSTEM_PROMPT_TEMPLATE.format(
             active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2),
             available_adapters_json=(
                 json.dumps(compact_adapters, ensure_ascii=False, indent=2)
                 if compact_adapters
-                else "（默认使用 gemini_agent）"
+                else "（默认使用 internal_agent）"
             ),
             recent_context_text=self._format_context_lines(recent_messages),
             agent_selection_rule=agent_selection_rule,
@@ -1466,3 +1494,95 @@ class KikiLLMClient:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("No LLM provider configured (set GEMINI_API_KEY or DEEPSEEK_API_KEY)")
+
+    async def explain_run_failure(
+        self,
+        *,
+        agent_name: str,
+        user_content: str,
+        error_message: str,
+        timeout: float = 8.0,
+    ) -> Optional[str]:
+        """Ask the fast LLM to understand a raw Heavy-Path error and explain it naturally."""
+        raw_err = (error_message or "").strip()
+        if not raw_err:
+            return None
+        prompt_input = (
+            f"执行引擎：{agent_name}\n"
+            f"用户原始请求：{user_content[:240]}\n"
+            f"原始报错信息：\n{raw_err[:1200]}"
+        )
+
+        # 1. Try Zhipu (fast, lightweight) first if configured and ready
+        if self.settings.zhipu_configured and time.monotonic() >= self._zhipu_cooldown_until:
+            try:
+                data = await self._openai_post_chat(
+                    base_url=self.zhipu_base_url,
+                    api_key=self.settings.zhipu_api_key,
+                    payload={
+                        "model": self.zhipu_model,
+                        "messages": [
+                            {"role": "system", "content": KIKI_FAILURE_EXPLAIN_SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt_input},
+                        ],
+                        "max_tokens": 512,
+                    },
+                    timeout=timeout,
+                )
+                choices = data.get("choices") or []
+                text = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                if text:
+                    self.last_used_provider = "zhipu"
+                    self.last_used_model = self.zhipu_model
+                    return text
+            except Exception as exc:
+                self._zhipu_cooldown_until = time.monotonic() + min(self._cooldown_seconds, 60.0)
+                logger.warning("Failure explanation (zhipu:%s) failed: %s", self.zhipu_model, exc)
+
+        # 2. Try Gemini candidate models
+        for model_name in self._candidate_models():
+            try:
+                client = self._get_client()
+                interaction = await asyncio.wait_for(
+                    client.aio.interactions.create(
+                        model=model_name,
+                        input=prompt_input,
+                        system_instruction=KIKI_FAILURE_EXPLAIN_SYSTEM_PROMPT,
+                        generation_config={"thinking_level": "low"},
+                        store=False,
+                    ),
+                    timeout=timeout,
+                )
+                text = (getattr(interaction, "output_text", None) or "").strip()
+                if text:
+                    self.last_used_provider = "gemini"
+                    self.last_used_model = model_name
+                    return text
+            except Exception as exc:
+                self._mark_model_cooldown(model_name, exc)
+                logger.warning("Failure explanation (%s) failed: %s", model_name, exc)
+
+        # 3. Fallback to DeepSeek if configured
+        if self.settings.deepseek_configured:
+            try:
+                data = await self._deepseek_post_chat(
+                    {
+                        "model": self.deepseek_model,
+                        "messages": [
+                            {"role": "system", "content": KIKI_FAILURE_EXPLAIN_SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt_input},
+                        ],
+                        "max_tokens": 512,
+                    },
+                    timeout=timeout,
+                )
+                choices = data.get("choices") or []
+                text = str((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                if text:
+                    self.last_used_provider = "deepseek"
+                    self.last_used_model = self.deepseek_model
+                    return text
+            except Exception as exc:
+                logger.warning("Failure explanation (deepseek:%s) failed: %s", self.deepseek_model, exc)
+
+        return None
