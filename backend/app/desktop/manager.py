@@ -155,6 +155,8 @@ class DesktopTakeoverManager:
             "supports_control": caps.supports_control,
             "supports_clipboard": caps.supports_clipboard,
             "displays": [d.to_dict() for d in caps.displays],
+            "spaces": [s.to_dict() for s in caps.spaces],
+            "supports_space_switch": caps.supports_space_switch,
             "permissions": caps.permissions.to_dict(),
             "error": None if self.enabled else "服务端已禁用桌面接管 (KIKI_DESKTOP_TAKEOVER_ENABLED=false)",
             "driver_error": caps.error,
@@ -299,6 +301,33 @@ class DesktopTakeoverManager:
         await asyncio.to_thread(self.driver.set_clipboard, text)
         sess.action_count += 1
         sess.touch()
+
+    async def switch_space(
+        self,
+        session_id: str,
+        *,
+        target_index: Optional[int] = None,
+        direction: Optional[str] = None,
+        display_index: Optional[int] = None,
+    ) -> dict[str, Any]:
+        sess = self.require_session(session_id)
+        if sess.control_mode != "control":
+            raise DesktopTakeoverError("当前处于只读观察模式，请先切换为「接管控制」模式再切换桌面空间")
+        d_idx = sess.display_index if display_index is None else max(0, display_index)
+        norm_dir = direction if direction in ("prev", "next") else None
+        await asyncio.to_thread(
+            self.driver.switch_space,
+            display_index=d_idx,
+            target_index=target_index,
+            direction=norm_dir,  # type: ignore[arg-type]
+        )
+        sess.action_count += 1
+        sess.touch()
+        caps = await asyncio.to_thread(self.driver.probe)
+        return {
+            "displays": [d.to_dict() for d in caps.displays],
+            "spaces": [s.to_dict() for s in caps.spaces],
+        }
 
     async def shutdown(self) -> None:
         if self._active_session is not None:

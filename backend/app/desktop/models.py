@@ -40,6 +40,21 @@ class DisplayInfo:
 
 
 @dataclass(frozen=True)
+class DesktopSpaceInfo:
+    """Describes one virtual desktop / Mission Control Space on a display."""
+
+    index: int
+    space_id: str
+    display_index: int
+    name: str
+    is_active: bool = False
+    is_fullscreen: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DesktopPermissions:
     """OS-level screen recording and accessibility permission status."""
 
@@ -65,6 +80,8 @@ class DesktopCapabilities:
     supports_control: bool
     supports_clipboard: bool
     displays: tuple[DisplayInfo, ...] = ()
+    spaces: tuple[DesktopSpaceInfo, ...] = ()
+    supports_space_switch: bool = False
     permissions: DesktopPermissions = field(default_factory=DesktopPermissions)
     error: Optional[str] = None
 
@@ -76,6 +93,8 @@ class DesktopCapabilities:
             "supports_control": self.supports_control,
             "supports_clipboard": self.supports_clipboard,
             "displays": [d.to_dict() for d in self.displays],
+            "spaces": [s.to_dict() for s in self.spaces],
+            "supports_space_switch": self.supports_space_switch,
             "permissions": self.permissions.to_dict(),
             "error": self.error,
         }
@@ -178,3 +197,11 @@ class DesktopDriver(Protocol):
     def get_clipboard(self) -> str: ...
 
     def set_clipboard(self, text: str) -> None: ...
+
+    def switch_space(
+        self,
+        *,
+        display_index: int = 0,
+        target_index: Optional[int] = None,
+        direction: Optional[Literal["prev", "next"]] = None,
+    ) -> None: ...

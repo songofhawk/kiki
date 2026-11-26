@@ -273,6 +273,15 @@ export interface DesktopDisplayInfo {
   is_main: boolean;
 }
 
+export interface DesktopSpaceInfo {
+  index: number;
+  space_id: string;
+  display_index: number;
+  name: string;
+  is_active: boolean;
+  is_fullscreen: boolean;
+}
+
 export interface DesktopPermissions {
   screen_recording: boolean;
   accessibility: boolean;
@@ -307,6 +316,8 @@ export interface DesktopStatusResponse {
   supports_control: boolean;
   supports_clipboard: boolean;
   displays: DesktopDisplayInfo[];
+  spaces: DesktopSpaceInfo[];
+  supports_space_switch: boolean;
   permissions: DesktopPermissions;
   error?: string | null;
   driver_error?: string | null;

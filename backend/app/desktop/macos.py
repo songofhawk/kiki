@@ -6,17 +6,20 @@ import ctypes
 import hashlib
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Literal, Optional
 
 from .models import (
     CapturedFrame,
     DesktopCapabilities,
     DesktopInputEvent,
     DesktopPermissions,
+    DesktopSpaceInfo,
     DisplayInfo,
 )
 
@@ -159,11 +162,65 @@ class MacOSDesktopDriver:
             warnings.append("请在「系统设置 → 隐私与安全性 → 屏幕录制与系统录音」中勾选运行 Kiki 的终端或 Python 进程。")
         if not ax_ok:
             warnings.append("请在「系统设置 → 隐私与安全性 → 辅助功能」中勾选运行 Kiki 的终端或 Python 进程，以启用远程鼠键控制。")
+        displays = self._list_displays()
+        spaces = self._list_spaces(displays)
         return DesktopCapabilities(
             available=True, driver_name=self.driver_name, platform="Darwin",
             supports_control=ax_ok, supports_clipboard=bool(shutil.which("pbcopy")),
-            displays=self._list_displays(),
+            displays=displays,
+            spaces=spaces,
+            supports_space_switch=ax_ok,
             permissions=DesktopPermissions(screen_recording=screen_ok, accessibility=ax_ok, warnings=tuple(warnings)),
+        )
+
+    def _list_spaces(self, displays: tuple[DisplayInfo, ...]) -> tuple[DesktopSpaceInfo, ...]:
+        if not displays:
+            return ()
+        plist_path = Path.home() / "Library" / "Preferences" / "com.apple.spaces.plist"
+        try:
+            raw = plistlib.loads(plist_path.read_bytes())
+            monitors = raw.get("SpacesDisplayConfiguration", {}).get("Management Data", {}).get("Monitors", [])
+            if not isinstance(monitors, list) or not monitors:
+                raise ValueError("empty monitors")
+            result: list[DesktopSpaceInfo] = []
+            for d_idx, display in enumerate(displays):
+                mon = None
+                if display.is_main:
+                    mon = next((m for m in monitors if m.get("Display Identifier") == "Main"), None)
+                if mon is None and d_idx < len(monitors):
+                    mon = monitors[d_idx]
+                if not isinstance(mon, dict):
+                    result.append(DesktopSpaceInfo(index=0, space_id=f"d{d_idx}-s0", display_index=d_idx, name="桌面 1", is_active=True))
+                    continue
+                cur_id = str((mon.get("Current Space") or {}).get("id64") or (mon.get("Current Space") or {}).get("uuid") or "")
+                raw_spaces = mon.get("Spaces") or []
+                desk_num, fs_num = 0, 0
+                for s_idx, sp in enumerate(raw_spaces):
+                    sid = str(sp.get("id64") or sp.get("uuid") or f"d{d_idx}-s{s_idx}")
+                    is_fs = int(sp.get("type", 0)) == 4
+                    if is_fs:
+                        fs_num += 1
+                        label = f"全屏空间 {fs_num}"
+                    else:
+                        desk_num += 1
+                        label = f"桌面 {desk_num}"
+                    result.append(
+                        DesktopSpaceInfo(
+                            index=s_idx,
+                            space_id=sid,
+                            display_index=d_idx,
+                            name=label,
+                            is_active=(sid == cur_id) if cur_id else (s_idx == 0),
+                            is_fullscreen=is_fs,
+                        )
+                    )
+            if result:
+                return tuple(result)
+        except Exception:
+            pass
+        return tuple(
+            DesktopSpaceInfo(index=0, space_id=f"d{d.index}-s0", display_index=d.index, name="桌面 1", is_active=True)
+            for d in displays
         )
 
     def capture_frame(self, display_index: int = 0, max_width: int = 1280, quality: int = 75) -> CapturedFrame:
@@ -277,3 +334,39 @@ class MacOSDesktopDriver:
 
     def set_clipboard(self, text: str) -> None:
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), capture_output=True, timeout=3)
+
+    def switch_space(
+        self,
+        *,
+        display_index: int = 0,
+        target_index: Optional[int] = None,
+        direction: Optional[Literal["prev", "next"]] = None,
+    ) -> None:
+        if not self._cg:
+            raise RuntimeError("CoreGraphics not available")
+        if self._ax and not self._ax.AXIsProcessTrusted():
+            raise PermissionError("macOS 辅助功能权限未开启，无法切换虚拟桌面")
+
+        displays = self._list_displays()
+        if len(displays) > 1:
+            # Focus target display by moving cursor to its center first
+            self.send_input(DesktopInputEvent(action="mouse_move", x=0.5, y=0.5, display_index=display_index))
+            time.sleep(0.04)
+
+        steps = 0
+        if direction == "prev":
+            steps = -1
+        elif direction == "next":
+            steps = 1
+        elif target_index is not None:
+            spaces = [s for s in self._list_spaces(displays) if s.display_index == display_index]
+            active = next((s.index for s in spaces if s.is_active), 0)
+            steps = target_index - active
+
+        if steps == 0:
+            return
+        key = "arrowright" if steps > 0 else "arrowleft"
+        for i in range(min(abs(steps), 12)):
+            self.send_input(DesktopInputEvent(action="key_combo", key=key, modifiers=("ctrl",), display_index=display_index))
+            if i + 1 < abs(steps):
+                time.sleep(0.14)

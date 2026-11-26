@@ -7,6 +7,7 @@ import {
   fetchDesktopStatus,
   setDesktopClipboard,
   startDesktopSession,
+  switchDesktopSpace,
   updateDesktopSession,
 } from '../api';
 import type {
@@ -121,6 +122,16 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
               setLoading(false);
             } else if (msg.type === 'session' && msg.session) {
               setSession((prev) => (prev ? { ...prev, ...msg.session } : msg.session));
+            } else if (msg.type === 'desktops') {
+              setStatus((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      displays: msg.displays ?? prev.displays,
+                      spaces: msg.spaces ?? prev.spaces,
+                    }
+                  : prev
+              );
             } else if (msg.type === 'error' && msg.message) {
               setErrorMsg(String(msg.message));
             }
@@ -220,6 +231,22 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     }
   };
 
+  const handleSwitchSpace = async (payload: { target_index?: number; direction?: 'prev' | 'next' }) => {
+    if (!session) return;
+    try {
+      const updated = await switchDesktopSpace(session.id, {
+        ...payload,
+        display_index: session.display_index,
+      });
+      setStatus((prev) =>
+        prev ? { ...prev, displays: updated.displays, spaces: updated.spaces } : prev
+      );
+      sendWs({ type: 'refresh' });
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : '切换虚拟桌面失败');
+    }
+  };
+
   const handleHandoff = async (approved: boolean) => {
     if (!context?.runId || !onResumeRun || handoffBusy) return;
     setHandoffBusy(true);
@@ -250,11 +277,14 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
           connected={connected}
           supportsControl={Boolean(status?.supports_control)}
           supportsClipboard={Boolean(status?.supports_clipboard)}
+          supportsSpaceSwitch={Boolean(status?.supports_space_switch)}
           displays={status?.displays ?? []}
+          spaces={status?.spaces ?? []}
           isFullscreen={isFullscreen}
           onToggleMode={(mode) => void handleUpdateConfig({ control_mode: mode })}
           onChangeFps={(fps) => void handleUpdateConfig({ fps })}
           onChangeDisplay={(display_index) => void handleUpdateConfig({ display_index })}
+          onSwitchSpace={(payload) => void handleSwitchSpace(payload)}
           onRefresh={() => sendWs({ type: 'refresh' })}
           onSendShortcut={(key, modifiers = []) => sendWs({ type: 'input', payload: { action: 'key_combo', key, modifiers } })}
           onSendText={(text) => sendWs({ type: 'input', payload: { action: 'type_text', text } })}

@@ -44,6 +44,12 @@ class DesktopClipboardBody(BaseModel):
     text: str = Field(default="", max_length=65536)
 
 
+class DesktopSpaceSwitchBody(BaseModel):
+    target_index: Optional[int] = Field(default=None, ge=0)
+    direction: Optional[str] = None
+    display_index: Optional[int] = Field(default=None, ge=0)
+
+
 def _raise_http(exc: DesktopTakeoverError) -> None:
     raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
@@ -82,7 +88,12 @@ def create_desktop_router(
                 instructions=body.instructions,
                 force=body.force,
             )
-            return {"session": sess.to_public_dict(include_token=True)}
+            status = manager.get_status()
+            return {
+                "session": sess.to_public_dict(include_token=True),
+                "displays": status["displays"],
+                "spaces": status["spaces"],
+            }
         except DesktopTakeoverError as exc:
             _raise_http(exc)
 
@@ -139,6 +150,19 @@ def create_desktop_router(
         try:
             await manager.set_clipboard(session_id, body.text)
             return {"ok": True, "text": body.text}
+        except DesktopTakeoverError as exc:
+            _raise_http(exc)
+
+    @router.post("/sessions/{session_id}/space")
+    async def desktop_switch_space(session_id: str, body: DesktopSpaceSwitchBody) -> dict[str, Any]:
+        try:
+            updated = await manager.switch_space(
+                session_id,
+                target_index=body.target_index,
+                direction=body.direction,
+                display_index=body.display_index,
+            )
+            return {"ok": True, **updated}
         except DesktopTakeoverError as exc:
             _raise_http(exc)
 
@@ -230,6 +254,19 @@ def create_desktop_router(
                         )
                         force_refresh.set()
                         await websocket.send_json({"type": "session", "session": updated.to_public_dict()})
+                    except Exception as exc:
+                        await websocket.send_json({"type": "error", "message": str(exc)})
+                elif msg_type == "switch_space":
+                    payload = msg.get("payload") or {}
+                    try:
+                        updated = await manager.switch_space(
+                            session_id,
+                            target_index=payload.get("target_index"),
+                            direction=payload.get("direction"),
+                            display_index=payload.get("display_index"),
+                        )
+                        force_refresh.set()
+                        await websocket.send_json({"type": "desktops", **updated})
                     except Exception as exc:
                         await websocket.send_json({"type": "error", "message": str(exc)})
                 elif msg_type == "refresh":

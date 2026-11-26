@@ -23,6 +23,7 @@ from .models import (
     DesktopInputAction,
     DesktopInputEvent,
     DesktopPermissions,
+    DesktopSpaceInfo,
     DisplayInfo,
     MouseButton,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "DesktopNotFoundError",
     "DesktopPermissions",
     "DesktopSession",
+    "DesktopSpaceInfo",
     "DesktopTakeoverError",
     "DesktopTakeoverManager",
     "DesktopUnauthorizedError",

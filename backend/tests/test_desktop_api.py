@@ -136,3 +136,38 @@ def test_desktop_websocket_streaming_input_and_auth(tmp_path: Path) -> None:
 
         assert len(driver.recorded_events) == 1
         assert driver.recorded_events[0].action == "mouse_click"
+
+
+def test_desktop_multi_display_and_space_switching(tmp_path: Path) -> None:
+    driver = MockDesktopDriver(displays_count=2, spaces_per_display=3)
+    app = _make_test_app(tmp_path, driver=driver)
+
+    with TestClient(app) as client:
+        # Status reports all displays and spaces
+        st = client.get("/api/desktop/status").json()
+        assert len(st["displays"]) == 2
+        assert len(st["spaces"]) == 6
+        assert st["supports_space_switch"] is True
+
+        # Start session auto-picks display 0 while returning available displays & spaces
+        created = client.post("/api/desktop/sessions", json={"fps": 10}).json()
+        sid = created["session"]["id"]
+        assert created["session"]["display_index"] == 0
+        assert len(created["displays"]) == 2
+        assert len(created["spaces"]) == 6
+
+        # Switch display to index 1
+        patched = client.patch(f"/api/desktop/sessions/{sid}", json={"display_index": 1}).json()
+        assert patched["session"]["display_index"] == 1
+
+        # Switch space on display 1 via REST
+        switched = client.post(f"/api/desktop/sessions/{sid}/space", json={"target_index": 2}).json()
+        assert switched["ok"] is True
+        d1_spaces = [s for s in switched["spaces"] if s["display_index"] == 1]
+        assert d1_spaces[2]["is_active"] is True
+        assert d1_spaces[0]["is_active"] is False
+
+        # Switch prev space via direction
+        prev_res = client.post(f"/api/desktop/sessions/{sid}/space", json={"direction": "prev"}).json()
+        d1_spaces = [s for s in prev_res["spaces"] if s["display_index"] == 1]
+        assert d1_spaces[1]["is_active"] is True

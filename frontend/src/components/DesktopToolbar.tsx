@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
 import {
+  ChevronLeft,
+  ChevronRight,
   ClipboardCopy,
   ClipboardPaste,
   Eye,
   Hand,
+  Layers,
   Maximize2,
   Minimize2,
   Monitor,
@@ -15,6 +18,7 @@ import type {
   DesktopControlMode,
   DesktopDisplayInfo,
   DesktopSession,
+  DesktopSpaceInfo,
 } from '../types';
 
 export interface DesktopToolbarProps {
@@ -22,11 +26,14 @@ export interface DesktopToolbarProps {
   connected: boolean;
   supportsControl: boolean;
   supportsClipboard: boolean;
+  supportsSpaceSwitch: boolean;
   displays: DesktopDisplayInfo[];
+  spaces: DesktopSpaceInfo[];
   isFullscreen: boolean;
   onToggleMode: (mode: DesktopControlMode) => void;
   onChangeFps: (fps: number) => void;
   onChangeDisplay: (displayIndex: number) => void;
+  onSwitchSpace: (payload: { target_index?: number; direction?: 'prev' | 'next' }) => void;
   onRefresh: () => void;
   onSendShortcut: (key: string, modifiers?: string[]) => void;
   onSendText: (text: string) => void;
@@ -50,11 +57,14 @@ export const DesktopToolbar: React.FC<DesktopToolbarProps> = ({
   connected,
   supportsControl,
   supportsClipboard,
+  supportsSpaceSwitch,
   displays,
+  spaces,
   isFullscreen,
   onToggleMode,
   onChangeFps,
   onChangeDisplay,
+  onSwitchSpace,
   onRefresh,
   onSendShortcut,
   onSendText,
@@ -65,6 +75,9 @@ export const DesktopToolbar: React.FC<DesktopToolbarProps> = ({
 }) => {
   const [textInput, setTextInput] = useState('');
   const isControl = session?.control_mode === 'control';
+  const activeDisplayIdx = session?.display_index ?? 0;
+  const spacesForDisplay = spaces.filter((s) => s.display_index === activeDisplayIdx);
+  const hasMultipleDesktops = displays.length > 1 || spacesForDisplay.length > 1;
 
   const handleSendText = (e: React.FormEvent) => {
     e.preventDefault();
@@ -192,6 +205,78 @@ export const DesktopToolbar: React.FC<DesktopToolbarProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Multi-Display & Virtual Desktop (Space) Switcher Banner */}
+      {hasMultipleDesktops && session && (
+        <div className="flex items-center gap-2 flex-wrap rounded-xl bg-[#F3EEE6] border border-[#E2D9CC] px-2.5 py-1.5 text-xs">
+          <span className="inline-flex items-center gap-1 font-medium text-[#5A534C] shrink-0">
+            <Layers className="w-3.5 h-3.5 text-[#D97706]" />
+            检测到多桌面（{displays.length > 1 ? `${displays.length} 块屏幕` : '1 块屏幕'}
+            {spacesForDisplay.length > 1 ? ` · ${spacesForDisplay.length} 个空间` : ''}）
+          </span>
+
+          {displays.length > 1 && (
+            <div className="flex items-center gap-1 flex-wrap">
+              {displays.map((d) => {
+                const selected = d.index === activeDisplayIdx;
+                return (
+                  <button
+                    key={d.index}
+                    type="button"
+                    onClick={() => onChangeDisplay(d.index)}
+                    className={`px-2 py-0.5 rounded-lg text-[11px] font-medium border transition-colors ${
+                      selected
+                        ? 'bg-[#262422] text-white border-[#262422]'
+                        : 'bg-white text-[#4E4842] border-[#DDD5C9] hover:bg-[#FAF7F2]'
+                    }`}
+                  >
+                    {d.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {spacesForDisplay.length > 1 && (
+            <div className="flex items-center gap-1 flex-wrap">
+              <button
+                type="button"
+                disabled={!isControl || !supportsSpaceSwitch}
+                onClick={() => onSwitchSpace({ direction: 'prev' })}
+                title={isControl ? '切换到上一个桌面空间 (Ctrl+←)' : '切换为「接管控制」模式后可切换虚拟桌面'}
+                className="p-0.5 rounded-md bg-white border border-[#DDD5C9] text-[#5A534C] hover:bg-[#FAF7F2] disabled:opacity-40"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              {spacesForDisplay.map((sp) => (
+                <button
+                  key={sp.space_id}
+                  type="button"
+                  disabled={!isControl || !supportsSpaceSwitch}
+                  onClick={() => onSwitchSpace({ target_index: sp.index })}
+                  title={isControl ? `切换到 ${sp.name}` : '切换为「接管控制」模式后可切换虚拟桌面'}
+                  className={`px-2 py-0.5 rounded-lg text-[11px] font-medium border transition-colors disabled:opacity-60 ${
+                    sp.is_active
+                      ? 'bg-[#D97706] text-white border-[#D97706]'
+                      : 'bg-white text-[#4E4842] border-[#DDD5C9] hover:bg-[#FAF7F2]'
+                  }`}
+                >
+                  {sp.name}
+                </button>
+              ))}
+              <button
+                type="button"
+                disabled={!isControl || !supportsSpaceSwitch}
+                onClick={() => onSwitchSpace({ direction: 'next' })}
+                title={isControl ? '切换到下一个桌面空间 (Ctrl+→)' : '切换为「接管控制」模式后可切换虚拟桌面'}
+                className="p-0.5 rounded-md bg-white border border-[#DDD5C9] text-[#5A534C] hover:bg-[#FAF7F2] disabled:opacity-40"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Shortcuts + Unicode Text Input + Clipboard Sync */}
       {isControl && (

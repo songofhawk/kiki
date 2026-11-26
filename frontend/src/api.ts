@@ -6,7 +6,9 @@ import type {
   ChatRequest,
   ChatResponse,
   DesktopControlMode,
+  DesktopDisplayInfo,
   DesktopSession,
+  DesktopSpaceInfo,
   DesktopStatusResponse,
   DirectoryBrowseResponse,
   GlobalWorkspace,
@@ -449,6 +451,23 @@ export async function setDesktopClipboard(sessionId: string, text: string): Prom
     {
       method: 'POST',
       body: JSON.stringify({ text }),
+    }
+  );
+}
+
+export async function switchDesktopSpace(
+  sessionId: string,
+  payload: {
+    target_index?: number;
+    direction?: 'prev' | 'next';
+    display_index?: number;
+  }
+): Promise<{ displays: DesktopDisplayInfo[]; spaces: DesktopSpaceInfo[] }> {
+  return requestJson<{ ok: boolean; displays: DesktopDisplayInfo[]; spaces: DesktopSpaceInfo[] }>(
+    `/desktop/sessions/${encodeURIComponent(sessionId)}/space`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }
   );
 }
