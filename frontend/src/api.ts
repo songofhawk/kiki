@@ -5,6 +5,9 @@ import type {
   BatchReassignTopicResponse,
   ChatRequest,
   ChatResponse,
+  DesktopControlMode,
+  DesktopSession,
+  DesktopStatusResponse,
   DirectoryBrowseResponse,
   GlobalWorkspace,
   HealthResponse,
@@ -271,6 +274,12 @@ export interface SseEventHandlers {
     run_id: string;
     summary: string;
   }) => void;
+  onDesktopSessionUpdated?: (payload: {
+    state: string;
+    active: boolean;
+    session?: DesktopSession | null;
+    ended_session_id?: string | null;
+  }) => void;
 }
 
 export function connectEventStream(handlers: SseEventHandlers): () => void {
@@ -357,6 +366,9 @@ export function connectEventStream(handlers: SseEventHandlers): () => void {
     eventSource.addEventListener('toast_notification', (e) =>
       parseAndDispatch(e as MessageEvent, handlers.onToastNotification)
     );
+    eventSource.addEventListener('desktop_session_updated', (e) =>
+      parseAndDispatch(e as MessageEvent, handlers.onDesktopSessionUpdated)
+    );
   };
 
   connect();
@@ -371,4 +383,80 @@ export function connectEventStream(handlers: SseEventHandlers): () => void {
       eventSource = null;
     }
   };
+}
+
+export async function fetchDesktopStatus(): Promise<DesktopStatusResponse> {
+  return requestJson<DesktopStatusResponse>('/desktop/status', { cache: 'no-store' });
+}
+
+export async function startDesktopSession(payload: {
+  control_mode?: DesktopControlMode;
+  display_index?: number;
+  fps?: number;
+  quality?: number;
+  max_width?: number;
+  run_id?: string;
+  topic_id?: string;
+  reason?: string;
+  instructions?: string;
+  force?: boolean;
+}): Promise<DesktopSession> {
+  const data = await requestJson<{ session: DesktopSession }>('/desktop/sessions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return data.session;
+}
+
+export async function updateDesktopSession(
+  sessionId: string,
+  payload: {
+    control_mode?: DesktopControlMode;
+    display_index?: number;
+    fps?: number;
+    quality?: number;
+    max_width?: number;
+  }
+): Promise<DesktopSession> {
+  const data = await requestJson<{ session: DesktopSession }>(
+    `/desktop/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }
+  );
+  return data.session;
+}
+
+export async function endDesktopSession(sessionId: string): Promise<void> {
+  await requestJson<{ ok: boolean }>(
+    `/desktop/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' }
+  );
+}
+
+export async function fetchDesktopClipboard(sessionId: string): Promise<string> {
+  const data = await requestJson<{ text: string }>(
+    `/desktop/sessions/${encodeURIComponent(sessionId)}/clipboard`,
+    { cache: 'no-store' }
+  );
+  return data.text ?? '';
+}
+
+export async function setDesktopClipboard(sessionId: string, text: string): Promise<void> {
+  await requestJson<{ ok: boolean }>(
+    `/desktop/sessions/${encodeURIComponent(sessionId)}/clipboard`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }
+  );
+}
+
+export function buildDesktopWsUrl(sessionId: string, wsToken: string): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const params = new URLSearchParams({ token: wsToken });
+  return `${proto}//${window.location.host}${API_BASE}/desktop/sessions/${encodeURIComponent(
+    sessionId
+  )}/ws?${params.toString()}`;
 }

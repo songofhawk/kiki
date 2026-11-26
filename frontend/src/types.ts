@@ -88,6 +88,9 @@ export interface HitlRequest {
   run_id?: string;
   topic_id?: string;
   prompt: string;
+  kind?: 'approval' | 'desktop_takeover';
+  instructions?: string | null;
+  url?: string | null;
   options: HitlOption[];
 }
 
@@ -255,4 +258,65 @@ export interface ToastNotification {
   run_id: string;
   summary: string;
   created_at: number;
+}
+
+export type DesktopControlMode = 'view' | 'control';
+
+export interface DesktopDisplayInfo {
+  index: number;
+  display_id: number;
+  name: string;
+  width: number;
+  height: number;
+  origin_x: number;
+  origin_y: number;
+  is_main: boolean;
+}
+
+export interface DesktopPermissions {
+  screen_recording: boolean;
+  accessibility: boolean;
+  warnings: string[];
+}
+
+export interface DesktopSession {
+  id: string;
+  control_mode: DesktopControlMode;
+  display_index: number;
+  fps: number;
+  quality: number;
+  max_width: number;
+  idle_timeout_seconds: number;
+  created_at: string;
+  last_activity_at: string;
+  expires_at: string;
+  run_id?: string | null;
+  topic_id?: string | null;
+  reason?: string | null;
+  instructions?: string | null;
+  action_count: number;
+  ws_connected: boolean;
+  ws_token?: string;
+}
+
+export interface DesktopStatusResponse {
+  enabled: boolean;
+  available: boolean;
+  driver: string;
+  platform: string;
+  supports_control: boolean;
+  supports_clipboard: boolean;
+  displays: DesktopDisplayInfo[];
+  permissions: DesktopPermissions;
+  error?: string | null;
+  driver_error?: string | null;
+  active_session?: DesktopSession | null;
+}
+
+export interface DesktopTakeoverContext {
+  runId?: string;
+  topicId?: string;
+  reason?: string;
+  instructions?: string | null;
+  url?: string | null;
 }
