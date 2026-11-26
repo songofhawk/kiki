@@ -499,7 +499,7 @@ def test_recent_messages_with_topic_includes_failed_session_run_in_context(tmp_p
     formatted = KikiLLMClient._format_context_lines(recent)
     assert "(#深圳实时天气查询)" in formatted
     assert "再查一下深圳现在的天气" in formatted
-    assert "[后台任务执行失败(gemini_agent): 503 Service Unavailable]" in formatted
+    assert "[后台任务执行失败(internal_agent): 503 Service Unavailable]" in formatted
 
 
 @pytest.mark.asyncio

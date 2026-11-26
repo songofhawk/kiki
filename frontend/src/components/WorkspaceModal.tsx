@@ -1,11 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
+  ArrowUp,
   Check,
+  ChevronRight,
   Copy,
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderSearch,
   Loader2,
   Star,
   Trash2,
@@ -13,12 +16,19 @@ import {
 } from 'lucide-react';
 import {
   addWorkspaceMount,
+  browseDirectories,
   deleteWorkspaceMount,
   fetchGlobalWorkspace,
   fetchTopicWorkspace,
   updateWorkspaceMount,
 } from '../api';
-import type { GlobalWorkspace, Topic, TopicWorkspace, WorkspaceMount } from '../types';
+import type {
+  DirectoryBrowseResponse,
+  GlobalWorkspace,
+  Topic,
+  TopicWorkspace,
+  WorkspaceMount,
+} from '../types';
 
 export interface WorkspaceModalProps {
   open: boolean;
@@ -53,6 +63,12 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
   const [newIsPrimary, setNewIsPrimary] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserLoading, setBrowserLoading] = useState(false);
+  const [browserError, setBrowserError] = useState<string | null>(null);
+  const [showHiddenDirs, setShowHiddenDirs] = useState(false);
+  const [browseData, setBrowseData] = useState<DirectoryBrowseResponse | null>(null);
+
   useEffect(() => {
     if (open) {
       setActiveTab(focusTopic ? 'topic' : 'global');
@@ -60,8 +76,43 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
       setNewPath('');
       setNewLabel('');
       setNewIsPrimary(Boolean(focusTopic));
+      setBrowserOpen(false);
+      setBrowserError(null);
     }
   }, [open, focusTopic]);
+
+  const loadBrowseDir = useCallback(
+    async (targetPath?: string, hiddenOverride?: boolean) => {
+      setBrowserLoading(true);
+      setBrowserError(null);
+      try {
+        const res = await browseDirectories(
+          targetPath,
+          hiddenOverride ?? showHiddenDirs
+        );
+        setBrowseData(res);
+      } catch (err) {
+        setBrowserError(err instanceof Error ? err.message : '无法读取该目录');
+      } finally {
+        setBrowserLoading(false);
+      }
+    },
+    [showHiddenDirs]
+  );
+
+  const handleToggleBrowser = () => {
+    if (browserOpen) {
+      setBrowserOpen(false);
+      return;
+    }
+    setBrowserOpen(true);
+    void loadBrowseDir(newPath.trim() || undefined);
+  };
+
+  const handlePickDirectory = (pickedPath: string) => {
+    setNewPath(pickedPath);
+    setBrowserOpen(false);
+  };
 
   const loadData = useCallback(async () => {
     if (!open) return;
@@ -419,13 +470,157 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
                   : '为主信息流添加指定目录'}
               </span>
             </div>
-            <input
-              type="text"
-              value={newPath}
-              onChange={(e) => setNewPath(e.target.value)}
-              placeholder="输入本地文件夹路径，例如 ~/projects/my-app"
-              className="w-full px-3 py-2 text-xs font-mono rounded-lg bg-[#FAF8F5] border border-[#E2D9CC] focus:outline-none focus:border-[#5B7A95]"
-            />
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={newPath}
+                onChange={(e) => setNewPath(e.target.value)}
+                placeholder="输入本地文件夹路径，例如 ~/projects/my-app"
+                className="flex-1 min-w-0 px-3 py-2 text-xs font-mono rounded-lg bg-[#FAF8F5] border border-[#E2D9CC] focus:outline-none focus:border-[#5B7A95]"
+              />
+              <button
+                type="button"
+                onClick={handleToggleBrowser}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors shrink-0 ${
+                  browserOpen
+                    ? 'bg-[#EAF0F5] text-[#3B5972] border-[#CFE0EC]'
+                    : 'bg-[#FAF8F5] hover:bg-[#EFEAE2] text-[#4E4842] border-[#E2D9CC]'
+                }`}
+              >
+                <FolderSearch className="w-3.5 h-3.5 text-[#5B7A95]" />
+                <span>{browserOpen ? '收起浏览' : '浏览...'}</span>
+              </button>
+            </div>
+
+            {browserOpen && (
+              <div className="rounded-xl border border-[#DFD7CB] bg-[#FAF8F5] overflow-hidden">
+                {/* Browser Toolbar */}
+                <div className="px-2.5 py-2 bg-[#F3EFE9] border-b border-[#E5DED4] flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    <button
+                      type="button"
+                      disabled={browserLoading || !browseData?.parent_path}
+                      onClick={() => {
+                        if (browseData?.parent_path) {
+                          void loadBrowseDir(browseData.parent_path);
+                        }
+                      }}
+                      title="返回上一级目录"
+                      className="p-1 rounded-md bg-white border border-[#E2D9CC] text-[#4E4842] hover:bg-[#FAF8F5] disabled:opacity-40 shrink-0"
+                    >
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </button>
+                    <span
+                      className="text-[11px] font-mono text-[#3A3530] truncate"
+                      title={browseData?.current_path || ''}
+                    >
+                      {browseData?.current_path || '正在加载...'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <label className="inline-flex items-center gap-1 text-[11px] text-[#6E665E] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={showHiddenDirs}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setShowHiddenDirs(next);
+                          void loadBrowseDir(browseData?.current_path, next);
+                        }}
+                        className="rounded border-[#C8BFB2] text-[#5B7A95] focus:ring-[#5B7A95]"
+                      />
+                      <span>隐藏目录</span>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={!browseData?.current_path}
+                      onClick={() => {
+                        if (browseData?.current_path) {
+                          handlePickDirectory(browseData.current_path);
+                        }
+                      }}
+                      className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-[#5B7A95] hover:bg-[#4B6882] text-white transition-colors disabled:opacity-40"
+                    >
+                      选择此目录
+                    </button>
+                  </div>
+                </div>
+
+                {/* Quick Shortcuts */}
+                {browseData && browseData.shortcuts.length > 0 && (
+                  <div className="px-2.5 py-1.5 border-b border-[#EAE3D8] flex items-center gap-1.5 overflow-x-auto">
+                    {browseData.shortcuts.map((sc) => {
+                      const active = browseData.current_path === sc.path;
+                      return (
+                        <button
+                          key={sc.path}
+                          type="button"
+                          onClick={() => void loadBrowseDir(sc.path)}
+                          className={`px-2 py-0.5 rounded-md text-[11px] whitespace-nowrap transition-colors ${
+                            active
+                              ? 'bg-[#5B7A95] text-white font-medium'
+                              : 'bg-white border border-[#E5DED4] text-[#5A534C] hover:bg-[#EFEAE2]'
+                          }`}
+                        >
+                          {sc.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {browserError && (
+                  <div className="px-3 py-2 text-[11px] text-rose-700 bg-rose-50 border-b border-rose-200 flex items-center justify-between gap-2">
+                    <span className="truncate">{browserError}</span>
+                    <button
+                      type="button"
+                      onClick={() => void loadBrowseDir(undefined)}
+                      className="text-[11px] font-medium underline shrink-0"
+                    >
+                      回到主目录
+                    </button>
+                  </div>
+                )}
+
+                {/* Directory Entries */}
+                <div className="max-h-48 overflow-y-auto divide-y divide-[#EFEAE2]">
+                  {browserLoading ? (
+                    <div className="py-6 flex items-center justify-center gap-2 text-xs text-[#7D756C]">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#5B7A95]" />
+                      <span>正在读取目录...</span>
+                    </div>
+                  ) : browseData && browseData.entries.length > 0 ? (
+                    browseData.entries.map((entry) => (
+                      <div
+                        key={entry.path}
+                        className="group flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-white transition-colors"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => void loadBrowseDir(entry.path)}
+                          className="flex-1 min-w-0 flex items-center gap-2 text-left text-xs text-[#262422]"
+                        >
+                          <Folder className="w-3.5 h-3.5 text-[#5B7A95] shrink-0" />
+                          <span className="truncate">{entry.name}</span>
+                          <ChevronRight className="w-3 h-3 text-[#ABA298] shrink-0 opacity-0 group-hover:opacity-100" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handlePickDirectory(entry.path)}
+                          className="opacity-0 group-hover:opacity-100 px-2 py-0.5 rounded text-[11px] font-medium text-[#3B5972] bg-[#EAF0F5] hover:bg-[#DCE7F0] transition-opacity shrink-0"
+                        >
+                          选择
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="py-5 text-center text-[11px] text-[#8C8378]">
+                      当前目录下没有子文件夹，可直接点击右上角「选择此目录」
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <input
                 type="text"

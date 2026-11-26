@@ -5,6 +5,7 @@ import type {
   BatchReassignTopicResponse,
   ChatRequest,
   ChatResponse,
+  DirectoryBrowseResponse,
   GlobalWorkspace,
   HealthResponse,
   HitlRequest,
@@ -53,6 +54,17 @@ export async function fetchHealth(): Promise<HealthResponse> {
 
 export async function fetchGlobalWorkspace(): Promise<GlobalWorkspace> {
   return requestJson<GlobalWorkspace>('/workspace');
+}
+
+export async function browseDirectories(
+  path?: string,
+  showHidden = false
+): Promise<DirectoryBrowseResponse> {
+  const params = new URLSearchParams();
+  if (path) params.set('path', path);
+  if (showHidden) params.set('show_hidden', 'true');
+  const qs = params.toString();
+  return requestJson<DirectoryBrowseResponse>(`/workspace/browse${qs ? `?${qs}` : ''}`);
 }
 
 export async function fetchTopicWorkspace(topicId: string): Promise<TopicWorkspace> {

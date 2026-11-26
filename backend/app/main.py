@@ -27,6 +27,8 @@ from .schemas import (
     BatchMessageTopicReassignResponse,
     ChatRequest,
     ChatResponse,
+    DirectoryBrowseResponse,
+    DirectoryEntry,
     GlobalWorkspaceResponse,
     HealthResponse,
     MessageItem,
@@ -266,6 +268,64 @@ def create_app(
             shared_dir=str(workspace_manager.shared_dir),
             topics_dir=str(workspace_manager.topics_dir),
             global_mounts=[WorkspaceMountItem.model_validate(m) for m in global_mounts],
+        )
+
+    @app.get("/api/workspace/browse", response_model=DirectoryBrowseResponse)
+    async def browse_workspace_directories(
+        path: Optional[str] = Query(default=None),
+        show_hidden: bool = Query(default=False),
+    ) -> DirectoryBrowseResponse:
+        home_dir = Path.home().resolve()
+        raw = (path or "").strip()
+        target = Path(raw).expanduser().resolve() if raw else home_dir
+        if not target.exists():
+            raise HTTPException(status_code=400, detail=f"目录不存在: {target}")
+        if not target.is_dir():
+            raise HTTPException(status_code=400, detail=f"路径不是文件夹: {target}")
+
+        entries: list[DirectoryEntry] = []
+        try:
+            children = sorted(
+                target.iterdir(),
+                key=lambda p: p.name.lower(),
+            )
+            for child in children:
+                if not show_hidden and child.name.startswith("."):
+                    continue
+                try:
+                    if child.is_dir():
+                        entries.append(DirectoryEntry(name=child.name, path=str(child)))
+                except OSError:
+                    continue
+                if len(entries) >= 500:
+                    break
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=f"无权限访问目录: {target}") from exc
+
+        shortcut_candidates = [
+            ("主目录 (~)", home_dir),
+            ("桌面", home_dir / "Desktop"),
+            ("文稿", home_dir / "Documents"),
+            ("下载", home_dir / "Downloads"),
+            ("Kiki 工作空间", workspace_manager.workspace_root),
+        ]
+        shortcuts: list[DirectoryEntry] = []
+        seen_paths: set[str] = set()
+        for label, p in shortcut_candidates:
+            try:
+                resolved_p = p.resolve()
+                if resolved_p.is_dir() and str(resolved_p) not in seen_paths:
+                    seen_paths.add(str(resolved_p))
+                    shortcuts.append(DirectoryEntry(name=label, path=str(resolved_p)))
+            except OSError:
+                continue
+
+        parent_path = str(target.parent) if target.parent != target else None
+        return DirectoryBrowseResponse(
+            current_path=str(target),
+            parent_path=parent_path,
+            entries=entries,
+            shortcuts=shortcuts,
         )
 
     @app.get("/api/topics/{topic_id}/workspace", response_model=TopicWorkspaceResponse)

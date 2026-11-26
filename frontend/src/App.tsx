@@ -9,7 +9,6 @@ import {
   Menu,
   Send,
   Sparkles,
-  Tag,
   X,
 } from 'lucide-react';
 import {
@@ -368,6 +367,7 @@ export const App: React.FC = () => {
 
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
+  const [workspaceTargetTopic, setWorkspaceTargetTopic] = useState<Topic | null>(null);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -1434,6 +1434,10 @@ export const App: React.FC = () => {
           onCreateTopic={handleCreateTopic}
           onRenameTopic={handleRenameTopic}
           onArchiveTopic={handleArchiveTopic}
+          onOpenTopicSettings={(topic) => {
+            setWorkspaceTargetTopic(topic);
+            setWorkspaceModalOpen(true);
+          }}
           onReassignMessage={handleReassignMessage}
         />
       </div>
@@ -1458,6 +1462,11 @@ export const App: React.FC = () => {
               onCreateTopic={handleCreateTopic}
               onRenameTopic={handleRenameTopic}
               onArchiveTopic={handleArchiveTopic}
+              onOpenTopicSettings={(topic) => {
+                setMobileSidebarOpen(false);
+                setWorkspaceTargetTopic(topic);
+                setWorkspaceModalOpen(true);
+              }}
               onReassignMessage={handleReassignMessage}
             />
           </div>
@@ -1514,6 +1523,8 @@ export const App: React.FC = () => {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
+              role="switch"
+              aria-checked={showAllTopicTags}
               onClick={() =>
                 setShowAllTopicTags((prev) => {
                   const next = !prev;
@@ -1525,26 +1536,36 @@ export const App: React.FC = () => {
                   return next;
                 })
               }
-              aria-pressed={showAllTopicTags}
               title={
                 showAllTopicTags
-                  ? '当前：始终显示每条消息的话题标签（点击改为悬停显示）'
-                  : '当前：悬停消息时显示话题标签（点击显示全部标签）'
+                  ? '关闭后仅在悬停消息时显示话题标签'
+                  : '开启后始终显示每条消息的话题标签'
               }
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+              className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
                 showAllTopicTags
                   ? 'bg-[#EAF0F5] text-[#3B5972] border-[#CFE0EC]'
                   : 'bg-white hover:bg-[#F3EFE9] text-[#5A534C] border-[#E5DED4]'
               }`}
             >
-              <Tag className="w-3.5 h-3.5 text-[#5B7A95]" />
-              <span className="hidden sm:inline">
-                {showAllTopicTags ? '显示全部标签' : '悬停显示标签'}
+              <span className="hidden sm:inline">显示话题标签</span>
+              <span
+                className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+                  showAllTopicTags ? 'bg-[#5B7A95]' : 'bg-[#D6CFC5]'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${
+                    showAllTopicTags ? 'translate-x-3.5' : 'translate-x-0.5'
+                  }`}
+                />
               </span>
             </button>
             <button
               type="button"
-              onClick={() => setWorkspaceModalOpen(true)}
+              onClick={() => {
+                setWorkspaceTargetTopic(focusedTopic);
+                setWorkspaceModalOpen(true);
+              }}
               title={
                 focusedTopic
                   ? `管理话题 #${focusedTopic.title} 与全局工作空间目录`
@@ -1800,8 +1821,11 @@ export const App: React.FC = () => {
       {/* Workspace & Directory Mounts Modal */}
       <WorkspaceModal
         open={workspaceModalOpen}
-        focusTopic={focusedTopic}
-        onClose={() => setWorkspaceModalOpen(false)}
+        focusTopic={workspaceTargetTopic ?? focusedTopic}
+        onClose={() => {
+          setWorkspaceModalOpen(false);
+          setWorkspaceTargetTopic(null);
+        }}
       />
 
       {/* L3 Geek Log Drawer */}

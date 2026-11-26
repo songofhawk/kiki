@@ -21,7 +21,7 @@ from app.adapters import (
     ClaudeCodeAdapter,
     CodexAdapter,
     DeepSeekHarnessAdapter,
-    GeminiAgentAdapter,
+    InternalAgentAdapter,
     KCodeAdapter,
     QoderAdapter,
     StreamParseState,
@@ -38,7 +38,7 @@ from app.sse import EventBus
 from app.tools import WorkspaceToolExecutor
 
 ALL_ADAPTER_IDS = [
-    "gemini_agent",
+    "internal_agent",
     "codex",
     "claude_code",
     "antigravity",
@@ -353,8 +353,8 @@ print(json.dumps({{"type": "result", "session_id": "sess_e2e_1", "result": "Clou
 
 
 @pytest.mark.asyncio
-async def test_gemini_agent_includes_topic_history_when_present(tmp_path: Path):
-    adapter = GeminiAgentAdapter()
+async def test_internal_agent_includes_topic_history_when_present(tmp_path: Path):
+    adapter = InternalAgentAdapter()
     ctx = _make_context(tmp_path, "再试一次")
     ctx.topic_title = "深圳实时天气查询"
     ctx.history = [
@@ -363,7 +363,7 @@ async def test_gemini_agent_includes_topic_history_when_present(tmp_path: Path):
             "content": "再查一下深圳现在的天气",
             "session_run": {
                 "status": "failed",
-                "agent_type": "gemini_agent",
+                "agent_type": "internal_agent",
                 "error_message": "503 high demand",
             },
         }
@@ -384,16 +384,16 @@ async def test_gemini_agent_includes_topic_history_when_present(tmp_path: Path):
     sent_input = captured[0]["input_data"]
     assert "当前话题：深圳实时天气查询" in sent_input
     assert "再查一下深圳现在的天气" in sent_input
-    assert "[后台任务执行失败(gemini_agent): 503 high demand]" in sent_input
+    assert "[后台任务执行失败(internal_agent): 503 high demand]" in sent_input
     assert "用户当前任务：再试一次" in sent_input
 
 
 @pytest.mark.asyncio
-async def test_gemini_agent_probe_model_override_and_max_steps_synthesis(tmp_path: Path):
-    assert GeminiAgentAdapter(api_key_configured=False).probe().available is False
-    assert GeminiAgentAdapter(api_key_configured=True).probe().available is True
+async def test_internal_agent_probe_model_override_and_max_steps_synthesis(tmp_path: Path):
+    assert InternalAgentAdapter(api_key_configured=False).probe().available is False
+    assert InternalAgentAdapter(api_key_configured=True).probe().available is True
 
-    adapter = GeminiAgentAdapter()
+    adapter = InternalAgentAdapter()
     ctx = _make_context(tmp_path, "循环查目录")
     ctx.max_steps = 1
     ctx.model_override = "gemini-3.8-flash"

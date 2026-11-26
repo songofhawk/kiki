@@ -224,6 +224,18 @@ export interface ResumeRunPayload {
   comment?: string;
 }
 
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface DirectoryBrowseResponse {
+  current_path: string;
+  parent_path?: string | null;
+  entries: DirectoryEntry[];
+  shortcuts: DirectoryEntry[];
+}
+
 export interface ToastNotification {
   id: string;
   topic_id: string;

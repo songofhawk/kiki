@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { Archive, Check, Hash, Layers, Loader2, PawPrint, Pencil, Plus, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Archive, Check, Hash, Layers, Loader2, PawPrint, Pencil, Plus, Settings, X } from 'lucide-react';
 import type { KikiStatus, ReassignTopicPayload, Topic } from '../types';
 import KikiAvatar, { KIKI_POSE_LABELS, KIKI_STATUS_LABELS, type KikiPose } from './KikiAvatar';
 import UserAvatar from './UserAvatar';
@@ -16,6 +17,7 @@ export interface SidebarProps {
   onCreateTopic: (title: string) => Promise<void> | void;
   onRenameTopic?: (topicId: string, title: string) => Promise<void> | void;
   onArchiveTopic?: (topicId: string) => Promise<void> | void;
+  onOpenTopicSettings?: (topic: Topic) => void;
   onReassignMessage: (
     messageId: string,
     payload: ReassignTopicPayload
@@ -34,6 +36,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCreateTopic,
   onRenameTopic,
   onArchiveTopic,
+  onOpenTopicSettings,
   onReassignMessage,
 }) => {
   const [dragOverTopicId, setDragOverTopicId] = useState<string | null>(null);
@@ -42,7 +45,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [creating, setCreating] = useState(false);
   const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState('');
+  const [archiveTargetTopic, setArchiveTargetTopic] = useState<Topic | null>(null);
+  const [archiving, setArchiving] = useState(false);
   const [companionMoodLabel, setCompanionMoodLabel] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!archiveTargetTopic) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !archiving) {
+        setArchiveTargetTopic(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [archiveTargetTopic, archiving]);
 
   const activeTopics = topics.filter((t) => t.status === 'active');
 
@@ -270,9 +286,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
-                  {!isGeneral && (onRenameTopic || onArchiveTopic) && (
+                  {(onOpenTopicSettings || (!isGeneral && (onRenameTopic || onArchiveTopic))) && (
                     <div className="hidden group-hover:flex items-center gap-0.5">
-                      {onRenameTopic && (
+                      {onOpenTopicSettings && (
+                        <button
+                          type="button"
+                          title="配置话题外部目录"
+                          aria-label="配置话题外部目录"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenTopicSettings(topic);
+                          }}
+                          className="p-1 rounded-md text-[#7D756C] hover:text-[#5B7A95] hover:bg-[#E2DBD0]"
+                        >
+                          <Settings className="w-3 h-3" />
+                        </button>
+                      )}
+                      {!isGeneral && onRenameTopic && (
                         <button
                           type="button"
                           title="重命名话题"
@@ -287,14 +317,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                           <Pencil className="w-3 h-3" />
                         </button>
                       )}
-                      {onArchiveTopic && (
+                      {!isGeneral && onArchiveTopic && (
                         <button
                           type="button"
                           title="归档话题"
                           aria-label="归档话题"
                           onClick={(e) => {
                             e.stopPropagation();
-                            void onArchiveTopic(topic.id);
+                            setArchiveTargetTopic(topic);
                           }}
                           className="p-1 rounded-md text-[#7D756C] hover:text-rose-700 hover:bg-rose-50"
                         >
@@ -332,26 +362,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Bottom Pinned Kiki Companion Stage (Live animated companion) */}
-      <div className="p-3 border-t border-[#E8E2D9]">
-        <div
-          className={`rounded-2xl border px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
-            globalKikiStatus === 'waiting_input'
-              ? 'bg-amber-50/70 border-amber-300'
-              : globalKikiStatus === 'running'
-                ? 'bg-[#EEF4F8] border-[#C9DAE8]'
-                : 'bg-[#FAF8F5] border-[#E6DFD5]'
-          }`}
-        >
+      <div className="px-3 py-2.5 border-t border-[#E8E2D9] flex justify-center">
+        <div className="group relative inline-flex items-center justify-center">
           <KikiAvatar
             status={isPureIdle ? 'idle' : globalKikiStatus}
             pose={isPureIdle ? undefined : companionPose}
             animated
             companion={isPureIdle}
             size="xl"
-            className="-my-1.5 -ml-1"
+            className="-my-1.5"
             onCompanionMoodChange={setCompanionMoodLabel}
           />
-          <div className="min-w-0 flex-1">
+          <div className="pointer-events-none opacity-0 group-hover:opacity-100 translate-y-1 group-hover:translate-y-0 transition-all duration-200 absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-52 rounded-xl bg-white/95 backdrop-blur-sm border border-[#E5DED4] shadow-lg shadow-stone-900/10 px-3 py-2 text-center z-30">
             <div className="text-[10px] font-semibold uppercase tracking-wider text-[#8C8378]">
               Kiki 伴宠小窝
             </div>
@@ -368,12 +390,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                           ? 'bg-[#E7EFF5] text-[#3B5972]'
                           : 'bg-[#ECE6DD] text-[#5A534C]'
                 }`}
-                title={statusBadgeText}
               >
                 {statusBadgeText}
               </span>
             </div>
-            <div className="mt-1 text-[10px] text-[#8C8378] truncate">
+            <div className="mt-1 text-[10px] text-[#8C8378]">
               {isPureIdle
                 ? '点点 Kiki 可逗她 · 拖拽消息改绑'
                 : '拖拽消息可快速改绑话题'}
@@ -381,6 +402,76 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Custom Archive Confirmation Modal */}
+      {archiveTargetTopic &&
+        onArchiveTopic &&
+        createPortal(
+          <div
+            onClick={() => {
+              if (!archiving) setArchiveTargetTopic(null);
+            }}
+            className="fixed inset-0 z-[120] flex items-center justify-center bg-black/30 backdrop-blur-[2px] p-4"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="archive-topic-dialog-title"
+              className="w-full max-w-sm rounded-2xl bg-[#FAF8F5] border border-[#E5DED4] shadow-2xl shadow-stone-900/15 p-5 animate-kiki-fade-up"
+            >
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-rose-50 border border-rose-200/80 flex items-center justify-center shrink-0">
+                  <Archive className="w-5 h-5 text-rose-600" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3
+                    id="archive-topic-dialog-title"
+                    className="text-sm font-semibold text-[#262422]"
+                  >
+                    归档话题
+                  </h3>
+                  <p className="mt-1.5 text-xs text-[#6E665E] leading-relaxed">
+                    确定要归档话题{' '}
+                    <span className="font-semibold text-[#3B5972]">
+                      #{archiveTargetTopic.title}
+                    </span>{' '}
+                    吗？归档后它将从活跃列表隐藏，历史消息仍会保留在全局流中。
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={archiving}
+                  onClick={() => setArchiveTargetTopic(null)}
+                  className="px-3.5 py-1.5 rounded-xl text-xs font-medium text-[#5A534C] bg-white hover:bg-[#EFEAE2] border border-[#E5DED4] transition-colors disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={archiving}
+                  onClick={async () => {
+                    setArchiving(true);
+                    try {
+                      await onArchiveTopic(archiveTargetTopic.id);
+                      setArchiveTargetTopic(null);
+                    } finally {
+                      setArchiving(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 shadow-sm transition-colors disabled:opacity-50"
+                >
+                  {archiving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>确认归档</span>
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </aside>
   );
 };

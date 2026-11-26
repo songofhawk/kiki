@@ -111,6 +111,18 @@ class WorkspaceMountUpdateRequest(BaseModel):
     is_primary: Optional[bool] = None
 
 
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str
+
+
+class DirectoryBrowseResponse(BaseModel):
+    current_path: str
+    parent_path: Optional[str] = None
+    entries: list[DirectoryEntry] = Field(default_factory=list)
+    shortcuts: list[DirectoryEntry] = Field(default_factory=list)
+
+
 class GlobalWorkspaceResponse(BaseModel):
     workspace_root: str
     rules_dir: str
