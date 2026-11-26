@@ -28,6 +28,7 @@ class EventBus:
         self._max_tracked_runs = max(1, max_tracked_runs)
         self._raw_logs: OrderedDict[str, deque[dict[str, Any]]] = OrderedDict()
         self._hitl_requests: dict[str, dict[str, Any]] = {}
+        self._hitl_meta: dict[str, dict[str, Any]] = {}
         self._current_kiki_status: dict[str, Any] = {"status": "idle"}
         self._closing: bool = False
 
@@ -113,6 +114,13 @@ class EventBus:
 
     def clear_hitl_request(self, run_id: str) -> None:
         self._hitl_requests.pop(run_id, None)
+        self._hitl_meta.pop(run_id, None)
+
+    def set_hitl_meta(self, run_id: str, meta: dict[str, Any]) -> None:
+        self._hitl_meta[run_id] = dict(meta)
+
+    def pop_hitl_meta(self, run_id: str) -> dict[str, Any]:
+        return self._hitl_meta.pop(run_id, {})
 
     def get_hitl_request(self, run_id: str) -> Optional[dict[str, Any]]:
         req = self._hitl_requests.get(run_id)

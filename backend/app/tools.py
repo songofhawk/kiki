@@ -220,6 +220,33 @@ AGENT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
             "required": ["prompt"],
         },
     },
+    {
+        "type": "function",
+        "name": "request_desktop_takeover",
+        "description": (
+            "Pause execution and hand over the Kiki server desktop to the human user when manual GUI "
+            "interaction is required (e.g. login/2FA, CAPTCHA, OAuth consent, macOS permission prompt, "
+            "or visual verification in a desktop app/browser)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Clear Chinese summary explaining why the user needs to take over the desktop.",
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "Optional step-by-step Chinese guidance for what the user should do on the server desktop.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Optional relevant http/https URL to display as context for the user.",
+                },
+            },
+            "required": ["reason"],
+        },
+    },
 ]
 
 

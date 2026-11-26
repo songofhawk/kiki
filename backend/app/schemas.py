@@ -182,6 +182,9 @@ class HITLRequest(BaseModel):
     run_id: str
     topic_id: str
     prompt: str
+    kind: Literal["approval", "desktop_takeover"] = "approval"
+    instructions: Optional[str] = None
+    url: Optional[str] = None
     options: list[HITLOption] = Field(default_factory=list)
 
 

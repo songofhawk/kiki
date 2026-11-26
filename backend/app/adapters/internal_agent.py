@@ -17,14 +17,15 @@ from .base import (
 )
 
 AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (internal_agent)。
-你可以使用工作区与联网工具（list_files, read_file, write_artifact, run_shell, web_search, fetch_webpage, request_human_approval）来完成用户的复杂任务。
+你可以使用工作区与联网工具（list_files, read_file, write_artifact, run_shell, web_search, fetch_webpage, request_human_approval, request_desktop_takeover）来完成用户的复杂任务。
 
 执行规范：
 1. 先探索再操作，合理调用工具获取真实信息；需要最新资讯、文档或外部资料时，优先调用 `web_search` 与 `fetch_webpage`。
 2. 若需要产出报告、分析文档或代码，使用 `write_artifact` 保存为产物文件。
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
-4. 任务完成时，用简洁、信息密度高的中文给出最终总结（**严格控制在 200 字以内**），直接说明结论与产出物。
-5. 你当前**不具备**真实图片生成（PNG/JPG/WebP）工具；若用户要求生成图片或插画，**严禁**用 ASCII 字符画或 Markdown 文档冒充图片，应直接诚实说明无法生成真实图片，并建议用户改用支持生图的执行引擎（例如 Codex）。
+4. 若任务遇到必须人工在服务器桌面亲自操作的场景（如登录/二步验证、图形验证码、OAuth 授权、桌面软件弹窗或系统权限确认），应调用 `request_desktop_takeover` 挂起并交由主人接管服务器桌面，待主人处理完成后继续执行。
+5. 任务完成时，用简洁、信息密度高的中文给出最终总结（**严格控制在 200 字以内**），直接说明结论与产出物。
+6. 你当前**不具备**真实图片生成（PNG/JPG/WebP）工具；若用户要求生成图片或插画，**严禁**用 ASCII 字符画或 Markdown 文档冒充图片，应直接诚实说明无法生成真实图片，并建议用户改用支持生图的执行引擎（例如 Codex）。
 """
 
 
@@ -35,6 +36,8 @@ def _action_type_for_tool(tool_name: str) -> str:
         return "file_edit"
     if tool_name == "request_human_approval":
         return "hitl_wait"
+    if tool_name == "request_desktop_takeover":
+        return "desktop_takeover"
     return "tool_call"
 
 
@@ -60,6 +63,9 @@ def _step_label_for_tool(tool_name: str, args: dict[str, Any]) -> str:
     if tool_name == "request_human_approval":
         prompt = str(args.get("prompt", "等待人工确认"))
         return f"等待主人拍板：{prompt[:50]}"
+    if tool_name == "request_desktop_takeover":
+        reason = str(args.get("reason", "需要接管服务器桌面"))
+        return f"等待主人接管桌面：{reason[:50]}"
     return f"正在执行工具 {tool_name}..."
 
 
@@ -200,6 +206,50 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                         step_log["id"],
                         status="success",
                         detail=f"主人已拍板：{'同意' if approved else '拒绝'} ({decision_val})",
+                    )
+                    function_results.append(
+                        {
+                            "type": "function_result",
+                            "call_id": call_id,
+                            "name": tool_name,
+                            "result": result_str,
+                            "is_error": False,
+                        }
+                    )
+                elif tool_name == "request_desktop_takeover":
+                    reason = str(args.get("reason") or "Kiki 需要你接管服务器桌面完成手动操作。")
+                    instructions = str(args.get("instructions") or "").strip() or None
+                    raw_url = str(args.get("url") or "").strip()
+                    safe_url = raw_url if raw_url.startswith(("http://", "https://")) else None
+                    takeover_options = [
+                        {"label": "我已处理完毕，继续执行", "value": "takeover_done", "approved": True, "style": "primary"},
+                        {"label": "无法处理，终止此步骤", "value": "takeover_cancel", "approved": False, "style": "danger"},
+                    ]
+                    ctx.event_bus.set_hitl_meta(
+                        ctx.run_id,
+                        {
+                            "kind": "desktop_takeover",
+                            "instructions": instructions,
+                            "url": safe_url,
+                        },
+                    )
+                    decision_payload = await ctx.request_hitl_approval(reason, takeover_options)
+
+                    completed = bool(decision_payload.get("approved", False))
+                    decision_val = str(decision_payload.get("decision", ""))
+                    comment = decision_payload.get("comment") or ""
+                    result_str = json.dumps(
+                        {
+                            "desktop_takeover_completed": completed,
+                            "decision": decision_val,
+                            "user_note": comment,
+                        },
+                        ensure_ascii=False,
+                    )
+                    ctx.finish_step(
+                        step_log["id"],
+                        status="success" if completed else "failed",
+                        detail=f"桌面接管已结束：{'主人已处理完毕' if completed else '主人取消处理'}",
                     )
                     function_results.append(
                         {

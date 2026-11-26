@@ -261,18 +261,26 @@ class TaskManager:
         raw_options: list[dict[str, Any]],
     ) -> dict[str, Any]:
         options = _normalize_hitl_options(raw_options)
-        hitl_req = {
+        meta = self.event_bus.pop_hitl_meta(run_id)
+        kind = "desktop_takeover" if meta.get("kind") == "desktop_takeover" else "approval"
+        hitl_req: dict[str, Any] = {
             "run_id": run_id,
             "topic_id": topic_id,
             "prompt": prompt,
+            "kind": kind,
             "options": options,
         }
+        if meta.get("instructions"):
+            hitl_req["instructions"] = str(meta["instructions"])
+        if meta.get("url"):
+            hitl_req["url"] = str(meta["url"])
         self.event_bus.set_hitl_request(run_id, hitl_req)
         self._run_states[run_id] = "waiting_input"
+        step_prefix = "需要主人接管桌面" if kind == "desktop_takeover" else "等待主人拍板"
         self.db.update_session_run(
             run_id,
             status="waiting_input",
-            current_step=f"等待主人拍板：{prompt[:60]}",
+            current_step=f"{step_prefix}：{prompt[:60]}",
         )
         self.event_bus.publish("hitl_required", hitl_req)
         self._publish_run_update(run_id)
