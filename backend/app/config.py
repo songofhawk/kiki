@@ -73,6 +73,11 @@ class Settings:
     search_provider_order: str = "tavily,serper,exa,jina,brave,bocha,serpapi"
     cors_origins: tuple[str, ...] = DEFAULT_CORS_ORIGINS
     api_token: str = ""
+    desktop_takeover_enabled: bool = True
+    desktop_driver: str = "auto"
+    desktop_idle_timeout_seconds: int = 900
+    desktop_default_fps: int = 4
+    desktop_max_width: int = 1280
 
     @property
     def api_key_configured(self) -> bool:
@@ -172,6 +177,23 @@ def load_settings() -> Settings:
     else:
         cors_origins = DEFAULT_CORS_ORIGINS
 
+    raw_desktop_enabled = os.getenv("KIKI_DESKTOP_TAKEOVER_ENABLED", "true").strip().lower()
+    desktop_enabled = raw_desktop_enabled not in ("0", "false", "no", "off")
+    desktop_driver = os.getenv("KIKI_DESKTOP_DRIVER", "auto").strip().lower() or "auto"
+
+    def _parse_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+        raw_val = os.getenv(name, "").strip()
+        if not raw_val:
+            return default
+        try:
+            return max(minimum, min(maximum, int(raw_val)))
+        except ValueError:
+            return default
+
+    desktop_idle_timeout = _parse_int_env("KIKI_DESKTOP_IDLE_TIMEOUT_SECONDS", 900, 30, 7200)
+    desktop_default_fps = _parse_int_env("KIKI_DESKTOP_DEFAULT_FPS", 4, 1, 15)
+    desktop_max_width = _parse_int_env("KIKI_DESKTOP_MAX_WIDTH", 1280, 640, 2560)
+
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -204,6 +226,11 @@ def load_settings() -> Settings:
         ),
         cors_origins=cors_origins,
         api_token=os.getenv("KIKI_API_TOKEN", "").strip(),
+        desktop_takeover_enabled=desktop_enabled,
+        desktop_driver=desktop_driver,
+        desktop_idle_timeout_seconds=desktop_idle_timeout,
+        desktop_default_fps=desktop_default_fps,
+        desktop_max_width=desktop_max_width,
     )
 
 
