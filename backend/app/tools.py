@@ -22,7 +22,7 @@ _SENSITIVE_BASENAMES = {"id_rsa", "id_ed25519", "id_ecdsa", ".netrc", ".npmrc", 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_KEY", "_SECRET", "_TOKEN", "_PASSWORD", "_CREDENTIAL", "_CREDENTIALS")
 
 BLOCKED_SHELL_PATTERNS = [
-    r"(?:^|[;&|]\s*)(?:/\S*/)?rm\s+[^\n]*(?:-r\b|-rf\b|-fr\b|--recursive\b)",
+    r"(?:^|(?:&&|\|\||[;&|])\s*)(?:/\S*/)?rm\s+[^\n]*(?:-r\b|-rf\b|-fr\b|--recursive\b)",
     r"\bfind\b[^\n]*-delete\b",
     r"\bshutil\.rmtree\b",
     r"\bsudo\b",
@@ -401,13 +401,13 @@ class WorkspaceToolExecutor:
         self.event_bus.publish("artifact_created", {"run_id": run_id, "artifact": artifact})
         return artifact
 
-    async def run_shell(self, run_id: str, command: str, timeout_sec: float = 20.0) -> str:
+    async def run_shell(self, run_id: str, command: str, timeout_sec: float = 300.0) -> tuple[str, bool]:
         cmd = (command or "").strip()
         if not cmd:
-            return "Error: empty command."
+            return "Error: empty command.", True
         for pattern in BLOCKED_SHELL_PATTERNS:
             if re.search(pattern, cmd):
-                return f"Blocked unsafe command matching safety rule: {cmd}"
+                return f"Blocked unsafe command matching safety rule: {cmd}", True
 
         self.event_bus.append_raw_log(run_id, f"$ {cmd}", stream="stdout")
         proc = await asyncio.create_subprocess_shell(
@@ -446,17 +446,20 @@ class WorkspaceToolExecutor:
             await proc.wait()
             msg = f"Command timed out after {timeout_sec}s"
             self.event_bus.append_raw_log(run_id, msg, stream="stderr")
-            return msg
+            return msg, True
 
+        exit_code = proc.returncode
         combined = "\n".join(stdout_lines)
         if stderr_lines:
             err_text = "\n".join(stderr_lines)
             combined = f"{combined}\n[stderr]\n{err_text}" if combined else f"[stderr]\n{err_text}"
         if not combined:
-            combined = f"(exit code {proc.returncode}, no output)"
+            combined = f"(exit code {exit_code}, no output)"
+        if exit_code != 0:
+            combined = f"{combined}\n[exit code {exit_code}]"
         if len(combined) > 4000:
             combined = combined[:4000] + "\n... (output truncated)"
-        return combined
+        return combined, exit_code != 0
 
     async def execute(self, run_id: str, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
         """Execute a non-HITL workspace tool. Returns (result_text, is_error)."""
@@ -483,8 +486,11 @@ class WorkspaceToolExecutor:
                     False,
                 )
             if name == "run_shell":
-                out = await self.run_shell(run_id=run_id, command=str(arguments.get("command", "")))
-                return out, False
+                out, is_error = await self.run_shell(
+                    run_id=run_id,
+                    command=str(arguments.get("command", "")),
+                )
+                return out, is_error
             if name == "web_search":
                 resp = await self.search_service.search(
                     query=str(arguments.get("query", "")),

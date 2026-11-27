@@ -1263,12 +1263,35 @@ async def test_workspace_tools_block_sensitive_files_and_scrub_shell_env(
     assert "your_key" in out_ex
 
     # run_shell blocks split rm -r -f and scrubs secret env vars
-    blocked = await executor.run_shell("run-1", "rm -r -f ./tmp_dir")
+    blocked, blocked_err = await executor.run_shell("run-1", "rm -r -f ./tmp_dir")
+    assert blocked_err is True
     assert "Blocked unsafe command" in blocked
 
-    env_out = await executor.run_shell("run-1", "echo $GEMINI_API_KEY:$KIKI_API_TOKEN")
+    blocked_compound, blocked_compound_err = await executor.execute(
+        "run-1",
+        "run_shell",
+        {"command": "cd /tmp && rm -rf ./tmp_dir"},
+    )
+    assert blocked_compound_err is True
+    assert "Blocked unsafe command" in blocked_compound
+
+    env_out, env_err = await executor.run_shell("run-1", "echo $GEMINI_API_KEY:$KIKI_API_TOKEN")
+    assert env_err is False
     assert "should-not-leak-to-shell" not in env_out
     assert "token-should-not-leak" not in env_out
+
+    ok_out, ok_err = await executor.execute("run-1", "run_shell", {"command": "printf 'ok'"})
+    assert ok_err is False
+    assert "ok" in ok_out
+
+    fail_out, fail_err = await executor.execute(
+        "run-1",
+        "run_shell",
+        {"command": "printf 'boom' >&2; exit 7"},
+    )
+    assert fail_err is True
+    assert "boom" in fail_out
+    assert "[exit code 7]" in fail_out
 
 
 @pytest.mark.asyncio
