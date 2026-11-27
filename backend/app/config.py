@@ -84,6 +84,10 @@ class Settings:
     desktop_idle_timeout_seconds: int = 900
     desktop_default_fps: int = 4
     desktop_max_width: int = 1280
+    computer_use_enabled: bool = True
+    computer_use_max_steps: int = 30
+    computer_use_screenshot_width: int = 1280
+    computer_use_screenshot_quality: int = 70
 
     @property
     def api_key_configured(self) -> bool:
@@ -199,6 +203,11 @@ def load_settings() -> Settings:
     desktop_idle_timeout = _parse_int_env("KIKI_DESKTOP_IDLE_TIMEOUT_SECONDS", 900, 30, 7200)
     desktop_default_fps = _parse_int_env("KIKI_DESKTOP_DEFAULT_FPS", 4, 1, 15)
     desktop_max_width = _parse_int_env("KIKI_DESKTOP_MAX_WIDTH", 1280, 640, 2560)
+    raw_computer_use_enabled = os.getenv("KIKI_COMPUTER_USE_ENABLED", "true").strip().lower()
+    computer_use_enabled = raw_computer_use_enabled not in ("0", "false", "no", "off")
+    computer_use_max_steps = _parse_int_env("KIKI_COMPUTER_USE_MAX_STEPS", 30, 10, 60)
+    computer_use_screenshot_width = _parse_int_env("KIKI_COMPUTER_USE_SCREENSHOT_WIDTH", 1280, 640, 1920)
+    computer_use_screenshot_quality = _parse_int_env("KIKI_COMPUTER_USE_SCREENSHOT_QUALITY", 70, 35, 95)
     auth_session_ttl = _parse_int_env("KIKI_AUTH_SESSION_TTL_SECONDS", 7 * 24 * 3600, 300, 90 * 24 * 3600)
     raw_auth_cookie_secure = os.getenv("KIKI_AUTH_COOKIE_SECURE", "false").strip().lower()
     auth_cookie_secure = raw_auth_cookie_secure in ("1", "true", "yes", "on")
@@ -246,6 +255,10 @@ def load_settings() -> Settings:
         desktop_idle_timeout_seconds=desktop_idle_timeout,
         desktop_default_fps=desktop_default_fps,
         desktop_max_width=desktop_max_width,
+        computer_use_enabled=computer_use_enabled,
+        computer_use_max_steps=computer_use_max_steps,
+        computer_use_screenshot_width=computer_use_screenshot_width,
+        computer_use_screenshot_quality=computer_use_screenshot_quality,
     )
 
 

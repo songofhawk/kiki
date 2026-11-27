@@ -15,6 +15,7 @@ import {
   FileText,
   Loader2,
   Monitor,
+  RotateCcw,
   Terminal,
   XCircle,
 } from 'lucide-react';
@@ -36,6 +37,7 @@ export interface RunStatusCardProps {
   onOpenLogDrawer: (runId: string) => void;
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
+  onRetryRun?: (runId: string) => Promise<void> | void;
   onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
   onOpenDesktopTakeover?: (ctx: DesktopTakeoverContext) => void;
 }
@@ -91,6 +93,7 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
   onOpenLogDrawer,
   onResumeRun,
   onCancelRun,
+  onRetryRun,
   onPreviewArtifact,
   onOpenDesktopTakeover,
 }) => {
@@ -152,6 +155,21 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
       setActionBusy(false);
     }
   };
+
+  const handleRetry = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (actionBusy || !onRetryRun) return;
+    setActionBusy(true);
+    try {
+      await onRetryRun(sessionRun.id);
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const canRetry =
+    Boolean(onRetryRun) &&
+    (sessionRun.status === 'failed' || sessionRun.status === 'cancelled');
 
   const renderStatusIcon = () => {
     switch (sessionRun.status) {
@@ -282,6 +300,19 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
               </button>
             )}
 
+            {canRetry && (
+              <button
+                type="button"
+                disabled={actionBusy}
+                onClick={handleRetry}
+                title="重新执行此后台任务"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium text-[#3D5C78] bg-[#EAF0F5] hover:bg-[#DCE7F0] border border-[#CBD9E6] transition-colors disabled:opacity-50"
+              >
+                <RotateCcw className="w-3 h-3" />
+                <span>重试</span>
+              </button>
+            )}
+
             <span className="p-1 text-[#8C8378]">
               {expanded ? (
                 <ChevronUp className="w-4 h-4" />
@@ -323,7 +354,18 @@ export const RunStatusCard: React.FC<RunStatusCardProps> = ({
                         )}
                       </span>
                       <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#EFEAE2] text-[#575049]">
+                        <span
+                          className={
+                            step.action_type === 'computer_use'
+                              ? 'inline-flex items-center gap-1 font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#E8F1F8] text-[#2F5B7C]'
+                              : step.action_type === 'desktop_takeover'
+                              ? 'inline-flex items-center gap-1 font-mono text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800'
+                              : 'font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#EFEAE2] text-[#575049]'
+                          }
+                        >
+                          {step.action_type === 'computer_use' && (
+                            <Monitor className="w-3 h-3 shrink-0" />
+                          )}
                           #{step.step_number} {step.action_type}
                         </span>
                         <span className="text-[#2E2B28] break-words">

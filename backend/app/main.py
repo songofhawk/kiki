@@ -111,6 +111,15 @@ def create_app(
         event_bus=bus,
         search_service=search_service,
     )
+    resolved_desktop_driver = desktop_driver or create_desktop_driver(cfg.desktop_driver)
+    desktop_manager = DesktopTakeoverManager(
+        driver=resolved_desktop_driver,
+        event_bus=bus,
+        enabled=cfg.desktop_takeover_enabled,
+        idle_timeout_seconds=cfg.desktop_idle_timeout_seconds,
+        default_fps=cfg.desktop_default_fps,
+        default_max_width=cfg.desktop_max_width,
+    )
     task_manager = TaskManager(
         db=database,
         llm=llm_client,
@@ -119,6 +128,7 @@ def create_app(
         adapter_registry=registry,
         settings=cfg,
         workspace_manager=workspace_manager,
+        desktop_manager=desktop_manager,
     )
     decision_router = DecisionRouter(
         db=database,
@@ -149,15 +159,6 @@ def create_app(
         llm=llm_client,
         event_bus=bus,
         is_busy_provider=lambda: compute_global_kiki_status() != "idle",
-    )
-    resolved_desktop_driver = desktop_driver or create_desktop_driver(cfg.desktop_driver)
-    desktop_manager = DesktopTakeoverManager(
-        driver=resolved_desktop_driver,
-        event_bus=bus,
-        enabled=cfg.desktop_takeover_enabled,
-        idle_timeout_seconds=cfg.desktop_idle_timeout_seconds,
-        default_fps=cfg.desktop_default_fps,
-        default_max_width=cfg.desktop_max_width,
     )
     auth_manager = AuthManager(
         username=cfg.auth_username,
@@ -910,6 +911,16 @@ def create_app(
     @app.post("/api/runs/{run_id}/cancel", response_model=RunActionResponse)
     async def cancel_run(run_id: str) -> RunActionResponse:
         run = await task_manager.cancel_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="SessionRun not found")
+        return RunActionResponse(run=SessionRunDetail.model_validate(run))
+
+    @app.post("/api/runs/{run_id}/retry", response_model=RunActionResponse)
+    async def retry_run(run_id: str) -> RunActionResponse:
+        try:
+            run = task_manager.retry_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if run is None:
             raise HTTPException(status_code=404, detail="SessionRun not found")
         return RunActionResponse(run=SessionRunDetail.model_validate(run))

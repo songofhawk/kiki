@@ -29,6 +29,7 @@ import {
   logoutSession,
   reassignMessageTopic,
   resumeRun,
+  retryRun,
   sendChat,
   updateTopic,
 } from './api';
@@ -777,14 +778,24 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
             for (const [key, stream] of Object.entries(prev)) {
               if (
                 stream.messages.some(
-                  (m) => m.id === run.trigger_message_id && !m.session_run
+                  (m) =>
+                    m.id === run.trigger_message_id &&
+                    m.session_run?.id !== run.id
                 )
               ) {
                 next[key] = {
                   ...stream,
                   messages: stream.messages.map((m) =>
-                    m.id === run.trigger_message_id && !m.session_run
-                      ? { ...m, session_run: run }
+                    m.id === run.trigger_message_id &&
+                    m.session_run?.id !== run.id
+                      ? {
+                          ...m,
+                          metadata: {
+                            ...(m.metadata ?? {}),
+                            session_run_id: run.id,
+                          },
+                          session_run: run,
+                        }
                       : m
                   ),
                 };
@@ -1494,6 +1505,51 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
     }
   }, []);
 
+  const handleRetryRun = useCallback(async (runId: string) => {
+    try {
+      const newRun = await retryRun(runId);
+      setRunsById((prev) => ({
+        ...prev,
+        [newRun.id]: mergeRun(prev[newRun.id], newRun),
+      }));
+      if (newRun.trigger_message_id) {
+        setStreamsByKey((prev) => {
+          let changed = false;
+          const next: Record<string, StreamPageState> = { ...prev };
+          for (const [key, stream] of Object.entries(prev)) {
+            if (
+              stream.messages.some(
+                (m) =>
+                  m.id === newRun.trigger_message_id &&
+                  m.session_run?.id !== newRun.id
+              )
+            ) {
+              next[key] = {
+                ...stream,
+                messages: stream.messages.map((m) =>
+                  m.id === newRun.trigger_message_id
+                    ? {
+                        ...m,
+                        metadata: {
+                          ...(m.metadata ?? {}),
+                          session_run_id: newRun.id,
+                        },
+                        session_run: newRun,
+                      }
+                    : m
+                ),
+              };
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      }
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : '重试任务失败');
+    }
+  }, []);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
@@ -1732,6 +1788,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           onOpenLogDrawer={handleOpenLogDrawer}
           onResumeRun={handleResumeRun}
           onCancelRun={handleCancelRun}
+          onRetryRun={handleRetryRun}
           onPreviewArtifact={handlePreviewArtifact}
           onOpenDesktopTakeover={(ctx) => {
             setDesktopContext(ctx);

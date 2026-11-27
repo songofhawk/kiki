@@ -56,6 +56,7 @@ export interface UnifiedMessageListProps {
   onOpenLogDrawer: (runId: string) => void;
   onResumeRun: (runId: string, payload: ResumeRunPayload) => Promise<void> | void;
   onCancelRun: (runId: string) => Promise<void> | void;
+  onRetryRun?: (runId: string) => Promise<void> | void;
   onPreviewArtifact?: (items: ArtifactPreviewItem[], initialIndex: number) => void;
   onOpenDesktopTakeover?: (ctx: import('../types').DesktopTakeoverContext) => void;
   onStarterPrompt: (prompt: string) => void;
@@ -274,6 +275,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   onOpenLogDrawer,
   onResumeRun,
   onCancelRun,
+  onRetryRun,
   onPreviewArtifact,
   onOpenDesktopTakeover,
   onStarterPrompt,
@@ -908,6 +910,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                         onOpenLogDrawer={onOpenLogDrawer}
                         onResumeRun={onResumeRun}
                         onCancelRun={onCancelRun}
+                        onRetryRun={onRetryRun}
                         onPreviewArtifact={onPreviewArtifact}
                         onOpenDesktopTakeover={onOpenDesktopTakeover}
                       />
@@ -1082,6 +1085,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     onOpenLogDrawer={onOpenLogDrawer}
                     onResumeRun={onResumeRun}
                     onCancelRun={onCancelRun}
+                    onRetryRun={onRetryRun}
                     onPreviewArtifact={onPreviewArtifact}
                     onOpenDesktopTakeover={onOpenDesktopTakeover}
                   />

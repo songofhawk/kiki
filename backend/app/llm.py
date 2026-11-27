@@ -47,7 +47,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 判定规则：
 1. 若输入仅为简单的问候、感叹或毫无延续主题的一次性闲聊，path 为 'fast'，topic_action 为 'none'。
 2. 注意：`topic-general`（日常闲聊）仅用于 `topic_action='none'` 的兜底，切勿对 `topic-general` 返回 `topic_action='reuse'`。若结合最近上下文发现对话已经围绕某个具体主题展开（例如社保、就医、理财、旅行、技术排查等），应选择 `create` 新建简短话题（若已有对应非闲聊话题则 `reuse`）。
-3. 若输入涉及代码重构、长文生成、图片/文件生成、数据分析、多步骤操作、文件读写、命令行排查、调用外部 Agent/工具，或需要联网搜索/实时信息查询/网页资料检索，path 为 'heavy'。
+3. 若输入涉及代码重构、长文生成、图片/文件生成、数据分析、多步骤操作、文件读写、命令行排查、调用外部 Agent/工具、需要联网搜索/实时信息查询/网页资料检索，或涉及 GUI/桌面操作与浏览器自动化（如操作桌面/浏览器、发布自媒体文章和视频到小红书/公众号/抖音/B站/知乎等），path 为 'heavy'。
 4. 置信度 confidence < 0.65 时，前端将展示 Kiki 思考并提供无感纠错胶囊。
 5. 若最近上下文显示某条用户消息带有 `[后台任务执行失败...]`、`[后台任务已取消...]` 或 `[后台任务等待人工确认...]` 等状态，而用户随后发送“再试一次”“再生成一次”“重试”“继续”等明确要求重新执行的指令，应 `reuse` 该原话题并选择 `heavy`。但若用户**只是在询问原因或讨论状态**（例如“为什么任务被取消了？”“刚才为什么失败了？”），并未要求重新执行或调用工具，应 `reuse` 原话题且判为 `path: "fast"`、`agent_type: null`，由 Kiki 结合上下文直接解答，切勿无故重新启动后台引擎。
 6. `agent_type` 判别规则：{agent_selection_rule}
@@ -135,12 +135,38 @@ KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点�
 """
 
 KIKI_FAILURE_EXPLAIN_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖的手绘风蓝灰虎斑小猫个人智能体。
-后台执行引擎刚刚执行任务失败了。请你阅读原始报错信息，准确理解真正的失败原因，用简洁自然的中文向主人解释发生了什么，并给出一条切实可行的下一步建议。
+后台执行引擎刚刚执行任务失败并已彻底停止。请你阅读原始报错信息，准确理解真正的失败原因，用简洁自然的中文向主人解释发生了什么，并给出一条切实可行的下一步建议。
 要求：
 1. 严格忠实于原始报错信息，切勿臆测或张冠李戴（例如报错明确写“未检测到某 CLI”就如实说明未安装/未检测到，绝不要说成鉴权失败）。
 2. 如果报错中包含关键细节（如预计恢复时间、缺失命令、退出码、具体安装命令等），请简明保留。
-3. 控制在 2~3 句话、160 字以内，语气自然亲切，不要提及 Heavy-Path / Fast-Path 等内部架构词。
+3. **严禁做出虚假的自动重试承诺**：当前任务已经终止，不会自动在后台继续或重试。切勿说出“稍等片刻，Kiki 这就去试试”“别急，很快就没事啦”“我等会儿再帮你试”等暗示会自动重跑的措辞；如需重试，请明确告知主人稍后点击卡片上的「重试」按钮或再发一次指令。
+4. 控制在 2~3 句话、160 字以内，语气自然亲切，不要提及 Heavy-Path / Fast-Path 等内部架构词。
 """
+
+
+def parse_retry_after_seconds(err_text: str) -> Optional[float]:
+    """Extract an explicit retry delay in seconds from upstream API error text."""
+    text = err_text or ""
+    patterns = (
+        r"retry\s+in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)\b",
+        r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*(ms|s|m)?['\"]?",
+        r"retry[-_]after['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*(ms|s|m)?['\"]?",
+    )
+    for pat in patterns:
+        match = re.search(pat, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        unit = (match.group(2) or "s").lower()
+        if unit.startswith("ms") or unit.startswith("millisecond"):
+            return max(0.0, value / 1000.0)
+        if unit.startswith("m"):
+            return max(0.0, value * 60.0)
+        return max(0.0, value)
+    return None
 
 
 def _extract_json_block(text: str) -> str:
@@ -153,6 +179,31 @@ def _extract_json_block(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return cleaned[start : end + 1]
     return cleaned
+
+
+def _stringify_tool_result_for_openai(result: Any) -> str:
+    if isinstance(result, list):
+        text_parts: list[str] = []
+        has_image = False
+        for block in result:
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text":
+                    text_val = block.get("text")
+                    if text_val is not None:
+                        text_parts.append(str(text_val))
+                elif btype == "image":
+                    has_image = True
+                elif "data" not in block:
+                    text_parts.append(json.dumps(block, ensure_ascii=False))
+            elif block is not None:
+                text_parts.append(str(block))
+        if has_image:
+            text_parts.append("[screenshot image attached; omitted for text-only fallback]")
+        return "\n".join(part for part in text_parts if part)
+    if isinstance(result, dict):
+        return json.dumps(result, ensure_ascii=False)
+    return str(result or "")
 
 
 class KikiLLMClient:
@@ -260,7 +311,14 @@ class KikiLLMClient:
         if not (is_unavailable_on_tier or is_transient_overload):
             return
 
-        duration = max(self._cooldown_seconds, 600.0) if is_unavailable_on_tier else self._cooldown_seconds
+        if is_unavailable_on_tier:
+            duration = max(self._cooldown_seconds, 600.0)
+        else:
+            parsed_retry = parse_retry_after_seconds(str(exc))
+            if parsed_retry is not None and parsed_retry > 0:
+                duration = min(max(parsed_retry + 2.0, 5.0), max(self._cooldown_seconds, 300.0))
+            else:
+                duration = self._cooldown_seconds
         self._model_cooldowns[model_name] = time.monotonic() + duration
         remaining = [
             m for m in self._all_models()
@@ -652,7 +710,7 @@ class KikiLLMClient:
                         {
                             "role": "tool",
                             "tool_call_id": str(item.get("call_id") or ""),
-                            "content": str(item.get("result") or ""),
+                            "content": _stringify_tool_result_for_openai(item.get("result")),
                         }
                     )
                 else:

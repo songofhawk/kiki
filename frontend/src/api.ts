@@ -287,6 +287,16 @@ export async function cancelRun(runId: string): Promise<SessionRun> {
   return 'run' in data ? data.run : data;
 }
 
+export async function retryRun(runId: string): Promise<SessionRun> {
+  const data = await requestJson<SessionRun | { run: SessionRun }>(
+    `/runs/${encodeURIComponent(runId)}/retry`,
+    {
+      method: 'POST',
+    }
+  );
+  return 'run' in data ? data.run : data;
+}
+
 export interface SseEventHandlers {
   onOpen?: () => void;
   onError?: () => void;

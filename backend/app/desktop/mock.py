@@ -62,6 +62,8 @@ class MockDesktopDriver:
         self.spaces_per_display = max(1, spaces_per_display)
         self.active_space_by_display: dict[int, int] = {i: 0 for i in range(self.displays_count)}
         self.recorded_events: list[DesktopInputEvent] = []
+        self.opened_urls: list[str] = []
+        self.opened_apps: list[str] = []
         self.clipboard_text: str = ""
         self._frame_seq: int = 0
         self._static_frame: Optional[bytes] = None
@@ -189,3 +191,25 @@ class MockDesktopDriver:
             nxt = cur
         self.active_space_by_display[d_idx] = nxt
         self._static_frame = None
+
+    def open_url(self, url: str) -> None:
+        if not self.available:
+            raise RuntimeError("Mock desktop unavailable")
+        cleaned = (url or "").strip()
+        if not cleaned.lower().startswith(("http://", "https://")):
+            raise ValueError(f"Only http:// and https:// URLs are allowed: {url!r}")
+        self.opened_urls.append(cleaned)
+
+    def open_app(self, app_name: str) -> None:
+        if not self.available:
+            raise RuntimeError("Mock desktop unavailable")
+        cleaned = (app_name or "").strip()
+        if (
+            not cleaned
+            or cleaned.startswith("-")
+            or "/" in cleaned
+            or ".." in cleaned
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned)
+        ):
+            raise ValueError(f"Invalid application name: {app_name!r}")
+        self.opened_apps.append(cleaned)

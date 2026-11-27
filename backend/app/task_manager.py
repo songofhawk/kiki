@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 from .adapters import (
     AdapterContext,
@@ -20,6 +20,9 @@ from .llm import KikiLLMClient
 from .sse import EventBus
 from .tools import WorkspaceToolExecutor
 from .workspace import WorkspaceManager
+
+if TYPE_CHECKING:
+    from .desktop.manager import DesktopTakeoverManager
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +150,7 @@ class TaskManager:
         adapter_registry: Optional[AdapterRegistry] = None,
         settings: Optional[Settings] = None,
         workspace_manager: Optional[WorkspaceManager] = None,
+        desktop_manager: Optional[DesktopTakeoverManager] = None,
         max_steps: int = 10,
         status_provider: Optional[Callable[[], Literal["idle", "thinking", "running", "waiting_input"]]] = None,
     ) -> None:
@@ -155,6 +159,7 @@ class TaskManager:
         self.event_bus = event_bus
         self.tool_executor = tool_executor
         self.settings = settings
+        self.desktop_manager = desktop_manager
         self.workspace_manager = workspace_manager or WorkspaceManager(
             workspace_root=tool_executor.workspace_root,
             legacy_artifacts_dir=tool_executor.artifacts_dir,
@@ -396,6 +401,7 @@ class TaskManager:
                 tool_executor=scoped_executor,
                 llm=self.llm,
                 settings=self.settings,
+                desktop_manager=self.desktop_manager,
                 model_override=model_override,
                 thinking_override=thinking_override,
                 history=topic_history,
@@ -626,6 +632,27 @@ class TaskManager:
 
         updated = self.db.get_session_run(run_id)
         return self.event_bus.enrich_run(updated) if updated else None
+
+    def retry_run(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Create and enqueue a new SessionRun re-running a failed or cancelled run."""
+        run = self.db.get_session_run(run_id)
+        if not run:
+            return None
+        if run["status"] not in ("failed", "cancelled"):
+            raise ValueError(
+                f"Run {run_id} cannot be retried in status '{run['status']}'"
+            )
+        trigger_msg = self.db.get_message(run["trigger_message_id"])
+        if not trigger_msg:
+            raise ValueError(
+                f"Trigger message {run['trigger_message_id']} not found for run {run_id}"
+            )
+        return self.enqueue_run(
+            topic_id=run["topic_id"],
+            trigger_message_id=run["trigger_message_id"],
+            user_content=str(trigger_msg.get("content") or ""),
+            agent_type=run.get("agent_type"),
+        )
 
     async def cancel_run(self, run_id: str) -> Optional[dict[str, Any]]:
         run = self.db.get_session_run(run_id)

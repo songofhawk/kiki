@@ -379,3 +379,27 @@ class MacOSDesktopDriver:
             self.send_input(DesktopInputEvent(action="key_combo", key=key, modifiers=("ctrl",), display_index=display_index))
             if i + 1 < abs(steps):
                 time.sleep(0.14)
+
+    def open_url(self, url: str) -> None:
+        cleaned = (url or "").strip()
+        if not cleaned.lower().startswith(("http://", "https://")):
+            raise ValueError(f"Only http:// and https:// URLs are allowed: {url!r}")
+        res = subprocess.run(["open", cleaned], capture_output=True, timeout=5, check=False)
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(err or f"Failed to open URL (exit {res.returncode})")
+
+    def open_app(self, app_name: str) -> None:
+        cleaned = (app_name or "").strip()
+        if (
+            not cleaned
+            or cleaned.startswith("-")
+            or "/" in cleaned
+            or ".." in cleaned
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned)
+        ):
+            raise ValueError(f"Invalid application name: {app_name!r}")
+        res = subprocess.run(["open", "-a", cleaned], capture_output=True, timeout=5, check=False)
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(err or f"Failed to open app {cleaned!r} (exit {res.returncode})")

@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import platform
 
+from .computer_use import (
+    COMPUTER_USE_TOOL_DECLARATIONS,
+    COMPUTER_USE_TOOL_NAMES,
+    ComputerUseExecutor,
+    ComputerUseResult,
+)
 from .macos import MacOSDesktopDriver
 from .manager import (
     DesktopConflictError,
@@ -42,7 +48,11 @@ def create_desktop_driver(driver_name: str = "auto") -> DesktopDriver:
 
 
 __all__ = [
+    "COMPUTER_USE_TOOL_DECLARATIONS",
+    "COMPUTER_USE_TOOL_NAMES",
     "CapturedFrame",
+    "ComputerUseExecutor",
+    "ComputerUseResult",
     "ControlMode",
     "DesktopCapabilities",
     "DesktopConflictError",

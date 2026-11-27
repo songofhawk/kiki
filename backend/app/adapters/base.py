@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Optional
 if TYPE_CHECKING:
     from ..config import Settings
     from ..db import Database
+    from ..desktop.manager import DesktopTakeoverManager
     from ..llm import KikiLLMClient
     from ..sse import EventBus
     from ..tools import WorkspaceToolExecutor
@@ -141,6 +142,7 @@ class AdapterContext:
     tool_executor: "WorkspaceToolExecutor"
     llm: "KikiLLMClient"
     settings: Optional["Settings"] = None
+    desktop_manager: Optional["DesktopTakeoverManager"] = None
     model_override: Optional[str] = None
     thinking_override: Optional[ThinkingLevel] = None
     history: list[dict[str, Any]] = field(default_factory=list)

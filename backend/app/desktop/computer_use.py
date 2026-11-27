@@ -1,0 +1,767 @@
+"""Computer-Use tool declarations and executor for Kiki's built-in agent."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from ..tools import (
+    WorkspaceToolExecutor,
+    _SAFE_ENV_TEMPLATES,
+    _SENSITIVE_BASENAMES,
+    _SENSITIVE_EXTENSIONS,
+)
+from .manager import DesktopTakeoverManager
+from .models import CapturedFrame, DesktopCapabilities, DesktopInputEvent
+
+COMPUTER_USE_TOOL_NAMES = frozenset({"computer_screenshot", "computer_action"})
+
+_MUTATING_ACTIONS = frozenset(
+    {
+        "click",
+        "double_click",
+        "right_click",
+        "move",
+        "drag",
+        "scroll",
+        "type",
+        "key",
+        "open_url",
+        "open_app",
+        "select_file_in_dialog",
+        "switch_space",
+        "set_clipboard",
+    }
+)
+
+_INPUT_INJECTION_ACTIONS = frozenset(
+    {
+        "click",
+        "double_click",
+        "right_click",
+        "move",
+        "drag",
+        "scroll",
+        "type",
+        "key",
+        "select_file_in_dialog",
+        "switch_space",
+    }
+)
+
+_HUMAN_TAKEOVER_CONFLICT_ERROR = (
+    "主人当前正在主动接管控制服务器桌面，为避免抢夺鼠键，请先暂停操作或等待主人交还控制权。"
+)
+
+COMPUTER_USE_TOOL_DECLARATIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "computer_screenshot",
+        "description": (
+            "Capture the current server desktop screenshot for visual inspection. "
+            "Coordinates on the returned image use a normalized 0..1000 grid where "
+            "(0, 0) is top-left and (1000, 1000) is bottom-right."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "display_index": {
+                    "type": "integer",
+                    "description": "Display index to capture (default 0).",
+                },
+                "save_artifact": {
+                    "type": "boolean",
+                    "description": "Whether to persist the screenshot as a run artifact (default false).",
+                },
+                "artifact_label": {
+                    "type": "string",
+                    "description": "Optional short Chinese label when saving the screenshot as an artifact.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "computer_action",
+        "description": (
+            "Execute a desktop GUI action (click, double_click, right_click, move, drag, scroll, "
+            "type, key, wait, open_url, open_app, select_file_in_dialog, switch_space, "
+            "get_clipboard, set_clipboard) and optionally return a fresh post-action screenshot. "
+            "All coordinates (x, y, end_x, end_y) use the 0..1000 normalized grid."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "click",
+                        "double_click",
+                        "right_click",
+                        "move",
+                        "drag",
+                        "scroll",
+                        "type",
+                        "key",
+                        "wait",
+                        "open_url",
+                        "open_app",
+                        "select_file_in_dialog",
+                        "switch_space",
+                        "get_clipboard",
+                        "set_clipboard",
+                    ],
+                    "description": "Desktop action to perform.",
+                },
+                "x": {
+                    "type": "number",
+                    "description": "Horizontal coordinate on the 0..1000 normalized grid.",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Vertical coordinate on the 0..1000 normalized grid.",
+                },
+                "end_x": {
+                    "type": "number",
+                    "description": "Drag target horizontal coordinate on the 0..1000 normalized grid.",
+                },
+                "end_y": {
+                    "type": "number",
+                    "description": "Drag target vertical coordinate on the 0..1000 normalized grid.",
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button (default 'left').",
+                },
+                "delta_x": {
+                    "type": "number",
+                    "description": "Horizontal scroll delta in pixels (default 0).",
+                },
+                "delta_y": {
+                    "type": "number",
+                    "description": "Vertical scroll delta in pixels (default 0).",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to type or place into the clipboard.",
+                },
+                "paste": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional override for 'type': if omitted, automatically uses clipboard paste "
+                        "for non-ASCII/CJK text, multiline text, or text longer than 40 characters."
+                    ),
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key name for 'key' action (e.g. 'enter', 'tab', 'escape', 'backspace', 'a', 'v', 'arrowdown').",
+                },
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional modifier keys (e.g. ['cmd'], ['cmd', 'shift'], ['ctrl']).",
+                },
+                "seconds": {
+                    "type": "number",
+                    "description": "Duration in seconds (0.2..30.0) for 'wait' action.",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Public http:// or https:// URL for 'open_url'.",
+                },
+                "app_name": {
+                    "type": "string",
+                    "description": "macOS application name for 'open_app' (e.g. 'Google Chrome', 'Safari').",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": (
+                        "Workspace-relative or absolute path to a local video/image/file to select "
+                        "in an open macOS file dialog ('select_file_in_dialog')."
+                    ),
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["prev", "next"],
+                    "description": "Space switch direction for 'switch_space'.",
+                },
+                "target_index": {
+                    "type": "integer",
+                    "description": "Target space index for 'switch_space'.",
+                },
+                "display_index": {
+                    "type": "integer",
+                    "description": "Target display index (default 0).",
+                },
+                "wait_after": {
+                    "type": "number",
+                    "description": "Seconds to wait after the action before capturing a screenshot (default 0.6, clamped 0..10).",
+                },
+                "return_screenshot": {
+                    "type": "boolean",
+                    "description": "Whether to return a fresh post-action screenshot (default true).",
+                },
+                "save_artifact": {
+                    "type": "boolean",
+                    "description": "Whether to save the post-action screenshot as a run artifact (default false).",
+                },
+                "artifact_label": {
+                    "type": "string",
+                    "description": "Optional short Chinese label when saving the screenshot as an artifact.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+]
+
+
+def _is_sensitive_dialog_file(target: Path) -> bool:
+    name = target.name.lower()
+    if name == ".env" or (name.startswith(".env.") and name not in _SAFE_ENV_TEMPLATES):
+        return True
+    if name in _SENSITIVE_BASENAMES or target.suffix.lower() in _SENSITIVE_EXTENSIONS:
+        return True
+    parts = [p.lower() for p in target.parts]
+    if ".git" in parts and name in {"config", "credentials"}:
+        return True
+    return False
+
+
+@dataclass
+class ComputerUseResult:
+    """Structured result returned by ComputerUseExecutor."""
+
+    text: str
+    is_error: bool = False
+    image_bytes: Optional[bytes] = None
+    mime_type: Optional[str] = None
+    artifact: Optional[dict[str, Any]] = None
+
+    def to_function_result_value(self) -> Any:
+        if self.image_bytes and self.mime_type:
+            return [
+                {"type": "text", "text": self.text},
+                {
+                    "type": "image",
+                    "data": base64.b64encode(self.image_bytes).decode("ascii"),
+                    "mime_type": self.mime_type,
+                },
+            ]
+        return self.text
+
+
+class ComputerUseExecutor:
+    """Executes GUI Computer-Use tools against the active DesktopDriver."""
+
+    def __init__(
+        self,
+        desktop_manager: DesktopTakeoverManager,
+        tool_executor: WorkspaceToolExecutor,
+        *,
+        max_width: int = 1280,
+        quality: int = 70,
+    ) -> None:
+        self.desktop_manager = desktop_manager
+        self.tool_executor = tool_executor
+        self.max_width = max(320, min(2560, int(max_width)))
+        self.quality = max(30, min(95, int(quality)))
+
+    @staticmethod
+    def _norm_coord(val: Any) -> float:
+        clamped = max(0.0, min(1000.0, float(val)))
+        return clamped / 1000.0
+
+    @staticmethod
+    def _error_result(message: str, **extra: Any) -> ComputerUseResult:
+        payload: dict[str, Any] = {"ok": False, "error": message}
+        payload.update(extra)
+        return ComputerUseResult(text=json.dumps(payload, ensure_ascii=False), is_error=True)
+
+    def _check_human_takeover_conflict(self) -> Optional[ComputerUseResult]:
+        active = self.desktop_manager.get_active_session()
+        if active is not None and active.control_mode == "control":
+            return self._error_result(_HUMAN_TAKEOVER_CONFLICT_ERROR)
+        return None
+
+    async def _capture_and_optionally_save(
+        self,
+        run_id: str,
+        *,
+        display_index: int,
+        save_artifact: bool,
+        artifact_label: str,
+        default_label: str,
+    ) -> tuple[CapturedFrame, Optional[dict[str, Any]]]:
+        frame = await asyncio.to_thread(
+            self.desktop_manager.driver.capture_frame,
+            display_index,
+            self.max_width,
+            self.quality,
+        )
+        artifact: Optional[dict[str, Any]] = None
+        if save_artifact:
+            ext = ".png" if "png" in frame.mime_type.lower() else ".jpg"
+            filename = f"desktop_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}{ext}"
+            artifact = await asyncio.to_thread(
+                self.tool_executor.write_binary_artifact,
+                run_id,
+                filename,
+                frame.data,
+                "image",
+                artifact_label or default_label,
+            )
+        return frame, artifact
+
+    async def _handle_screenshot(self, run_id: str, arguments: dict[str, Any]) -> ComputerUseResult:
+        driver = self.desktop_manager.driver
+        caps: DesktopCapabilities = await asyncio.to_thread(driver.probe)
+        if not caps.available:
+            return self._error_result(caps.error or "当前服务器桌面不可用")
+        if not caps.permissions.screen_recording:
+            return self._error_result("屏幕录制权限未开启，无法截取服务器桌面画面。")
+
+        display_index = max(0, int(arguments.get("display_index") or 0))
+        save_artifact = bool(arguments.get("save_artifact", False))
+        artifact_label = str(arguments.get("artifact_label") or "").strip()
+
+        frame, artifact = await self._capture_and_optionally_save(
+            run_id,
+            display_index=display_index,
+            save_artifact=save_artifact,
+            artifact_label=artifact_label,
+            default_label="桌面截图",
+        )
+        meta: dict[str, Any] = {
+            "ok": True,
+            "action": "screenshot",
+            "display_index": frame.display_index,
+            "width": frame.width,
+            "height": frame.height,
+            "coord_space": "0..1000",
+        }
+        if artifact:
+            meta["artifact_id"] = artifact.get("id")
+            meta["artifact_path"] = artifact.get("file_path")
+        return ComputerUseResult(
+            text=json.dumps(meta, ensure_ascii=False),
+            is_error=False,
+            image_bytes=frame.data,
+            mime_type=frame.mime_type,
+            artifact=artifact,
+        )
+
+    async def _send_input(self, event: DesktopInputEvent) -> None:
+        await asyncio.to_thread(self.desktop_manager.driver.send_input, event)
+
+    async def _handle_type(
+        self,
+        *,
+        text: str,
+        paste_override: Any,
+        display_index: int,
+        caps: DesktopCapabilities,
+    ) -> dict[str, Any]:
+        driver = self.desktop_manager.driver
+        if paste_override is None:
+            use_paste = any(ord(c) > 127 for c in text) or "\n" in text or len(text) > 40
+        else:
+            use_paste = bool(paste_override)
+
+        if use_paste:
+            prev_clipboard: Optional[str] = None
+            try:
+                prev_clipboard = await asyncio.to_thread(driver.get_clipboard)
+            except Exception:
+                prev_clipboard = None
+
+            await asyncio.to_thread(driver.set_clipboard, text)
+            paste_mod = "cmd" if caps.platform in ("Darwin", "mock") else "ctrl"
+            await self._send_input(
+                DesktopInputEvent(
+                    action="key_combo",
+                    key="v",
+                    modifiers=(paste_mod,),
+                    display_index=display_index,
+                )
+            )
+            await asyncio.sleep(0.1)
+
+            if prev_clipboard is not None:
+                try:
+                    await asyncio.to_thread(driver.set_clipboard, prev_clipboard)
+                except Exception:
+                    pass
+            return {"method": "paste", "length": len(text)}
+
+        await self._send_input(
+            DesktopInputEvent(
+                action="type_text",
+                text=text,
+                display_index=display_index,
+            )
+        )
+        return {"method": "type_text", "length": len(text)}
+
+    async def _handle_drag(
+        self,
+        *,
+        x: Any,
+        y: Any,
+        end_x: Any,
+        end_y: Any,
+        button: str,
+        display_index: int,
+    ) -> dict[str, Any]:
+        nx, ny = self._norm_coord(x), self._norm_coord(y)
+        nex, ney = self._norm_coord(end_x), self._norm_coord(end_y)
+        btn = button if button in ("left", "right", "middle") else "left"
+
+        await self._send_input(
+            DesktopInputEvent(action="mouse_move", x=nx, y=ny, display_index=display_index)
+        )
+        await self._send_input(
+            DesktopInputEvent(
+                action="mouse_down",
+                x=nx,
+                y=ny,
+                button=btn,  # type: ignore[arg-type]
+                display_index=display_index,
+            )
+        )
+        steps = 5
+        for step in range(1, steps + 1):
+            t = step / float(steps)
+            mx = nx + (nex - nx) * t
+            my = ny + (ney - ny) * t
+            await self._send_input(
+                DesktopInputEvent(action="mouse_move", x=mx, y=my, display_index=display_index)
+            )
+            await asyncio.sleep(0.01)
+        await self._send_input(
+            DesktopInputEvent(
+                action="mouse_up",
+                x=nex,
+                y=ney,
+                button=btn,  # type: ignore[arg-type]
+                display_index=display_index,
+            )
+        )
+        return {"from": [float(x), float(y)], "to": [float(end_x), float(end_y)], "steps": steps}
+
+    async def _handle_select_file_in_dialog(
+        self,
+        *,
+        raw_file_path: str,
+        display_index: int,
+    ) -> dict[str, Any]:
+        cleaned = (raw_file_path or "").strip()
+        if not cleaned:
+            raise ValueError("select_file_in_dialog requires a non-empty 'file_path'")
+        expanded = Path(os.path.expanduser(cleaned))
+        resolved = (
+            expanded.resolve()
+            if expanded.is_absolute()
+            else (self.tool_executor.workspace_root / expanded).resolve()
+        )
+        if _is_sensitive_dialog_file(resolved):
+            raise PermissionError(f"Access denied to sensitive file: {cleaned}")
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(f"File not found: {resolved}")
+
+        driver = self.desktop_manager.driver
+        await self._send_input(
+            DesktopInputEvent(
+                action="key_combo",
+                key="g",
+                modifiers=("cmd", "shift"),
+                display_index=display_index,
+            )
+        )
+        await asyncio.sleep(0.25)
+        await asyncio.to_thread(driver.set_clipboard, str(resolved))
+        await self._send_input(
+            DesktopInputEvent(
+                action="key_combo",
+                key="v",
+                modifiers=("cmd",),
+                display_index=display_index,
+            )
+        )
+        await asyncio.sleep(0.15)
+        await self._send_input(
+            DesktopInputEvent(action="key_tap", key="enter", display_index=display_index)
+        )
+        await asyncio.sleep(0.35)
+        await self._send_input(
+            DesktopInputEvent(action="key_tap", key="enter", display_index=display_index)
+        )
+        return {"selected_file": str(resolved)}
+
+    async def _handle_action(self, run_id: str, arguments: dict[str, Any]) -> ComputerUseResult:
+        action = str(arguments.get("action") or "").strip().lower()
+        if not action:
+            return self._error_result("Missing required parameter: 'action'")
+
+        if action in _MUTATING_ACTIONS:
+            conflict = self._check_human_takeover_conflict()
+            if conflict is not None:
+                return conflict
+
+        driver = self.desktop_manager.driver
+        caps: DesktopCapabilities = await asyncio.to_thread(driver.probe)
+        if not caps.available:
+            return self._error_result(caps.error or "当前服务器桌面不可用")
+
+        if action in _INPUT_INJECTION_ACTIONS and (
+            not caps.supports_control or not caps.permissions.accessibility
+        ):
+            return self._error_result("辅助功能权限未开启，无法执行桌面鼠键操作。")
+
+        if action in ("get_clipboard", "set_clipboard") and not caps.supports_clipboard:
+            return self._error_result("当前桌面驱动不支持剪贴板读写。")
+
+        display_index = max(0, int(arguments.get("display_index") or 0))
+        button_raw = str(arguments.get("button") or "left").strip().lower()
+        button = button_raw if button_raw in ("left", "right", "middle") else "left"
+
+        detail: dict[str, Any] = {}
+
+        if action in ("click", "double_click", "right_click", "move"):
+            x, y = arguments.get("x"), arguments.get("y")
+            if x is None or y is None:
+                return self._error_result(f"Action '{action}' requires 'x' and 'y' coordinates.")
+            nx, ny = self._norm_coord(x), self._norm_coord(y)
+            if action == "click":
+                await self._send_input(
+                    DesktopInputEvent(
+                        action="mouse_click",
+                        x=nx,
+                        y=ny,
+                        button=button,  # type: ignore[arg-type]
+                        display_index=display_index,
+                    )
+                )
+            elif action == "double_click":
+                await self._send_input(
+                    DesktopInputEvent(
+                        action="mouse_double_click",
+                        x=nx,
+                        y=ny,
+                        button=button,  # type: ignore[arg-type]
+                        display_index=display_index,
+                    )
+                )
+            elif action == "right_click":
+                await self._send_input(
+                    DesktopInputEvent(
+                        action="mouse_click",
+                        x=nx,
+                        y=ny,
+                        button="right",
+                        display_index=display_index,
+                    )
+                )
+            else:
+                await self._send_input(
+                    DesktopInputEvent(
+                        action="mouse_move",
+                        x=nx,
+                        y=ny,
+                        display_index=display_index,
+                    )
+                )
+            detail = {"x": float(x), "y": float(y)}
+
+        elif action == "drag":
+            x, y = arguments.get("x"), arguments.get("y")
+            end_x, end_y = arguments.get("end_x"), arguments.get("end_y")
+            if x is None or y is None or end_x is None or end_y is None:
+                return self._error_result("Action 'drag' requires 'x', 'y', 'end_x', and 'end_y'.")
+            detail = await self._handle_drag(
+                x=x,
+                y=y,
+                end_x=end_x,
+                end_y=end_y,
+                button=button,
+                display_index=display_index,
+            )
+
+        elif action == "scroll":
+            x, y = arguments.get("x"), arguments.get("y")
+            nx = self._norm_coord(x) if x is not None else None
+            ny = self._norm_coord(y) if y is not None else None
+            if nx is not None and ny is not None:
+                await self._send_input(
+                    DesktopInputEvent(
+                        action="mouse_move",
+                        x=nx,
+                        y=ny,
+                        display_index=display_index,
+                    )
+                )
+            delta_x = float(arguments.get("delta_x") or 0.0)
+            delta_y = float(arguments.get("delta_y") or 0.0)
+            await self._send_input(
+                DesktopInputEvent(
+                    action="mouse_scroll",
+                    x=nx,
+                    y=ny,
+                    delta_x=delta_x,
+                    delta_y=delta_y,
+                    display_index=display_index,
+                )
+            )
+            detail = {"delta_x": delta_x, "delta_y": delta_y}
+
+        elif action == "type":
+            text = arguments.get("text")
+            if text is None or str(text) == "":
+                return self._error_result("Action 'type' requires non-empty 'text'.")
+            detail = await self._handle_type(
+                text=str(text),
+                paste_override=arguments.get("paste"),
+                display_index=display_index,
+                caps=caps,
+            )
+
+        elif action == "key":
+            key = str(arguments.get("key") or "").strip()
+            if not key:
+                return self._error_result("Action 'key' requires 'key'.")
+            raw_mods = arguments.get("modifiers") or []
+            mods = tuple(str(m).strip().lower() for m in raw_mods if str(m).strip())
+            input_action = "key_combo" if mods else "key_tap"
+            await self._send_input(
+                DesktopInputEvent(
+                    action=input_action,  # type: ignore[arg-type]
+                    key=key,
+                    modifiers=mods,
+                    display_index=display_index,
+                )
+            )
+            detail = {"key": key, "modifiers": list(mods)}
+
+        elif action == "wait":
+            raw_secs = arguments.get("seconds")
+            seconds = max(0.2, min(30.0, float(1.0 if raw_secs is None else raw_secs)))
+            await asyncio.sleep(seconds)
+            detail = {"seconds": seconds}
+
+        elif action == "open_url":
+            url = str(arguments.get("url") or "").strip()
+            if not url:
+                return self._error_result("Action 'open_url' requires 'url'.")
+            await asyncio.to_thread(driver.open_url, url)
+            detail = {"url": url}
+
+        elif action == "open_app":
+            app_name = str(arguments.get("app_name") or "").strip()
+            if not app_name:
+                return self._error_result("Action 'open_app' requires 'app_name'.")
+            await asyncio.to_thread(driver.open_app, app_name)
+            detail = {"app_name": app_name}
+
+        elif action == "select_file_in_dialog":
+            detail = await self._handle_select_file_in_dialog(
+                raw_file_path=str(arguments.get("file_path") or ""),
+                display_index=display_index,
+            )
+
+        elif action == "switch_space":
+            raw_dir = arguments.get("direction")
+            direction = raw_dir if raw_dir in ("prev", "next") else None
+            raw_target = arguments.get("target_index")
+            target_index = int(raw_target) if raw_target is not None else None
+            if direction is None and target_index is None:
+                return self._error_result(
+                    "Action 'switch_space' requires 'direction' ('prev'/'next') or 'target_index'."
+                )
+            await asyncio.to_thread(
+                driver.switch_space,
+                display_index=display_index,
+                target_index=target_index,
+                direction=direction,  # type: ignore[arg-type]
+            )
+            detail = {"direction": direction, "target_index": target_index}
+
+        elif action == "get_clipboard":
+            clip = await asyncio.to_thread(driver.get_clipboard)
+            detail = {"clipboard": clip}
+
+        elif action == "set_clipboard":
+            text = arguments.get("text")
+            if text is None:
+                return self._error_result("Action 'set_clipboard' requires 'text'.")
+            await asyncio.to_thread(driver.set_clipboard, str(text))
+            detail = {"length": len(str(text))}
+
+        else:
+            return self._error_result(f"Unsupported computer_action: {action!r}")
+
+        raw_wait = arguments.get("wait_after")
+        if raw_wait is None and action in ("wait", "get_clipboard"):
+            wait_after = 0.0
+        else:
+            wait_after = max(0.0, min(10.0, float(0.6 if raw_wait is None else raw_wait)))
+        if wait_after > 0:
+            await asyncio.sleep(wait_after)
+
+        return_screenshot = bool(arguments.get("return_screenshot", True))
+        save_artifact = bool(arguments.get("save_artifact", False))
+        artifact_label = str(arguments.get("artifact_label") or "").strip()
+
+        frame: Optional[CapturedFrame] = None
+        artifact: Optional[dict[str, Any]] = None
+        if return_screenshot or save_artifact:
+            if not caps.permissions.screen_recording:
+                return self._error_result("操作已执行，但屏幕录制权限未开启，无法截取桌面画面。", action=action, **detail)
+            frame, artifact = await self._capture_and_optionally_save(
+                run_id,
+                display_index=display_index,
+                save_artifact=save_artifact,
+                artifact_label=artifact_label,
+                default_label=f"桌面操作截图 ({action})",
+            )
+
+        meta: dict[str, Any] = {
+            "ok": True,
+            "action": action,
+            "display_index": frame.display_index if frame else display_index,
+            "coord_space": "0..1000",
+            **detail,
+        }
+        if frame:
+            meta["width"] = frame.width
+            meta["height"] = frame.height
+        if artifact:
+            meta["artifact_id"] = artifact.get("id")
+            meta["artifact_path"] = artifact.get("file_path")
+
+        return ComputerUseResult(
+            text=json.dumps(meta, ensure_ascii=False),
+            is_error=False,
+            image_bytes=frame.data if (frame and return_screenshot) else None,
+            mime_type=frame.mime_type if (frame and return_screenshot) else None,
+            artifact=artifact,
+        )
+
+    async def execute(self, run_id: str, name: str, arguments: dict[str, Any]) -> ComputerUseResult:
+        """Execute a Computer-Use tool call for a specific SessionRun."""
+        try:
+            args = arguments if isinstance(arguments, dict) else {}
+            if name == "computer_screenshot":
+                return await self._handle_screenshot(run_id, args)
+            if name == "computer_action":
+                return await self._handle_action(run_id, args)
+            return self._error_result(f"Unknown computer use tool: {name}")
+        except Exception as exc:
+            return self._error_result(f"Tool '{name}' failed: {exc}")
