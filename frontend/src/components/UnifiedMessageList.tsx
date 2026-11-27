@@ -902,6 +902,39 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                     </div>
                   </div>
 
+                  {typeof msg.metadata?.steered_run_id === 'string' &&
+                    msg.metadata.steered_run_id &&
+                    !sessionRun && (() => {
+                      const steeredRun = runsById[msg.metadata.steered_run_id];
+                      const targetTriggerId = steeredRun?.trigger_message_id;
+                      const canJumpToRun = Boolean(
+                        targetTriggerId && messagesById[targetTriggerId]
+                      );
+                      return (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            if (selectionMode || !canJumpToRun || !targetTriggerId) return;
+                            e.stopPropagation();
+                            handleJumpToMessage(targetTriggerId);
+                          }}
+                          title={
+                            canJumpToRun
+                              ? '点击定位到被补充的进行中任务'
+                              : '已作为补充指令并入进行中的任务'
+                          }
+                          className={`mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-[#EAF0F5] text-[#3B5972] border border-[#CFE0EC] ${
+                            canJumpToRun && !selectionMode
+                              ? 'hover:bg-[#DCE7F0] cursor-pointer transition-colors'
+                              : 'cursor-default'
+                          }`}
+                        >
+                          <CornerUpLeft className="w-3 h-3 shrink-0" />
+                          <span>已并入进行中的任务</span>
+                        </button>
+                      );
+                    })()}
+
                   {sessionRun && (
                     <div className="w-full max-w-[92%] sm:max-w-[85%]">
                       <RunStatusCard

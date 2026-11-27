@@ -360,6 +360,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
   const [selectedAgentType, setSelectedAgentType] = useState<string>('auto');
+  const [forceNewRun, setForceNewRun] = useState<boolean>(false);
   const [topics, setTopics] = useState<Topic[]>([]);
   const [streamsByKey, setStreamsByKey] = useState<Record<string, StreamPageState>>({
     [ALL_STREAM_KEY]: { ...EMPTY_STREAM, loadingInitial: true },
@@ -832,6 +833,14 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
             .catch(() => { });
         }
       },
+      onRunSteered: ({ run }) => {
+        if (run) {
+          setRunsById((prev) => ({
+            ...prev,
+            [run.id]: mergeRun(prev[run.id], run),
+          }));
+        }
+      },
       onStepLog: ({ run_id, step_log }) => {
         setRunsById((prev) => {
           const existing = prev[run_id];
@@ -950,6 +959,27 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
       ).length,
     [runsById]
   );
+
+  const activeRunInContext = useMemo(() => {
+    const activeRuns = Object.values(runsById).filter(
+      (r) =>
+        r.status === 'queued' ||
+        r.status === 'running' ||
+        r.status === 'waiting_input'
+    );
+    if (activeRuns.length === 0) return null;
+    const targetTopicId = quotedMessage?.topic_id ?? focusTopicId;
+    if (targetTopicId) {
+      return activeRuns.find((r) => r.topic_id === targetTopicId) ?? null;
+    }
+    return activeRuns[activeRuns.length - 1] ?? null;
+  }, [runsById, focusTopicId, quotedMessage]);
+
+  useEffect(() => {
+    if (!activeRunInContext && forceNewRun) {
+      setForceNewRun(false);
+    }
+  }, [activeRunInContext, forceNewRun]);
 
   const globalKikiStatus: KikiStatus = useMemo(() => {
     const allRuns = Object.values(runsById);
@@ -1135,6 +1165,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
       const currentQuotedMessage = overrideText ? null : quotedMessage;
       const currentPathOption = pathOption;
       const currentAgentType = selectedAgentType;
+      const currentForceNewRun = overrideText ? false : forceNewRun;
 
       const effectiveTopicId =
         currentQuotedMessage?.topic_id ?? currentFocusTopicId ?? null;
@@ -1160,6 +1191,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
       if (!overrideText) {
         setInputText('');
         setQuotedMessage(null);
+        setForceNewRun(false);
         if (textareaRef.current) {
           textareaRef.current.style.height = 'auto';
         }
@@ -1222,6 +1254,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           focus_topic_id: currentFocusTopicId,
           quoted_message_id: currentQuotedMessage?.id ?? null,
           force_path: currentPathOption === 'auto' ? null : currentPathOption,
+          force_new_run: currentForceNewRun || undefined,
           agent_type: currentAgentType === 'auto' ? null : currentAgentType,
         });
 
@@ -1248,7 +1281,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
             ...res.user_message,
             topic: res.topic ?? res.user_message.topic,
             session_run:
-              !res.assistant_message && res.session_run
+              !res.assistant_message && !res.steered_run_id && res.session_run
                 ? res.session_run
                 : res.user_message.session_run,
           };
@@ -1302,7 +1335,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
         setPendingSendCount((count) => Math.max(0, count - 1));
       }
     },
-    [inputText, focusTopicId, quotedMessage, pathOption, selectedAgentType, topicsById]
+    [inputText, focusTopicId, quotedMessage, pathOption, selectedAgentType, forceNewRun, topicsById]
   );
 
   const handleReassignMessage = useCallback(
@@ -1960,6 +1993,39 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
 
             {/* Input Container */}
             <div className="rounded-2xl bg-white border border-[#E4DDD2] focus-within:border-[#5B7A95] focus-within:ring-2 focus-within:ring-[#5B7A95]/15 shadow-sm transition-all overflow-hidden">
+              {activeRunInContext && (() => {
+                const runTopic = topicsById[activeRunInContext.topic_id];
+                const runTitle = runTopic?.title ?? '当前任务';
+                return (
+                  <div
+                    className={`px-3.5 py-1.5 border-b flex items-center justify-between gap-2 text-[11px] ${
+                      forceNewRun
+                        ? 'bg-[#F8F5F0] border-[#EAE3D9] text-[#6F6860]'
+                        : 'bg-[#F0F5F9] border-[#DAE6F0] text-[#3B5972]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          forceNewRun ? 'bg-[#9A9187]' : 'bg-[#5B7A95] animate-pulse'
+                        }`}
+                      />
+                      <span className="truncate">
+                        {forceNewRun
+                          ? '已切换为独立新任务模式 · 本次发送不会并入进行中的任务'
+                          : `「#${runTitle}」执行中 · 补充说明将自动并入当前任务`}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setForceNewRun((prev) => !prev)}
+                      className="shrink-0 px-2 py-0.5 rounded-md font-medium bg-white/80 hover:bg-white border border-[#D4E0EA] text-[#3B5972] transition-colors"
+                    >
+                      {forceNewRun ? '恢复自动补充' : '作为独立新任务'}
+                    </button>
+                  </div>
+                );
+              })()}
               {quotedMessage && (() => {
                 const quotedTopic =
                   topicsById[quotedMessage.topic_id] ?? quotedMessage.topic ?? null;
@@ -2016,11 +2082,13 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
                   placeholder={
                     quotedMessage
                       ? `回复引用消息（自动归属至 #${(topicsById[quotedMessage.topic_id] ?? quotedMessage.topic)?.title ?? '原话题'}）...`
-                      : focusedTopic
-                        ? `在 #${focusedTopic.title} 中继续对话...`
-                        : activeRunCount > 0
-                          ? '后台任务并行执行中，随时继续发新消息或开启新话题...'
-                          : '和 Kiki 聊点什么，或直接交办一个后台任务...'
+                      : activeRunInContext && !forceNewRun
+                        ? '任务执行中，输入补充说明将自动并入当前任务...'
+                        : focusedTopic
+                          ? `在 #${focusedTopic.title} 中继续对话...`
+                          : activeRunCount > 0
+                            ? '后台任务执行中，可随时补充说明或开启新话题...'
+                            : '和 Kiki 聊点什么，或直接交办一个后台任务...'
                   }
                   className="flex-1 resize-none bg-transparent text-sm text-[#262422] placeholder:text-[#A39A90] focus:outline-none max-h-40 leading-relaxed py-0.5"
                 />

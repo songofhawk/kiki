@@ -313,6 +313,13 @@ export interface SseEventHandlers {
   onMessageCompleted?: (payload: { message: Message }) => void;
   onRunCreated?: (payload: { run: SessionRun }) => void;
   onRunUpdated?: (payload: { run: SessionRun }) => void;
+  onRunSteered?: (payload: {
+    run_id: string;
+    topic_id: string;
+    message_id: string;
+    content: string;
+    run: SessionRun;
+  }) => void;
   onStepLog?: (payload: { run_id: string; step_log: StepLog }) => void;
   onArtifactCreated?: (payload: { run_id: string; artifact: Artifact }) => void;
   onRawLog?: (payload: RawLogLine & { run_id: string }) => void;
@@ -399,6 +406,9 @@ export function connectEventStream(handlers: SseEventHandlers): () => void {
     );
     eventSource.addEventListener('run_updated', (e) =>
       parseAndDispatch(e as MessageEvent, handlers.onRunUpdated)
+    );
+    eventSource.addEventListener('run_steered', (e) =>
+      parseAndDispatch(e as MessageEvent, handlers.onRunSteered)
     );
     eventSource.addEventListener('step_log', (e) =>
       parseAndDispatch(e as MessageEvent, handlers.onStepLog)

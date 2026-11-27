@@ -79,6 +79,8 @@ export interface RouteDecision {
   topic_id?: string | null;
   new_topic_title?: string | null;
   agent_type?: string | null;
+  run_action?: 'new_run' | 'steer' | 'cancel' | 'none';
+  target_run_id?: string | null;
   confidence: number;
   reasoning?: string | null;
 }
@@ -156,6 +158,8 @@ export interface MessageMetadata {
   reasoning?: string;
   path?: 'fast' | 'heavy';
   session_run_id?: string;
+  steered_run_id?: string;
+  run_action?: string;
   streaming?: boolean;
   quoted_message_id?: string;
   quoted_message?: QuotedMessageSnapshot;
@@ -202,6 +206,7 @@ export interface ChatRequest {
   focus_topic_id?: string | null;
   quoted_message_id?: string | null;
   force_path?: 'fast' | 'heavy' | null;
+  force_new_run?: boolean;
   agent_type?: string | null;
   model?: string | null;
   thinking_level?: 'low' | 'medium' | 'high' | null;
@@ -213,6 +218,7 @@ export interface ChatResponse {
   topic: Topic;
   assistant_message?: Message | null;
   session_run?: SessionRun | null;
+  steered_run_id?: string | null;
   reassigned_messages?: Message[];
 }
 
