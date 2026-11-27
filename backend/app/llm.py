@@ -27,6 +27,9 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 现有活跃 Topic 列表：
 {active_topics_json}
 
+当前进行中的后台任务（Active SessionRuns）：
+{active_runs_json}
+
 可用后台执行引擎（Heavy-Path Agents）列表：
 {available_adapters_json}
 
@@ -40,6 +43,8 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
   "topic_id": "Existing Topic ID if reuse, else null",
   "new_topic_title": "Short title if create, else null",
   "agent_type": "Explicitly requested agent ID (e.g. codex, claude_code, internal_agent, antigravity, deepseek_harness, zcode, kcode, qoder, workbuddy) if specified by user or continuing that agent's task, else null",
+  "run_action": "new_run" | "steer" | "cancel" | "none",
+  "target_run_id": "Active Run ID if run_action is steer or cancel, else null",
   "confidence": 0.0 - 1.0,
   "reasoning": "简短判定理由"
 }}
@@ -53,6 +58,7 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你是一个智能意图分流与 Topic 判
 6. `agent_type` 判别规则：{agent_selection_rule}
 7. 若用户正在纠正执行引擎并要求完成/重跑任务（例如“不是，我是让你用豆包工作来生成图，你为什么用 Codex？”），**必须**判为 `path: "heavy"`、`topic_action: "reuse"`，并将 `agent_type` 设为**用户期望使用的目标引擎**，绝不能判为 `fast` 闲聊。
 8. 若用户消息带有承接/转折/备选语气（例如“那你先帮我发小红书吧”“那就换个方式”“改发到另一平台”“不然先做…”）或**省略了核心处理对象**（未说明要发布什么内容、修改什么文件，必须结合最近对话上下文才能理解），属于同一事项下的方案切换或延续，应优先 `reuse` 最近相关的活跃话题，切勿拆分为新的独立话题。
+9. **活跃后台任务补充/纠偏判定（极其重要）**：查看上方「当前进行中的后台任务」。若某话题正有 `queued`、`running` 或 `waiting_input` 的任务，而用户的新消息是在**补充细节、追加条件、纠正方向、补充上下文或调整该任务**（哪怕很简短或省略了主语，如“顺便加上单测”“配色改成浅色”“别忘了处理边界情况”），**必须** `reuse` 该任务所属话题，并设 `path: "heavy"`、`run_action: "steer"`、`target_run_id` 为对应活跃任务 ID，绝不要新建话题或另起独立并发任务。若用户明确要求停止/取消该运行中任务（如“先停一下”“算了取消吧”），设 `path: "fast"`、`topic_action: "reuse"`、`run_action: "cancel"`、`target_run_id` 为对应任务 ID。若用户只是询问进度/闲聊，设 `path: "fast"`、`run_action: "none"`。若无活跃任务或明确是完全独立的新任务，`path: "heavy"` 时 `run_action` 填 `"new_run"`，`path: "fast"` 时 `run_action` 填 `"none"`。
 """
 
 BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手。
@@ -1053,6 +1059,7 @@ class KikiLLMClient:
         recent_messages: Optional[list[dict[str, Any]]] = None,
         available_adapters: Optional[list[dict[str, Any]]] = None,
         forced_agent_type: Optional[str] = None,
+        active_runs: Optional[list[dict[str, Any]]] = None,
     ) -> RouteDecision:
         non_general_topics = [
             {
@@ -1078,11 +1085,26 @@ class KikiLLMClient:
             if tid not in topic_snippets or msg.get("role") == "user":
                 topic_snippets[str(tid)] = text[:80] + ("…" if len(text) > 80 else "")
 
-        state_obj = {
+        compact_active_runs = [
+            {
+                "run_id": r["id"],
+                "topic_id": r["topic_id"],
+                "status": r.get("status"),
+                "agent_type": r.get("agent_type"),
+                "current_step": r.get("current_step") or "",
+                "trigger_content": str(r.get("trigger_content") or "")[:120],
+            }
+            for r in (active_runs or [])
+            if r.get("id") and r.get("topic_id")
+        ]
+
+        state_obj: dict[str, Any] = {
             "user_message": content,
             "recent_context": self._format_context_lines(recent_messages),
             "active_topics": non_general_topics,
         }
+        if compact_active_runs:
+            state_obj["active_runs"] = compact_active_runs
         questions: dict[str, Any] = {
             "path": {
                 "type": "choice",
@@ -1179,6 +1201,23 @@ class KikiLLMClient:
                 "criteria": topic_criteria,
             }
 
+        if compact_active_runs:
+            questions["run_action"] = {
+                "type": "choice",
+                "instructions": (
+                    "There are currently active background runs in active_runs. Decide how this user message "
+                    "relates to them: 'steer' if adding details/constraints/corrections to an ongoing run, "
+                    "'cancel' if asking to stop/abort an ongoing run, 'new_run' only if starting a completely "
+                    "independent new heavy task, or 'none' if pure fast chat / status question."
+                ),
+                "criteria": {
+                    "steer": "Adds follow-up details, constraints, corrections, or clarifications to an ongoing active run",
+                    "cancel": "Explicitly asks to stop, cancel, or abort an ongoing active run",
+                    "new_run": "Starts a completely separate independent heavy task unrelated to the active runs",
+                    "none": "Pure casual chat or asking a status question without modifying or starting a run",
+                },
+            }
+
         data = await self._jev_post_systemone(
             {"model": self.jev_model, "state": state_obj, "questions": questions},
             timeout=10.0,
@@ -1245,14 +1284,37 @@ class KikiLLMClient:
             agent_choice = agent_ans.get("choice")
             agent_type = str(agent_choice) if agent_choice and agent_choice != "none" else None
 
+        run_action_val: str = "new_run" if path_val == "heavy" else "none"
+        target_run_id: Optional[str] = None
+        if compact_active_runs:
+            ra_ans = answers.get("run_action") or {}
+            ra_choice = str(ra_ans.get("choice") or "")
+            if ra_choice in ("steer", "cancel", "new_run", "none"):
+                run_action_val = ra_choice
+            if run_action_val in ("steer", "cancel"):
+                matched_run = next(
+                    (r for r in compact_active_runs if r["topic_id"] == resolved_topic_id),
+                    compact_active_runs[0] if len(compact_active_runs) == 1 else None,
+                )
+                if matched_run is not None:
+                    target_run_id = str(matched_run["run_id"])
+                    if resolved_topic_id is None:
+                        action_val = "reuse"
+                        resolved_topic_id = str(matched_run["topic_id"])
+                        new_topic_title = None
+                    if run_action_val == "steer":
+                        path_val = "heavy"
+                    elif run_action_val == "cancel":
+                        path_val = "fast"
+
         used_model = str(data.get("model") or self.jev_model)
         self.last_used_provider = "jev"
         self.last_used_model = used_model
 
         reasoning = (
-            f"Jev ({used_model}) 判定: path={path_val}, topic={action_val} ({override_note})"
+            f"Jev ({used_model}) 判定: path={path_val}, topic={action_val}, run={run_action_val} ({override_note})"
             if override_note
-            else f"Jev ({used_model}) 判定: path={path_val}, topic={action_val} (p={confidence:.2f})"
+            else f"Jev ({used_model}) 判定: path={path_val}, topic={action_val}, run={run_action_val} (p={confidence:.2f})"
         )
 
         return RouteDecision(
@@ -1261,6 +1323,8 @@ class KikiLLMClient:
             topic_id=resolved_topic_id,
             new_topic_title=new_topic_title,
             agent_type=agent_type,
+            run_action=run_action_val,  # type: ignore[arg-type]
+            target_run_id=target_run_id,
             confidence=round(confidence, 3),
             reasoning=reasoning,
         )
@@ -1272,6 +1336,7 @@ class KikiLLMClient:
         recent_messages: Optional[list[dict[str, Any]]] = None,
         available_adapters: Optional[list[dict[str, Any]]] = None,
         forced_agent_type: Optional[str] = None,
+        active_runs: Optional[list[dict[str, Any]]] = None,
     ) -> RouteDecision:
         if self.settings.jev_configured and time.monotonic() >= self._jev_cooldown_until:
             try:
@@ -1281,6 +1346,7 @@ class KikiLLMClient:
                     recent_messages=recent_messages,
                     available_adapters=available_adapters,
                     forced_agent_type=forced_agent_type,
+                    active_runs=active_runs,
                 )
             except Exception as exc:
                 self._jev_cooldown_until = time.monotonic() + min(self._cooldown_seconds, 60.0)
@@ -1293,6 +1359,18 @@ class KikiLLMClient:
                 "summary": t.get("summary") or "",
             }
             for t in active_topics
+        ]
+        compact_active_runs = [
+            {
+                "run_id": r["id"],
+                "topic_id": r["topic_id"],
+                "status": r.get("status"),
+                "agent_type": r.get("agent_type"),
+                "current_step": r.get("current_step") or "",
+                "trigger_content": str(r.get("trigger_content") or "")[:120],
+            }
+            for r in (active_runs or [])
+            if r.get("id") and r.get("topic_id")
         ]
         compact_adapters = [
             {
@@ -1316,6 +1394,11 @@ class KikiLLMClient:
             )
         system_instruction = DECISION_SYSTEM_PROMPT_TEMPLATE.format(
             active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2),
+            active_runs_json=(
+                json.dumps(compact_active_runs, ensure_ascii=False, indent=2)
+                if compact_active_runs
+                else "（当前无进行中的后台任务）"
+            ),
             available_adapters_json=(
                 json.dumps(compact_adapters, ensure_ascii=False, indent=2)
                 if compact_adapters

@@ -135,6 +135,7 @@ def create_app(
         llm=llm_client,
         event_bus=bus,
         adapter_registry=registry,
+        active_runs_provider=task_manager.list_active_runs,
     )
     fast_path = FastPathService(
         db=database,
@@ -802,56 +803,130 @@ def create_app(
 
         assistant_msg: Optional[dict[str, Any]] = None
         session_run: Optional[dict[str, Any]] = None
+        steered_run_id: Optional[str] = None
 
-        if decision.path == "heavy":
+        # Handle explicit cancel intent routed to an active run
+        if decision.run_action == "cancel" and not req.force_new_run:
+            cancel_target_id = decision.target_run_id
+            if not cancel_target_id:
+                topic_active = task_manager.get_active_run_for_topic(topic["id"])
+                cancel_target_id = topic_active["id"] if topic_active else None
+            if cancel_target_id:
+                cancelled_run = await task_manager.cancel_run(cancel_target_id)
+                if cancelled_run is not None:
+                    session_run = cancelled_run
+            assistant_msg = fast_path.start_reply(
+                topic=topic,
+                user_content=effective_content,
+                user_message_id=user_msg["id"],
+            )
+        elif decision.path == "heavy" or decision.run_action == "steer":
             raw_req_agent = (req.agent_type or "").strip()
             requested_agent = (
                 None if (not raw_req_agent or raw_req_agent.lower() == "auto") else raw_req_agent
             )
-            inherited_topic_agent: Optional[str] = None
-            if (
-                not requested_agent
-                and not registry.try_resolve_type(decision.agent_type)
-                and decision.topic_action == "reuse"
-            ):
-                latest_topic_run = database.get_latest_topic_run(topic["id"])
-                prior_agent = (
-                    registry.try_resolve_type(latest_topic_run.get("agent_type"))
-                    if latest_topic_run
+            requested_canonical_agent = (
+                registry.try_resolve_type(requested_agent) if requested_agent else None
+            )
+
+            # Guardrail: if target topic already has an active run (or router explicitly chose steer),
+            # steer/resume that active run instead of spawning a duplicate concurrent run.
+            # Exception: if the user explicitly switched to a different agent_type, respect the switch.
+            active_run: Optional[dict[str, Any]] = None
+            if not req.force_new_run:
+                if decision.target_run_id:
+                    cand = database.get_session_run(decision.target_run_id)
+                    if cand and cand.get("status") in ("queued", "running", "waiting_input"):
+                        active_run = bus.enrich_run(cand)
+                if active_run is None:
+                    active_run = task_manager.get_active_run_for_topic(topic["id"])
+                explicit_or_routed_agent = requested_canonical_agent or (
+                    registry.try_resolve_type(decision.agent_type)
+                    if decision.run_action != "steer" and decision.agent_type
                     else None
                 )
-                if prior_agent:
+                if (
+                    active_run is not None
+                    and explicit_or_routed_agent
+                    and active_run.get("agent_type") != explicit_or_routed_agent
+                ):
+                    active_run = None
+
+            if active_run is not None and not req.force_new_run:
+                if active_run["status"] == "waiting_input":
                     try:
-                        if registry.get(prior_agent).probe().available:
-                            inherited_topic_agent = prior_agent
-                    except KeyError:
-                        pass
-            resolved_agent_type = (
-                requested_agent
-                or registry.try_resolve_type(decision.agent_type)
-                or inherited_topic_agent
-                or cfg.default_heavy_agent
-                or "internal_agent"
-            )
-            if decision.agent_type != resolved_agent_type:
-                canonical = registry.try_resolve_type(resolved_agent_type)
-                if canonical:
-                    decision = decision.model_copy(update={"agent_type": canonical})
-            try:
-                session_run = task_manager.enqueue_run(
-                    topic_id=topic["id"],
-                    trigger_message_id=user_msg["id"],
-                    user_content=effective_content,
-                    agent_type=resolved_agent_type,
-                    model_override=req.model,
-                    thinking_override=req.thinking_level,
+                        session_run = task_manager.resume_run(
+                            run_id=active_run["id"],
+                            decision="user_message",
+                            approved=True,
+                            comment=effective_content,
+                        )
+                    except ValueError:
+                        session_run = None
+                else:
+                    session_run = task_manager.steer_run(
+                        active_run["id"],
+                        message_id=user_msg["id"],
+                        content=effective_content,
+                    )
+                if session_run is not None:
+                    steered_run_id = active_run["id"]
+                    updated_user = database.update_message(
+                        user_msg["id"],
+                        metadata={
+                            "steered_run_id": steered_run_id,
+                            "run_action": "steer",
+                        },
+                    )
+                    if updated_user:
+                        user_msg = _enrich_message(updated_user, bus)
+                        bus.publish("message_updated", {"message": user_msg})
+
+            if steered_run_id is None:
+                inherited_topic_agent: Optional[str] = None
+                if (
+                    not requested_agent
+                    and not registry.try_resolve_type(decision.agent_type)
+                    and decision.topic_action == "reuse"
+                ):
+                    latest_topic_run = database.get_latest_topic_run(topic["id"])
+                    prior_agent = (
+                        registry.try_resolve_type(latest_topic_run.get("agent_type"))
+                        if latest_topic_run
+                        else None
+                    )
+                    if prior_agent:
+                        try:
+                            if registry.get(prior_agent).probe().available:
+                                inherited_topic_agent = prior_agent
+                        except KeyError:
+                            pass
+                resolved_agent_type = (
+                    requested_agent
+                    or registry.try_resolve_type(decision.agent_type)
+                    or inherited_topic_agent
+                    or cfg.default_heavy_agent
+                    or "internal_agent"
                 )
-            except KeyError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            # Re-fetch user message so it includes linked session_run
-            refreshed_user_msg = database.get_message(user_msg["id"])
-            if refreshed_user_msg:
-                user_msg = _enrich_message(refreshed_user_msg, bus)
+                if decision.agent_type != resolved_agent_type:
+                    canonical = registry.try_resolve_type(resolved_agent_type)
+                    if canonical:
+                        decision = decision.model_copy(update={"agent_type": canonical})
+                try:
+                    session_run = task_manager.enqueue_run(
+                        topic_id=topic["id"],
+                        trigger_message_id=user_msg["id"],
+                        user_content=effective_content,
+                        agent_type=resolved_agent_type,
+                        model_override=req.model,
+                        thinking_override=req.thinking_level,
+                    )
+                except KeyError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                # Re-fetch user message so it includes linked session_run
+                refreshed_user_msg = database.get_message(user_msg["id"])
+                if refreshed_user_msg:
+                    user_msg = _enrich_message(refreshed_user_msg, bus)
         else:
             assistant_msg = fast_path.start_reply(
                 topic=topic,
@@ -868,6 +943,7 @@ def create_app(
             topic=TopicSummary.model_validate(refreshed_topic),
             assistant_message=MessageItem.model_validate(assistant_msg) if assistant_msg else None,
             session_run=SessionRunDetail.model_validate(session_run) if session_run else None,
+            steered_run_id=steered_run_id,
             reassigned_messages=[MessageItem.model_validate(m) for m in reassigned_messages],
         )
 

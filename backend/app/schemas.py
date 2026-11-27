@@ -26,6 +26,14 @@ class RouteDecision(BaseModel):
         default=None,
         description="Explicitly requested Heavy-Path agent ID (e.g. codex, claude_code, internal_agent) if mentioned by user or continuing a previous agent task, else null",
     )
+    run_action: Literal["new_run", "steer", "cancel", "none"] = Field(
+        default="new_run",
+        description="Action relative to currently active runs: 'steer' to append/adjust an active run, 'cancel' to stop it, 'new_run' to start a new run, or 'none' for fast chat",
+    )
+    target_run_id: Optional[str] = Field(
+        default=None,
+        description="Active SessionRun ID when run_action is 'steer' or 'cancel', else null",
+    )
     confidence: float = Field(
         ge=0.0,
         le=1.0,
@@ -288,6 +296,7 @@ class ChatRequest(BaseModel):
     focus_topic_id: Optional[str] = None
     quoted_message_id: Optional[str] = None
     force_path: Optional[Literal["fast", "heavy"]] = None
+    force_new_run: bool = False
     agent_type: Optional[str] = None
     model: Optional[str] = None
     thinking_level: Optional[Literal["low", "medium", "high"]] = None
@@ -299,6 +308,7 @@ class ChatResponse(BaseModel):
     topic: TopicSummary
     assistant_message: Optional[MessageItem] = None
     session_run: Optional[SessionRunDetail] = None
+    steered_run_id: Optional[str] = None
     reassigned_messages: list[MessageItem] = Field(default_factory=list)
 
 

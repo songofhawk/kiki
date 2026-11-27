@@ -27,6 +27,7 @@ class DecisionRouter:
         *,
         adapter_registry: Optional[AdapterRegistry] = None,
         status_provider: Optional[Callable[[], str]] = None,
+        active_runs_provider: Optional[Callable[[], list[dict[str, Any]]]] = None,
         backtrack_batch_size: int = 6,
         max_backtrack_batches: int = 6,
         recent_context_limit: int = 10,
@@ -36,6 +37,7 @@ class DecisionRouter:
         self.event_bus = event_bus
         self.adapter_registry = adapter_registry
         self._status_provider = status_provider
+        self._active_runs_provider = active_runs_provider
         self.backtrack_batch_size = backtrack_batch_size
         self.max_backtrack_batches = max_backtrack_batches
         self.recent_context_limit = recent_context_limit
@@ -53,6 +55,14 @@ class DecisionRouter:
             return []
         return [info.to_dict() for info in self.adapter_registry.list_infos()]
 
+    def _active_runs_payload(self, *, topic_id: Optional[str] = None) -> list[dict[str, Any]]:
+        if self._active_runs_provider is None:
+            return []
+        runs = self._active_runs_provider() or []
+        if topic_id:
+            return [r for r in runs if r.get("topic_id") == topic_id]
+        return runs
+
     async def _call_route_message(
         self,
         content: str,
@@ -60,6 +70,7 @@ class DecisionRouter:
         recent_messages: list[dict[str, Any]],
         *,
         forced_agent_type: Optional[str] = None,
+        active_runs: Optional[list[dict[str, Any]]] = None,
     ) -> RouteDecision:
         sig = inspect.signature(self.llm.route_message)
         has_varkw = any(
@@ -72,6 +83,8 @@ class DecisionRouter:
             kwargs["available_adapters"] = self._available_adapters_payload()
         if has_varkw or "forced_agent_type" in sig.parameters:
             kwargs["forced_agent_type"] = forced_agent_type
+        if has_varkw or "active_runs" in sig.parameters:
+            kwargs["active_runs"] = active_runs or []
         return await self.llm.route_message(content, active_topics, **kwargs)
 
     async def _backtrack_general_messages(
@@ -211,11 +224,13 @@ class DecisionRouter:
                     topic_id=topic["id"],
                     exclude_interim=True,
                 )
+                topic_active_runs = self._active_runs_payload(topic_id=topic["id"])
                 raw_decision = await self._call_route_message(
                     content,
                     [topic],
                     topic_recent_messages,
                     forced_agent_type=explicit_agent,
+                    active_runs=topic_active_runs,
                 )
                 resolved_agent = explicit_agent or (
                     self.adapter_registry.try_resolve_type(raw_decision.agent_type)
@@ -248,12 +263,29 @@ class DecisionRouter:
                 exclude_interim=True,
             )
             latest_msg = self.db.get_latest_message()
+            active_runs = self._active_runs_payload()
             decision = await self._call_route_message(
                 content,
                 active_topics,
                 recent_messages,
                 forced_agent_type=explicit_agent,
+                active_runs=active_runs,
             )
+
+            # If router decided to steer/cancel an active run, align topic to that run's topic
+            if decision.run_action in ("steer", "cancel") and decision.target_run_id:
+                matched_active = next(
+                    (r for r in active_runs if r.get("id") == decision.target_run_id),
+                    None,
+                )
+                if matched_active and matched_active.get("topic_id"):
+                    decision = decision.model_copy(
+                        update={
+                            "topic_action": "reuse",
+                            "topic_id": matched_active["topic_id"],
+                            "new_topic_title": None,
+                        }
+                    )
 
             if force_path is not None:
                 decision = decision.model_copy(update={"path": force_path})
