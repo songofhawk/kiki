@@ -20,6 +20,12 @@ export interface HealthResponse {
   workspace_root?: string;
 }
 
+export interface AuthStatusResponse {
+  auth_enabled: boolean;
+  authenticated: boolean;
+  username?: string | null;
+}
+
 export interface WorkspaceMount {
   id: string;
   scope: 'global' | 'topic';

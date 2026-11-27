@@ -87,6 +87,17 @@ class HealthResponse(BaseModel):
     workspace_root: Optional[str] = None
 
 
+class AuthLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=512)
+
+
+class AuthStatusResponse(BaseModel):
+    auth_enabled: bool
+    authenticated: bool
+    username: Optional[str] = None
+
+
 class WorkspaceMountItem(BaseModel):
     id: str
     scope: Literal["global", "topic"]

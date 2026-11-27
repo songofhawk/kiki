@@ -1,6 +1,7 @@
 import type {
   AdapterInfo,
   Artifact,
+  AuthStatusResponse,
   BatchReassignTopicPayload,
   BatchReassignTopicResponse,
   ChatRequest,
@@ -30,8 +31,17 @@ import type {
 
 const API_BASE = '/api';
 
+export const AUTH_UNAUTHORIZED_EVENT = 'kiki:auth-unauthorized';
+
+function notifyUnauthorized(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
+  }
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
@@ -40,6 +50,9 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!res.ok) {
+    if (res.status === 401 && !path.startsWith('/auth/')) {
+      notifyUnauthorized();
+    }
     let detail = `HTTP ${res.status}`;
     try {
       const data = await res.json();
@@ -51,6 +64,26 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return res.json() as Promise<T>;
+}
+
+export async function fetchAuthMe(): Promise<AuthStatusResponse> {
+  return requestJson<AuthStatusResponse>('/auth/me', { cache: 'no-store' });
+}
+
+export async function loginWithPassword(
+  username: string,
+  password: string
+): Promise<AuthStatusResponse> {
+  return requestJson<AuthStatusResponse>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function logoutSession(): Promise<void> {
+  await requestJson<{ ok: boolean }>('/auth/logout', {
+    method: 'POST',
+  });
 }
 
 export async function fetchHealth(): Promise<HealthResponse> {
@@ -106,8 +139,12 @@ export async function updateWorkspaceMount(
 export async function deleteWorkspaceMount(mountId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/workspace/mounts/${encodeURIComponent(mountId)}`, {
     method: 'DELETE',
+    credentials: 'same-origin',
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      notifyUnauthorized();
+    }
     let detail = `HTTP ${res.status}`;
     try {
       const data = await res.json();

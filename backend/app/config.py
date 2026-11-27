@@ -73,6 +73,12 @@ class Settings:
     search_provider_order: str = "tavily,serper,exa,jina,brave,bocha,serpapi"
     cors_origins: tuple[str, ...] = DEFAULT_CORS_ORIGINS
     api_token: str = ""
+    auth_username: str = ""
+    auth_password_hash: str = ""
+    auth_users: str = ""
+    auth_secret: str = ""
+    auth_session_ttl_seconds: int = 7 * 24 * 3600
+    auth_cookie_secure: bool = False
     desktop_takeover_enabled: bool = True
     desktop_driver: str = "auto"
     desktop_idle_timeout_seconds: int = 900
@@ -193,6 +199,9 @@ def load_settings() -> Settings:
     desktop_idle_timeout = _parse_int_env("KIKI_DESKTOP_IDLE_TIMEOUT_SECONDS", 900, 30, 7200)
     desktop_default_fps = _parse_int_env("KIKI_DESKTOP_DEFAULT_FPS", 4, 1, 15)
     desktop_max_width = _parse_int_env("KIKI_DESKTOP_MAX_WIDTH", 1280, 640, 2560)
+    auth_session_ttl = _parse_int_env("KIKI_AUTH_SESSION_TTL_SECONDS", 7 * 24 * 3600, 300, 90 * 24 * 3600)
+    raw_auth_cookie_secure = os.getenv("KIKI_AUTH_COOKIE_SECURE", "false").strip().lower()
+    auth_cookie_secure = raw_auth_cookie_secure in ("1", "true", "yes", "on")
 
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
@@ -226,6 +235,12 @@ def load_settings() -> Settings:
         ),
         cors_origins=cors_origins,
         api_token=os.getenv("KIKI_API_TOKEN", "").strip(),
+        auth_username=os.getenv("KIKI_AUTH_USERNAME", "").strip(),
+        auth_password_hash=os.getenv("KIKI_AUTH_PASSWORD_HASH", "").strip(),
+        auth_users=os.getenv("KIKI_AUTH_USERS", "").strip(),
+        auth_secret=os.getenv("KIKI_AUTH_SECRET", "").strip(),
+        auth_session_ttl_seconds=auth_session_ttl,
+        auth_cookie_secure=auth_cookie_secure,
         desktop_takeover_enabled=desktop_enabled,
         desktop_driver=desktop_driver,
         desktop_idle_timeout_seconds=desktop_idle_timeout,

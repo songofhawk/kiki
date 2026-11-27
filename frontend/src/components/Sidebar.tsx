@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Archive, Check, Hash, Layers, Loader2, PawPrint, Pencil, Plus, Settings, X } from 'lucide-react';
+import { Archive, Check, Hash, Layers, Loader2, LogOut, PawPrint, Pencil, Plus, Settings, X } from 'lucide-react';
 import type { KikiStatus, ReassignTopicPayload, Topic } from '../types';
 import KikiAvatar, { KIKI_POSE_LABELS, KIKI_STATUS_LABELS, type KikiPose } from './KikiAvatar';
 import UserAvatar from './UserAvatar';
@@ -22,6 +22,8 @@ export interface SidebarProps {
     messageId: string,
     payload: ReassignTopicPayload
   ) => Promise<void> | void;
+  authUsername?: string | null;
+  onLogout?: () => Promise<void> | void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -38,6 +40,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onArchiveTopic,
   onOpenTopicSettings,
   onReassignMessage,
+  authUsername = null,
+  onLogout,
 }) => {
   const [dragOverTopicId, setDragOverTopicId] = useState<string | null>(null);
   const [addingTopic, setAddingTopic] = useState(false);
@@ -121,8 +125,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
 
-        {/* Customer's own avatar (clickable to customize photo & display name) */}
-        <UserAvatar size="sm" editable />
+        {/* Customer's own avatar + optional logout button */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          <UserAvatar size="sm" editable />
+          {onLogout && (
+            <button
+              type="button"
+              onClick={() => void onLogout()}
+              title={authUsername ? `退出登录 (${authUsername})` : '退出登录'}
+              aria-label="退出登录"
+              className="p-1.5 rounded-xl text-[#7D756C] hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200/70 transition-colors"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Primary Navigation */}

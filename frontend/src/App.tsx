@@ -14,16 +14,19 @@ import {
   X,
 } from 'lucide-react';
 import {
+  AUTH_UNAUTHORIZED_EVENT,
   batchReassignMessageTopics,
   cancelRun,
   connectEventStream,
   createTopic,
   fetchActiveRuns,
   fetchAdapters,
+  fetchAuthMe,
   fetchHealth,
   fetchMessagesPage,
   fetchRun,
   fetchTopics,
+  logoutSession,
   reassignMessageTopic,
   resumeRun,
   sendChat,
@@ -31,6 +34,7 @@ import {
 } from './api';
 import type {
   AdapterInfo,
+  AuthStatusResponse,
   BatchReassignTopicPayload,
   DesktopTakeoverContext,
   HealthResponse,
@@ -45,7 +49,8 @@ import type {
   Topic,
 } from './types';
 import Sidebar from './components/Sidebar';
-import type { KikiPose } from './components/KikiAvatar';
+import LoginPage from './components/LoginPage';
+import KikiAvatar, { type KikiPose } from './components/KikiAvatar';
 import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
@@ -342,7 +347,15 @@ function mergeRun(prev: SessionRun | undefined, incoming: SessionRun): SessionRu
   };
 }
 
-export const App: React.FC = () => {
+interface KikiWorkspaceProps {
+  authUsername?: string | null;
+  onLogout?: () => Promise<void> | void;
+}
+
+const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
+  authUsername = null,
+  onLogout,
+}) => {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [adapters, setAdapters] = useState<AdapterInfo[]>([]);
   const [selectedAgentType, setSelectedAgentType] = useState<string>('auto');
@@ -1520,6 +1533,8 @@ export const App: React.FC = () => {
             setWorkspaceModalOpen(true);
           }}
           onReassignMessage={handleReassignMessage}
+          authUsername={authUsername}
+          onLogout={onLogout}
         />
       </div>
 
@@ -1549,6 +1564,8 @@ export const App: React.FC = () => {
                 setWorkspaceModalOpen(true);
               }}
               onReassignMessage={handleReassignMessage}
+              authUsername={authUsername}
+              onLogout={onLogout}
             />
           </div>
         </div>
@@ -2015,6 +2032,70 @@ export const App: React.FC = () => {
         onDismiss={dismissToast}
       />
     </div>
+  );
+};
+
+export const App: React.FC = () => {
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    fetchAuthMe()
+      .then((status) => {
+        if (!active) return;
+        setAuthStatus(status);
+      })
+      .catch(() => {
+        if (!active) return;
+        // Fallback when backend is unreachable: let workspace surface the connection error
+        setAuthStatus({ auth_enabled: false, authenticated: true, username: null });
+      })
+      .finally(() => {
+        if (active) setAuthChecking(false);
+      });
+
+    const handleUnauthorized = () => {
+      setAuthStatus((prev) =>
+        prev && !prev.auth_enabled
+          ? prev
+          : { auth_enabled: true, authenticated: false, username: null }
+      );
+    };
+    window.addEventListener(AUTH_UNAUTHORIZED_EVENT, handleUnauthorized);
+    return () => {
+      active = false;
+      window.removeEventListener(AUTH_UNAUTHORIZED_EVENT, handleUnauthorized);
+    };
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await logoutSession();
+    } catch {
+      // Ignore network errors and still clear local auth state
+    }
+    setAuthStatus({ auth_enabled: true, authenticated: false, username: null });
+  }, []);
+
+  if (authChecking) {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-[#FAF8F5] text-[#7D756C] gap-3 kiki-paper-bg">
+        <KikiAvatar status="idle" animated size="md" />
+        <span className="text-xs">正在连接 Kiki...</span>
+      </div>
+    );
+  }
+
+  if (authStatus?.auth_enabled && !authStatus.authenticated) {
+    return <LoginPage onLoginSuccess={(status) => setAuthStatus(status)} />;
+  }
+
+  return (
+    <KikiWorkspace
+      authUsername={authStatus?.auth_enabled ? authStatus.username ?? null : null}
+      onLogout={authStatus?.auth_enabled ? handleLogout : undefined}
+    />
   );
 };
 

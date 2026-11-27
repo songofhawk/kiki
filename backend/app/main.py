@@ -10,11 +10,12 @@ import threading
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .adapters import AdapterRegistry, create_default_registry
+from .auth import AuthManager, SESSION_COOKIE_NAME
 from .config import Settings, get_settings
 from .db import Database
 from .desktop import DesktopDriver, DesktopTakeoverManager, create_desktop_driver
@@ -25,6 +26,8 @@ from .router import DecisionRouter, FastPathService
 from .search import WebSearchService
 from .schemas import (
     AdapterInfoResponse,
+    AuthLoginRequest,
+    AuthStatusResponse,
     BatchMessageTopicReassignRequest,
     BatchMessageTopicReassignResponse,
     ChatRequest,
@@ -156,6 +159,14 @@ def create_app(
         default_fps=cfg.desktop_default_fps,
         default_max_width=cfg.desktop_max_width,
     )
+    auth_manager = AuthManager(
+        username=cfg.auth_username,
+        password_hash=cfg.auth_password_hash,
+        users_raw=cfg.auth_users,
+        secret=cfg.auth_secret,
+        session_ttl_seconds=cfg.auth_session_ttl_seconds,
+        cookie_secure=cfg.auth_cookie_secure,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -227,10 +238,12 @@ def create_app(
     app.state.fast_path = fast_path
     app.state.dream_consolidator = dream_consolidator
     app.state.desktop_manager = desktop_manager
+    app.state.auth_manager = auth_manager
     app.include_router(
         create_desktop_router(
             desktop_manager,
             configured_api_token=cfg.api_token.strip(),
+            auth_manager=auth_manager,
         )
     )
 
@@ -244,29 +257,123 @@ def create_app(
     )
 
     configured_api_token = cfg.api_token.strip()
-    if configured_api_token:
+    _AUTH_PUBLIC_PATHS = {
+        "/api/health",
+        "/api/auth/me",
+        "/api/auth/login",
+        "/api/auth/logout",
+    }
+
+    if configured_api_token or auth_manager.enabled:
         @app.middleware("http")
-        async def verify_api_token(request: Request, call_next: Any) -> Any:
+        async def verify_auth(request: Request, call_next: Any) -> Any:
             if (
                 request.method == "OPTIONS"
                 or not request.url.path.startswith("/api/")
-                or request.url.path == "/api/health"
+                or request.url.path in _AUTH_PUBLIC_PATHS
             ):
                 return await call_next(request)
 
-            auth_header = request.headers.get("authorization", "")
-            provided = ""
-            if auth_header.lower().startswith("bearer "):
-                provided = auth_header[7:].strip()
-            elif request.url.path == "/api/events":
-                provided = request.query_params.get("token", "").strip()
+            # 1. Check signed HttpOnly session cookie (Web login)
+            if auth_manager.enabled:
+                session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
+                authed_user = auth_manager.verify_session_token(session_cookie)
+                if authed_user is not None:
+                    request.state.auth_user = authed_user
+                    return await call_next(request)
 
-            if not provided or not hmac.compare_digest(provided, configured_api_token):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Unauthorized: invalid or missing API token"},
-                )
-            return await call_next(request)
+            # 2. Check static Bearer API token (CLI / programmatic access)
+            if configured_api_token:
+                auth_header = request.headers.get("authorization", "")
+                provided = ""
+                if auth_header.lower().startswith("bearer "):
+                    provided = auth_header[7:].strip()
+                elif request.url.path == "/api/events":
+                    provided = request.query_params.get("token", "").strip()
+
+                if provided and hmac.compare_digest(provided, configured_api_token):
+                    request.state.auth_user = "__api_token__"
+                    return await call_next(request)
+
+            detail = (
+                "Unauthorized: login required"
+                if auth_manager.enabled
+                else "Unauthorized: invalid or missing API token"
+            )
+            return JSONResponse(status_code=401, content={"detail": detail})
+
+    # ------------------------------------------------------------------
+    # Authentication (Static-config login, no self-registration)
+    # ------------------------------------------------------------------
+    @app.get("/api/auth/me", response_model=AuthStatusResponse)
+    async def auth_me(request: Request) -> AuthStatusResponse:
+        if not auth_manager.enabled:
+            return AuthStatusResponse(
+                auth_enabled=False,
+                authenticated=True,
+                username=None,
+            )
+        session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
+        authed_user = auth_manager.verify_session_token(session_cookie)
+        return AuthStatusResponse(
+            auth_enabled=True,
+            authenticated=authed_user is not None,
+            username=authed_user,
+        )
+
+    @app.post("/api/auth/login", response_model=AuthStatusResponse)
+    async def auth_login(
+        req: AuthLoginRequest,
+        request: Request,
+        response: Response,
+    ) -> AuthStatusResponse:
+        if not auth_manager.enabled:
+            return AuthStatusResponse(
+                auth_enabled=False,
+                authenticated=True,
+                username=None,
+            )
+
+        client_ip = request.client.host if request.client else "unknown"
+        retry_after = auth_manager.check_rate_limit(client_ip)
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"登录尝试过于频繁，请 {retry_after} 秒后再试",
+            )
+
+        authed_user = auth_manager.authenticate(req.username, req.password)
+        if authed_user is None:
+            auth_manager.record_failure(client_ip)
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        auth_manager.clear_failures(client_ip)
+        token = auth_manager.create_session_token(authed_user)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            max_age=auth_manager.session_ttl_seconds,
+            httponly=True,
+            samesite="lax",
+            secure=auth_manager.cookie_secure,
+            path="/",
+        )
+        return AuthStatusResponse(
+            auth_enabled=True,
+            authenticated=True,
+            username=authed_user,
+        )
+
+    @app.post("/api/auth/logout")
+    async def auth_logout(response: Response) -> dict[str, bool]:
+        response.delete_cookie(
+            key=SESSION_COOKIE_NAME,
+            path="/",
+            httponly=True,
+            samesite="lax",
+            secure=auth_manager.cookie_secure,
+        )
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # Health & Heavy-Path Adapters

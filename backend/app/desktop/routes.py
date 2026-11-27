@@ -11,6 +11,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from ..auth import AuthManager, SESSION_COOKIE_NAME
 from .manager import (
     DesktopNotFoundError,
     DesktopTakeoverError,
@@ -59,6 +60,7 @@ def create_desktop_router(
     manager: DesktopTakeoverManager,
     *,
     configured_api_token: str = "",
+    auth_manager: Optional[AuthManager] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/desktop", tags=["desktop"])
 
@@ -176,11 +178,24 @@ def create_desktop_router(
         binary: bool = Query(default=False),
         ack: bool = Query(default=False),
     ) -> None:
-        if configured_api_token:
-            auth_header = websocket.headers.get("authorization", "")
-            provided_api = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else api_token.strip()
-            if not provided_api or not hmac.compare_digest(provided_api, configured_api_token):
-                await websocket.close(code=4401, reason="Unauthorized API token")
+        auth_enabled = bool(auth_manager and auth_manager.enabled)
+        if configured_api_token or auth_enabled:
+            authorized = False
+            if auth_enabled and auth_manager is not None:
+                session_cookie = websocket.cookies.get(SESSION_COOKIE_NAME)
+                if auth_manager.verify_session_token(session_cookie) is not None:
+                    authorized = True
+            if not authorized and configured_api_token:
+                auth_header = websocket.headers.get("authorization", "")
+                provided_api = (
+                    auth_header[7:].strip()
+                    if auth_header.lower().startswith("bearer ")
+                    else api_token.strip()
+                )
+                if provided_api and hmac.compare_digest(provided_api, configured_api_token):
+                    authorized = True
+            if not authorized:
+                await websocket.close(code=4401, reason="Unauthorized")
                 return
 
         try:
