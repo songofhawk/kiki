@@ -85,6 +85,7 @@ class MacOSDesktopDriver:
 
     def __init__(self) -> None:
         self._cg: Any = None
+        self._cf: Any = None
         self._ax: Any = None
         self._pressed_buttons: set[str] = set()
         self._screencapture = shutil.which("screencapture") or "/usr/sbin/screencapture"
@@ -101,6 +102,8 @@ class MacOSDesktopDriver:
             cg.CGGetActiveDisplayList.restype = ctypes.c_int32
             cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
             cg.CGDisplayBounds.restype = _CGRect
+            cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
             cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32]
             cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
             cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
@@ -117,6 +120,24 @@ class MacOSDesktopDriver:
             self._cg = cg
         except OSError:
             self._cg = None
+        try:
+            cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+            cf.CFArrayGetCount.restype = ctypes.c_long
+            cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+            cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+            cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+            cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+            cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+            cf.CFStringGetCString.restype = ctypes.c_bool
+            cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+            cf.CFNumberGetValue.restype = ctypes.c_bool
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            self._cf = cf
+        except OSError:
+            self._cf = None
         try:
             ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
             ax.AXIsProcessTrusted.restype = ctypes.c_bool
@@ -403,3 +424,140 @@ class MacOSDesktopDriver:
         if res.returncode != 0:
             err = res.stderr.decode("utf-8", errors="ignore").strip()
             raise RuntimeError(err or f"Failed to open app {cleaned!r} (exit {res.returncode})")
+
+    def _enumerate_visible_windows(self) -> list[tuple[str, float, float, float, float]]:
+        """Return visible normal app windows in front-to-back order as (owner, x, y, w, h)."""
+        if not self._cg or not self._cf:
+            return []
+        cf = self._cf
+        # kCGWindowListOptionOnScreenOnly (1) | kCGWindowListExcludeDesktopElements (16) = 17
+        arr = self._cg.CGWindowListCopyWindowInfo(17, 0)
+        if not arr:
+            return []
+
+        cf_keys: list[Any] = []
+        try:
+            def _cfstr(s: str) -> Any:
+                ref = cf.CFStringCreateWithCString(None, s.encode("utf-8"), 0x08000100)
+                if ref:
+                    cf_keys.append(ref)
+                return ref
+
+            def _to_str(ref: Any) -> str:
+                if not ref:
+                    return ""
+                buf = ctypes.create_string_buffer(512)
+                if cf.CFStringGetCString(ref, buf, 512, 0x08000100):
+                    return buf.value.decode("utf-8", errors="replace")
+                return ""
+
+            def _to_double(ref: Any) -> float:
+                if not ref:
+                    return 0.0
+                v = ctypes.c_double(0.0)
+                cf.CFNumberGetValue(ref, 13, ctypes.byref(v))  # kCFNumberFloat64Type
+                return v.value
+
+            def _to_int(ref: Any) -> int:
+                if not ref:
+                    return 0
+                v = ctypes.c_longlong(0)
+                cf.CFNumberGetValue(ref, 4, ctypes.byref(v))  # kCFNumberSInt64Type
+                return v.value
+
+            k_owner = _cfstr("kCGWindowOwnerName")
+            k_layer = _cfstr("kCGWindowLayer")
+            k_bounds = _cfstr("kCGWindowBounds")
+            k_x = _cfstr("X")
+            k_y = _cfstr("Y")
+            k_w = _cfstr("Width")
+            k_h = _cfstr("Height")
+            ignored_owners = {"Window Server", "Dock", "Control Center", "Spotlight", "Notification Center"}
+
+            results: list[tuple[str, float, float, float, float]] = []
+            count = int(cf.CFArrayGetCount(arr))
+            for i in range(count):
+                entry = cf.CFArrayGetValueAtIndex(arr, i)
+                if not entry:
+                    continue
+                if _to_int(cf.CFDictionaryGetValue(entry, k_layer)) != 0:
+                    continue
+                owner = _to_str(cf.CFDictionaryGetValue(entry, k_owner))
+                if not owner or owner in ignored_owners:
+                    continue
+                bounds = cf.CFDictionaryGetValue(entry, k_bounds)
+                if not bounds:
+                    continue
+                x = _to_double(cf.CFDictionaryGetValue(bounds, k_x))
+                y = _to_double(cf.CFDictionaryGetValue(bounds, k_y))
+                w = _to_double(cf.CFDictionaryGetValue(bounds, k_w))
+                h = _to_double(cf.CFDictionaryGetValue(bounds, k_h))
+                if w >= 80.0 and h >= 80.0:
+                    results.append((owner, x, y, w, h))
+            return results
+        finally:
+            cf.CFRelease(arr)
+            for ref in cf_keys:
+                cf.CFRelease(ref)
+
+    @staticmethod
+    def _match_display_for_rect(
+        displays: tuple[DisplayInfo, ...],
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> Optional[int]:
+        if not displays:
+            return None
+        cx, cy = x + w * 0.5, y + h * 0.5
+        for d in displays:
+            if d.origin_x <= cx < d.origin_x + d.width and d.origin_y <= cy < d.origin_y + d.height:
+                return d.index
+        best_idx: Optional[int] = None
+        best_area = 0.0
+        for d in displays:
+            ix = max(0.0, min(x + w, d.origin_x + d.width) - max(x, d.origin_x))
+            iy = max(0.0, min(y + h, d.origin_y + d.height) - max(y, d.origin_y))
+            area = ix * iy
+            if area > best_area:
+                best_area = area
+                best_idx = d.index
+        return best_idx
+
+    def get_frontmost_window_display(
+        self,
+        *,
+        preferred_app: Optional[str] = None,
+    ) -> tuple[Optional[int], Optional[str]]:
+        """Return (display_index, owner_name) for the frontmost (or preferred_app) visible window."""
+        displays = self._list_displays()
+        if not displays:
+            return None, None
+        windows = self._enumerate_visible_windows()
+        if not windows:
+            return None, None
+        if preferred_app:
+            needle = preferred_app.strip().lower()
+            for owner, x, y, w, h in windows:
+                if needle in owner.lower():
+                    d_idx = self._match_display_for_rect(displays, x, y, w, h)
+                    if d_idx is not None:
+                        return d_idx, owner
+        owner, x, y, w, h = windows[0]
+        return self._match_display_for_rect(displays, x, y, w, h), owner
+
+    def list_visible_windows_by_display(self) -> dict[int, list[str]]:
+        """Return deduplicated visible app names per display index (top 5 each)."""
+        displays = self._list_displays()
+        by_display: dict[int, list[str]] = {d.index: [] for d in displays}
+        if not displays:
+            return by_display
+        for owner, x, y, w, h in self._enumerate_visible_windows():
+            d_idx = self._match_display_for_rect(displays, x, y, w, h)
+            if d_idx is None:
+                continue
+            bucket = by_display.setdefault(d_idx, [])
+            if owner not in bucket and len(bucket) < 5:
+                bucket.append(owner)
+        return by_display

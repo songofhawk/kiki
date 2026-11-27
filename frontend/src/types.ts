@@ -157,6 +157,7 @@ export interface MessageMetadata {
   confidence?: number;
   reasoning?: string;
   path?: 'fast' | 'heavy';
+  reply_to?: string;
   session_run_id?: string;
   steered_run_id?: string;
   run_action?: string;

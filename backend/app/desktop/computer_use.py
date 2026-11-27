@@ -160,6 +160,13 @@ COMPUTER_USE_TOOL_DECLARATIONS: list[dict[str, Any]] = [
                         "for non-ASCII/CJK text, multiline text, or text longer than 40 characters."
                     ),
                 },
+                "replace": {
+                    "type": "boolean",
+                    "description": (
+                        "For 'type' action: if true, select all (Cmd+A) and clear existing text in the "
+                        "focused input before typing/pasting, saving multiple turns."
+                    ),
+                },
                 "key": {
                     "type": "string",
                     "description": "Key name for 'key' action (e.g. 'enter', 'tab', 'escape', 'backspace', 'a', 'v', 'arrowdown').",
@@ -274,6 +281,55 @@ class ComputerUseExecutor:
         self.tool_executor = tool_executor
         self.max_width = max(320, min(2560, int(max_width)))
         self.quality = max(30, min(95, int(quality)))
+        self._active_display_index: int = 0
+
+    def _resolve_display_index(self, raw_display: Any, caps: DesktopCapabilities) -> int:
+        max_idx = max(0, len(caps.displays) - 1)
+        if raw_display is not None:
+            resolved = min(max(0, int(raw_display)), max_idx)
+            self._active_display_index = resolved
+            return resolved
+        self._active_display_index = min(max(0, self._active_display_index), max_idx)
+        return self._active_display_index
+
+    async def _collect_display_context(
+        self,
+        caps: DesktopCapabilities,
+        *,
+        preferred_app: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], Optional[int], Optional[str]]:
+        driver = self.desktop_manager.driver
+        windows_by_display: dict[int, list[str]] = {}
+        list_win_fn = getattr(driver, "list_visible_windows_by_display", None)
+        if callable(list_win_fn):
+            try:
+                windows_by_display = await asyncio.to_thread(list_win_fn)
+            except Exception:
+                windows_by_display = {}
+
+        front_display: Optional[int] = None
+        front_app: Optional[str] = None
+        front_fn = getattr(driver, "get_frontmost_window_display", None)
+        if callable(front_fn):
+            try:
+                front_display, front_app = await asyncio.to_thread(
+                    front_fn, preferred_app=preferred_app
+                )
+            except Exception:
+                front_display, front_app = None, None
+
+        displays_summary = [
+            {
+                "index": d.index,
+                "name": d.name,
+                "width": d.width,
+                "height": d.height,
+                "is_main": d.is_main,
+                "windows": windows_by_display.get(d.index, []),
+            }
+            for d in caps.displays
+        ]
+        return displays_summary, front_display, front_app
 
     @staticmethod
     def _norm_coord(val: Any) -> float:
@@ -329,7 +385,7 @@ class ComputerUseExecutor:
         if not caps.permissions.screen_recording:
             return self._error_result("屏幕录制权限未开启，无法截取服务器桌面画面。")
 
-        display_index = max(0, int(arguments.get("display_index") or 0))
+        display_index = self._resolve_display_index(arguments.get("display_index"), caps)
         save_artifact = bool(arguments.get("save_artifact", False))
         artifact_label = str(arguments.get("artifact_label") or "").strip()
 
@@ -340,6 +396,7 @@ class ComputerUseExecutor:
             artifact_label=artifact_label,
             default_label="桌面截图",
         )
+        displays_summary, front_display, front_app = await self._collect_display_context(caps)
         meta: dict[str, Any] = {
             "ok": True,
             "action": "screenshot",
@@ -347,7 +404,17 @@ class ComputerUseExecutor:
             "width": frame.width,
             "height": frame.height,
             "coord_space": "0..1000",
+            "displays": displays_summary,
         }
+        if front_app is not None:
+            meta["frontmost_app"] = front_app
+        if front_display is not None:
+            meta["frontmost_display_index"] = front_display
+            if len(caps.displays) > 1 and front_display != frame.display_index:
+                meta["hint"] = (
+                    f"当前前台窗口（{front_app or '未知应用'}）位于显示器 {front_display}，"
+                    f"而本次截取的是显示器 {frame.display_index}；如需查看该窗口请传 display_index={front_display}。"
+                )
         if artifact:
             meta["artifact_id"] = artifact.get("id")
             meta["artifact_path"] = artifact.get("file_path")
@@ -367,10 +434,31 @@ class ComputerUseExecutor:
         *,
         text: str,
         paste_override: Any,
+        replace: bool,
         display_index: int,
         caps: DesktopCapabilities,
     ) -> dict[str, Any]:
         driver = self.desktop_manager.driver
+        paste_mod = "cmd" if caps.platform in ("Darwin", "mock") else "ctrl"
+        if replace:
+            await self._send_input(
+                DesktopInputEvent(
+                    action="key_combo",
+                    key="a",
+                    modifiers=(paste_mod,),
+                    display_index=display_index,
+                )
+            )
+            await asyncio.sleep(0.05)
+            await self._send_input(
+                DesktopInputEvent(
+                    action="key_tap",
+                    key="backspace",
+                    display_index=display_index,
+                )
+            )
+            await asyncio.sleep(0.05)
+
         if paste_override is None:
             use_paste = any(ord(c) > 127 for c in text) or "\n" in text or len(text) > 40
         else:
@@ -384,7 +472,7 @@ class ComputerUseExecutor:
                 prev_clipboard = None
 
             await asyncio.to_thread(driver.set_clipboard, text)
-            paste_mod = "cmd" if caps.platform in ("Darwin", "mock") else "ctrl"
+            await asyncio.sleep(0.05)
             await self._send_input(
                 DesktopInputEvent(
                     action="key_combo",
@@ -393,14 +481,14 @@ class ComputerUseExecutor:
                     display_index=display_index,
                 )
             )
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.25)
 
             if prev_clipboard is not None:
                 try:
                     await asyncio.to_thread(driver.set_clipboard, prev_clipboard)
                 except Exception:
                     pass
-            return {"method": "paste", "length": len(text)}
+            return {"method": "paste", "length": len(text), "replace": replace}
 
         await self._send_input(
             DesktopInputEvent(
@@ -409,7 +497,7 @@ class ComputerUseExecutor:
                 display_index=display_index,
             )
         )
-        return {"method": "type_text", "length": len(text)}
+        return {"method": "type_text", "length": len(text), "replace": replace}
 
     async def _handle_drag(
         self,
@@ -529,7 +617,8 @@ class ComputerUseExecutor:
         if action in ("get_clipboard", "set_clipboard") and not caps.supports_clipboard:
             return self._error_result("当前桌面驱动不支持剪贴板读写。")
 
-        display_index = max(0, int(arguments.get("display_index") or 0))
+        explicit_display = arguments.get("display_index") is not None
+        display_index = self._resolve_display_index(arguments.get("display_index"), caps)
         button_raw = str(arguments.get("button") or "left").strip().lower()
         button = button_raw if button_raw in ("left", "right", "middle") else "left"
 
@@ -629,6 +718,7 @@ class ComputerUseExecutor:
             detail = await self._handle_type(
                 text=str(text),
                 paste_override=arguments.get("paste"),
+                replace=bool(arguments.get("replace", False)),
                 display_index=display_index,
                 caps=caps,
             )
@@ -710,10 +800,31 @@ class ComputerUseExecutor:
         raw_wait = arguments.get("wait_after")
         if raw_wait is None and action in ("wait", "get_clipboard"):
             wait_after = 0.0
+        elif raw_wait is None and action in ("open_url", "open_app"):
+            wait_after = 1.5
         else:
             wait_after = max(0.0, min(10.0, float(0.6 if raw_wait is None else raw_wait)))
         if wait_after > 0:
             await asyncio.sleep(wait_after)
+
+        preferred_app = str(arguments.get("app_name") or "").strip() or None if action == "open_app" else None
+        displays_summary, front_display, front_app = await self._collect_display_context(
+            caps, preferred_app=preferred_app
+        )
+
+        # Auto-follow the newly focused window's display on open_url / open_app when caller
+        # didn't pin display_index, so multi-monitor setups capture the actual browser/app screen.
+        auto_switched_display = False
+        if (
+            not explicit_display
+            and action in ("open_url", "open_app")
+            and front_display is not None
+            and 0 <= front_display < max(1, len(caps.displays))
+            and front_display != display_index
+        ):
+            display_index = front_display
+            self._active_display_index = front_display
+            auto_switched_display = True
 
         return_screenshot = bool(arguments.get("return_screenshot", True))
         save_artifact = bool(arguments.get("save_artifact", False))
@@ -737,8 +848,15 @@ class ComputerUseExecutor:
             "action": action,
             "display_index": frame.display_index if frame else display_index,
             "coord_space": "0..1000",
+            "displays": displays_summary,
             **detail,
         }
+        if front_app is not None:
+            meta["frontmost_app"] = front_app
+        if front_display is not None:
+            meta["frontmost_display_index"] = front_display
+        if auto_switched_display:
+            meta["auto_switched_display"] = True
         if frame:
             meta["width"] = frame.width
             meta["height"] = frame.height

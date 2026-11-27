@@ -151,7 +151,7 @@ class TaskManager:
         settings: Optional[Settings] = None,
         workspace_manager: Optional[WorkspaceManager] = None,
         desktop_manager: Optional[DesktopTakeoverManager] = None,
-        max_steps: int = 10,
+        max_steps: Optional[int] = None,
         status_provider: Optional[Callable[[], Literal["idle", "thinking", "running", "waiting_input"]]] = None,
     ) -> None:
         self.db = db
@@ -168,7 +168,12 @@ class TaskManager:
             gemini_model=settings.gemini_model if settings else None,
             gemini_api_key_configured=settings.any_llm_configured if settings else True,
         )
-        self.max_steps = max_steps
+        if max_steps is not None:
+            self.max_steps = max_steps
+        elif settings is not None:
+            self.max_steps = settings.agent_max_steps
+        else:
+            self.max_steps = 25
         self._status_provider = status_provider
 
         self._tasks: dict[str, asyncio.Task[Any]] = {}

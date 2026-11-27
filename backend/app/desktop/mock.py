@@ -64,6 +64,9 @@ class MockDesktopDriver:
         self.recorded_events: list[DesktopInputEvent] = []
         self.opened_urls: list[str] = []
         self.opened_apps: list[str] = []
+        self.frontmost_display_index: int = 0
+        self.frontmost_app: Optional[str] = None
+        self.windows_by_display: dict[int, list[str]] = {}
         self.clipboard_text: str = ""
         self._frame_seq: int = 0
         self._static_frame: Optional[bytes] = None
@@ -213,3 +216,27 @@ class MockDesktopDriver:
         ):
             raise ValueError(f"Invalid application name: {app_name!r}")
         self.opened_apps.append(cleaned)
+
+    def get_frontmost_window_display(
+        self,
+        *,
+        preferred_app: Optional[str] = None,
+    ) -> tuple[Optional[int], Optional[str]]:
+        if not self.available:
+            return None, None
+        if preferred_app:
+            needle = preferred_app.strip().lower()
+            for d_idx, wins in self.windows_by_display.items():
+                for owner in wins:
+                    if needle in owner.lower():
+                        return min(max(0, d_idx), self.displays_count - 1), owner
+        d_idx = min(max(0, self.frontmost_display_index), self.displays_count - 1)
+        return d_idx, self.frontmost_app
+
+    def list_visible_windows_by_display(self) -> dict[int, list[str]]:
+        if not self.available:
+            return {}
+        return {
+            i: list(self.windows_by_display.get(i, []))
+            for i in range(self.displays_count)
+        }

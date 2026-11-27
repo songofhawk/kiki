@@ -141,6 +141,20 @@ async def test_computer_use_executor_core_actions(tmp_path: Path) -> None:
     assert "cmd" in driver.recorded_events[-1].modifiers
     assert driver.get_clipboard() == "previous-clip"
 
+    # 3b. Type with replace=True sends Cmd+A, Backspace, then pastes
+    before_replace = len(driver.recorded_events)
+    res_replace = await cu.execute(
+        run_id,
+        "computer_action",
+        {"action": "type", "text": "替换后的中文正文", "replace": True, "wait_after": 0, "return_screenshot": False},
+    )
+    assert not res_replace.is_error
+    assert json.loads(res_replace.text)["replace"] is True
+    replace_evts = driver.recorded_events[before_replace:]
+    assert replace_evts[0].action == "key_combo" and replace_evts[0].key == "a"
+    assert replace_evts[1].action == "key_tap" and replace_evts[1].key == "backspace"
+    assert replace_evts[2].action == "key_combo" and replace_evts[2].key == "v"
+
     # 4. Drag action
     before_len = len(driver.recorded_events)
     res_drag = await cu.execute(
@@ -390,5 +404,76 @@ async def test_internal_agent_end_to_end_social_media_publish(tmp_path: Path) ->
     assert driver.opened_urls == ["https://creator.xiaohongshu.com/publish/publish"]
     assert len(final_run["artifacts"]) == 1
     assert any(s["action_type"] == "computer_use" for s in final_run["step_logs"])
+
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_computer_use_multi_display_auto_follow_and_default_step_limits(tmp_path: Path) -> None:
+    cfg = Settings(
+        gemini_api_key="test-key",
+        gemini_model="gemini-3.8-flash",
+        workspace_root=tmp_path / "workspace",
+        database_path=tmp_path / "kiki.db",
+        artifacts_dir=tmp_path / "workspace" / "artifacts",
+    )
+    assert cfg.agent_max_steps == 25
+    assert cfg.computer_use_max_steps == 80
+
+    db = Database(cfg.database_path)
+    db.init_db()
+    bus = EventBus()
+    driver = MockDesktopDriver(displays_count=2)
+    driver.frontmost_display_index = 1
+    driver.frontmost_app = "Google Chrome"
+    driver.windows_by_display = {
+        0: ["微信"],
+        1: ["Google Chrome", "Safari浏览器"],
+    }
+    desktop_manager = DesktopTakeoverManager(driver=driver, event_bus=bus)
+    tool_executor = WorkspaceToolExecutor(
+        workspace_root=cfg.workspace_root,
+        artifacts_dir=cfg.artifacts_dir,
+        db=db,
+        event_bus=bus,
+    )
+    cu = ComputerUseExecutor(desktop_manager, tool_executor)
+
+    # open_url without display_index should auto-follow Google Chrome onto display 1
+    res_open = await cu.execute(
+        "run-multi",
+        "computer_action",
+        {
+            "action": "open_url",
+            "url": "https://creator.xiaohongshu.com/publish/publish",
+            "wait_after": 0,
+        },
+    )
+    assert not res_open.is_error
+    meta_open = json.loads(res_open.text)
+    assert meta_open["display_index"] == 1
+    assert meta_open["auto_switched_display"] is True
+    assert meta_open["frontmost_app"] == "Google Chrome"
+    assert len(meta_open["displays"]) == 2
+    assert "Google Chrome" in meta_open["displays"][1]["windows"]
+
+    # Subsequent click without display_index should stay on display 1 (remembered active display)
+    res_click = await cu.execute(
+        "run-multi",
+        "computer_action",
+        {"action": "click", "x": 500, "y": 500, "wait_after": 0, "return_screenshot": False},
+    )
+    assert not res_click.is_error
+    assert driver.recorded_events[-1].display_index == 1
+
+    # Screenshot on display 0 explicitly should report hint pointing to frontmost window on display 1
+    res_shot0 = await cu.execute(
+        "run-multi",
+        "computer_screenshot",
+        {"display_index": 0},
+    )
+    meta_shot0 = json.loads(res_shot0.text)
+    assert meta_shot0["display_index"] == 0
+    assert "显示器 1" in meta_shot0.get("hint", "")
 
     db.close()

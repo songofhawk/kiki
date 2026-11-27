@@ -32,14 +32,16 @@ AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (internal_agent
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
 4. 若任务遇到必须人工在服务器桌面亲自操作的场景（如登录/二步验证、图形验证码、滑块校验、OAuth 授权、桌面软件弹窗或系统权限确认），必须立即调用 `request_desktop_takeover` 挂起并交由主人接管服务器桌面（切勿尝试绕过验证码），待主人处理完成后继续执行。
 5. **ComputerUse 桌面视觉操作与自媒体发布规范**（当可用 `computer_screenshot` / `computer_action` 时）：
-   - 坐标系统统一为 `0..1000` 归一化网格，`(0, 0)` 为屏幕左上角，`(1000, 1000)` 为右下角；每次操作前先观察当前截图，操作后根据返回的最新截图确认状态再进行下一步。
+   - 坐标系统统一为 `0..1000` 归一化网格，`(0, 0)` 为当前显示器左上角，`(1000, 1000)` 为右下角；每次操作前先观察当前截图，操作后根据返回的最新截图确认状态再进行下一步。
+   - **多显示器协同**：每次截屏或操作返回的 JSON 中都包含 `displays`（列出所有显示器及每个显示器上可见的应用窗口 `windows`）和 `display_index`。`open_url` / `open_app` 会自动跟随前台窗口所在的显示器并记住当前激活显示器；如果没在当前屏幕看到目标窗口，**切勿重复打开同一网页或乱切其他浏览器**，请查看 `displays` 并传入对应的 `display_index` 截屏定位！
    - 发布自媒体文章/视频（如小红书、微信公众号、抖音、B站、知乎、YouTube、X 等）推荐流程：
      a) 先在工作区准备好正文、标题、标签或核实本地视频/封面图路径；
      b) 优先使用 `computer_action(action="open_url", url=...)` 直接打开创作者后台，或 `open_app` 激活目标桌面应用；
      c) 若页面需要登录、扫码、二步验证或人机验证码，立即调用 `request_desktop_takeover` 请主人处理后继续；
-     d) 输入中文标题、长文正文或简介时，先点击输入框，再调用 `computer_action(action="type", text=...)`（会自动通过剪贴板粘贴以保证中文与多行文本完整准确）；
-     e) 上传本地视频或封面图弹出 macOS 文件选择框时，使用 `computer_action(action="select_file_in_dialog", file_path=...)` 选择文件，随后可用 `action="wait"` 等待视频上传与转码完成；
-     f) 在点击最终「发布 / Publish / 提交」按钮前（除非用户明确说明“直接发布无需确认”），先带 `save_artifact=True` 截取草稿预览图，再调用 `request_human_approval` 请主人确认无误后发布。
+     d) 输入中文标题、长文正文或简介时，先点击输入框，再调用 `computer_action(action="type", text=...)`（会自动通过剪贴板粘贴以保证中文与多行文本完整准确）；若需替换已有内容，直接传 `replace=True` 即可一步完成全选清空与粘贴，切勿再分多步手动 `cmd+a` + `backspace` + `cmd+v`。
+     e) 若主人通过审批/反馈要求修改已填好的内容，优先切回已有浏览器窗口（`open_app`）在原编辑页直接用 `replace=True` 修改，**切勿重复调用 `open_url` 打开空白新页面重头再来**。
+     f) 上传本地视频或封面图弹出 macOS 文件选择框时，使用 `computer_action(action="select_file_in_dialog", file_path=...)` 选择文件，随后可用 `action="wait"` 等待视频上传与转码完成；
+     g) 在点击最终「发布 / Publish / 提交」按钮前（除非用户明确说明“直接发布无需确认”），先带 `save_artifact=True` 截取草稿预览图，再调用 `request_human_approval` 请主人确认无误后发布。
 6. 任务完成时，用简洁、信息密度高的中文给出最终总结（**严格控制在 200 字以内**），直接说明结论与产出物。
 7. 你当前**不具备**真实图片生成（PNG/JPG/WebP）工具；若用户要求生成图片或插画，**严禁**用 ASCII 字符画或 Markdown 文档冒充图片，应直接诚实说明无法生成真实图片，并建议用户改用支持生图的执行引擎（例如 Codex）。
 """
@@ -389,8 +391,10 @@ class InternalAgentAdapter(HeavyTaskAdapter):
         step_budget = ctx.max_steps
         cu_max_steps = max(
             ctx.max_steps,
-            ctx.settings.computer_use_max_steps if ctx.settings else 30,
+            ctx.settings.computer_use_max_steps if ctx.settings else 80,
         )
+        hard_step_cap = max(200, cu_max_steps * 3)
+        hitl_bonus_steps = 25
 
         turn = 0
         while turn < step_budget:
@@ -468,6 +472,8 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                     decision_payload = await ctx.request_hitl_approval(prompt, options)
 
                     approved = bool(decision_payload.get("approved", False))
+                    if approved:
+                        step_budget = min(hard_step_cap, step_budget + hitl_bonus_steps)
                     decision_val = str(decision_payload.get("decision", ""))
                     comment = decision_payload.get("comment") or ""
                     result_str = json.dumps(
@@ -512,6 +518,8 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                     decision_payload = await ctx.request_hitl_approval(reason, takeover_options)
 
                     completed = bool(decision_payload.get("approved", False))
+                    if completed:
+                        step_budget = min(hard_step_cap, step_budget + hitl_bonus_steps)
                     decision_val = str(decision_payload.get("decision", ""))
                     comment = decision_payload.get("comment") or ""
                     result_str = json.dumps(

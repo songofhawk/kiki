@@ -387,6 +387,12 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
       return false;
     }
   });
+  // Tracks newly sent user messages that were just classified by the decision model
+  // (messageId -> topicId) so their topic badge temporarily stays visible until Kiki outputs.
+  const [recentlyRoutedMessageIds, setRecentlyRoutedMessageIds] = useState<
+    Record<string, string>
+  >({});
+  const clearedRoutedMessageIdsRef = useRef<Set<string>>(new Set());
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
@@ -415,6 +421,58 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
   >([]);
   const loadingInitialKeysRef = useRef<Set<string>>(new Set());
   const loadingOlderKeysRef = useRef<Set<string>>(new Set());
+
+  const markRecentlyRoutedMessage = useCallback(
+    (messageId: string, topicId: string) => {
+      if (clearedRoutedMessageIdsRef.current.has(messageId)) return;
+      setRecentlyRoutedMessageIds((prev) => {
+        if (prev[messageId] === topicId) return prev;
+        return { ...prev, [messageId]: topicId };
+      });
+    },
+    []
+  );
+
+  const clearRecentlyRoutedForReply = useCallback(
+    (opts: {
+      replyToMessageId?: string | null;
+      topicId?: string | null;
+      clearTopic?: boolean;
+    }) => {
+      const { replyToMessageId, topicId, clearTopic = false } = opts;
+      if (replyToMessageId) {
+        clearedRoutedMessageIdsRef.current.add(replyToMessageId);
+      }
+      setRecentlyRoutedMessageIds((prev) => {
+        const entries = Object.entries(prev);
+        if (entries.length === 0) return prev;
+
+        let changed = false;
+        const next: Record<string, string> = {};
+        const hasExactReplyTarget = Boolean(
+          replyToMessageId &&
+            Object.prototype.hasOwnProperty.call(prev, replyToMessageId)
+        );
+
+        for (const [msgId, msgTopicId] of entries) {
+          const shouldClear = clearTopic
+            ? msgId === replyToMessageId ||
+              Boolean(topicId && msgTopicId === topicId)
+            : hasExactReplyTarget
+              ? msgId === replyToMessageId
+              : Boolean(topicId && msgTopicId === topicId);
+          if (shouldClear) {
+            clearedRoutedMessageIdsRef.current.add(msgId);
+            changed = true;
+          } else {
+            next[msgId] = msgTopicId;
+          }
+        }
+        return changed ? next : prev;
+      });
+    },
+    []
+  );
 
   const hydrateRunsFromMessages = useCallback((msgs: Message[]) => {
     const found: SessionRun[] = [];
@@ -734,6 +792,9 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           }
           if (matchIdx >= 0) {
             const [matched] = pendingOptimisticRef.current.splice(matchIdx, 1);
+            if (matched.focusTopicId === null) {
+              markRecentlyRoutedMessage(message.id, message.topic_id);
+            }
             setStreamsByKey((prev) =>
               applyMessageCreatedToStreams(prev, message, matched.tempId)
             );
@@ -742,6 +803,19 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           }
         } else {
           setStreamsByKey((prev) => applyMessageCreatedToStreams(prev, message));
+          if (
+            message.role === 'assistant' &&
+            !isMessageStreaming(message) &&
+            Boolean(message.content?.trim())
+          ) {
+            clearRecentlyRoutedForReply({
+              replyToMessageId:
+                typeof message.metadata?.reply_to === 'string'
+                  ? message.metadata.reply_to
+                  : null,
+              topicId: message.topic_id,
+            });
+          }
         }
         if (message.session_run) {
           setRunsById((prev) => ({
@@ -762,9 +836,38 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
         setStreamsByKey((prev) =>
           applyMessageCreatedToStreams(prev, { ...message, streaming: false })
         );
+        if (message.role === 'assistant') {
+          clearRecentlyRoutedForReply({
+            replyToMessageId:
+              typeof message.metadata?.reply_to === 'string'
+                ? message.metadata.reply_to
+                : null,
+            topicId: message.topic_id,
+          });
+        }
       },
       onMessageUpdated: ({ message }) => {
         setStreamsByKey((prev) => applyMessageUpdatedToStreams(prev, message));
+        if (message.role === 'user') {
+          setRecentlyRoutedMessageIds((prev) =>
+            Object.prototype.hasOwnProperty.call(prev, message.id) &&
+            prev[message.id] !== message.topic_id
+              ? { ...prev, [message.id]: message.topic_id }
+              : prev
+          );
+        } else if (
+          message.role === 'assistant' &&
+          !isMessageStreaming(message) &&
+          Boolean(message.content?.trim())
+        ) {
+          clearRecentlyRoutedForReply({
+            replyToMessageId:
+              typeof message.metadata?.reply_to === 'string'
+                ? message.metadata.reply_to
+                : null,
+            topicId: message.topic_id,
+          });
+        }
       },
       onRunCreated: ({ run }) => {
         setRunsById((prev) => ({
@@ -820,6 +923,11 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           run.status === 'failed' ||
           run.status === 'cancelled'
         ) {
+          clearRecentlyRoutedForReply({
+            replyToMessageId: run.trigger_message_id,
+            topicId: run.topic_id,
+            clearTopic: true,
+          });
           fetchTopics()
             .then((list) =>
               setTopics(
@@ -923,7 +1031,12 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
     });
 
     return disconnect;
-  }, [pushToast, loadStreamFirstPage]);
+  }, [
+    pushToast,
+    loadStreamFirstPage,
+    markRecentlyRoutedMessage,
+    clearRecentlyRoutedForReply,
+  ]);
 
   const topicsById = useMemo(() => {
     const map: Record<string, Topic> = {};
@@ -1277,6 +1390,12 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           pendingOptimisticRef.current = pendingOptimisticRef.current.filter(
             (item) => item.tempId !== tempId
           );
+          if (!effectiveTopicId) {
+            markRecentlyRoutedMessage(
+              res.user_message.id,
+              res.topic?.id ?? res.user_message.topic_id
+            );
+          }
           const enrichedUser: Message = {
             ...res.user_message,
             topic: res.topic ?? res.user_message.topic,
@@ -1298,6 +1417,15 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           setStreamsByKey((prev) =>
             applyMessageCreatedToStreams(prev, enrichedAssistant)
           );
+          if (
+            !isMessageStreaming(enrichedAssistant) &&
+            Boolean(enrichedAssistant.content?.trim())
+          ) {
+            clearRecentlyRoutedForReply({
+              replyToMessageId: res.user_message?.id ?? null,
+              topicId: res.topic?.id ?? enrichedAssistant.topic_id,
+            });
+          }
         }
         if (res.session_run) {
           setRunsById((prev) => ({
@@ -1335,7 +1463,17 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
         setPendingSendCount((count) => Math.max(0, count - 1));
       }
     },
-    [inputText, focusTopicId, quotedMessage, pathOption, selectedAgentType, forceNewRun, topicsById]
+    [
+      inputText,
+      focusTopicId,
+      quotedMessage,
+      pathOption,
+      selectedAgentType,
+      forceNewRun,
+      topicsById,
+      markRecentlyRoutedMessage,
+      clearRecentlyRoutedForReply,
+    ]
   );
 
   const handleReassignMessage = useCallback(
@@ -1597,6 +1735,11 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   };
 
+  const temporarilyVisibleTopicMessageIds = useMemo(
+    () => new Set(Object.keys(recentlyRoutedMessageIds)),
+    [recentlyRoutedMessageIds]
+  );
+
   const activeDrawerRun = activeDrawerRunId
     ? runsById[activeDrawerRunId] ?? null
     : null;
@@ -1725,7 +1868,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
               }
               title={
                 showAllTopicTags
-                  ? '关闭后仅在悬停消息时显示话题标签'
+                  ? '关闭后日常隐藏话题标签，新分类消息会在 Kiki 回复前临时显示'
                   : '开启后始终显示每条消息的话题标签'
               }
               className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
@@ -1805,6 +1948,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           runsById={runsById}
           focusTopicId={focusTopicId}
           showAllTopicTags={showAllTopicTags}
+          temporarilyVisibleTopicMessageIds={temporarilyVisibleTopicMessageIds}
           hasMore={currentStream.hasMore}
           loadingInitial={currentStream.loadingInitial}
           loadingOlder={currentStream.loadingOlder}

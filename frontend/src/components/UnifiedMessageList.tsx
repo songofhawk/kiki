@@ -37,6 +37,7 @@ export interface UnifiedMessageListProps {
   runsById: Record<string, SessionRun>;
   focusTopicId: string | null;
   showAllTopicTags?: boolean;
+  temporarilyVisibleTopicMessageIds?: ReadonlySet<string>;
   hasMore?: boolean;
   loadingInitial?: boolean;
   loadingOlder?: boolean;
@@ -259,6 +260,7 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
   runsById,
   focusTopicId,
   showAllTopicTags = false,
+  temporarilyVisibleTopicMessageIds,
   hasMore = false,
   loadingInitial = false,
   loadingOlder = false,
@@ -854,27 +856,31 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
                         <GripVertical className="w-3.5 h-3.5 pointer-events-none" />
                       </div>
                     )}
-                    {topic ? (
-                      <div
-                        className={
-                          showAllTopicTags
-                            ? 'opacity-100'
-                            : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity'
-                        }
-                      >
-                        <TopicBadge
-                          topic={topic}
-                          messageId={msg.id}
-                          confidence={confidence}
-                          allTopics={allTopics}
-                          onSelectTopic={onSelectTopic}
-                          onReassign={onReassignMessage}
-                          onStartMultiSelect={onStartMultiSelect}
-                          compact
-                        />
-                      </div>
-                    ) : msg.metadata?.optimistic ? (
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269]">
+                    {topic ? (() => {
+                      const isTemporarilyVisible = Boolean(
+                        temporarilyVisibleTopicMessageIds?.has(msg.id)
+                      );
+                      const badgeStateClass = showAllTopicTags
+                        ? 'opacity-100 scale-100 translate-y-0'
+                        : isTemporarilyVisible
+                          ? 'opacity-100 scale-100 translate-y-0 kiki-topic-bubble-enter'
+                          : 'kiki-topic-bubble-hidden';
+                      return (
+                        <div className={`kiki-topic-bubble ${badgeStateClass}`}>
+                          <TopicBadge
+                            topic={topic}
+                            messageId={msg.id}
+                            confidence={confidence}
+                            allTopics={allTopics}
+                            onSelectTopic={onSelectTopic}
+                            onReassign={onReassignMessage}
+                            onStartMultiSelect={onStartMultiSelect}
+                            compact
+                          />
+                        </div>
+                      );
+                    })() : msg.metadata?.optimistic ? (
+                      <span className="kiki-topic-bubble kiki-topic-bubble-enter inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] bg-[#F1ECE5] border border-[#E5DED4] text-[#7A7269]">
                         <Loader2 className="w-3 h-3 text-[#5B7A95] animate-spin" />
                         <span>归类路由中...</span>
                       </span>
@@ -1017,11 +1023,11 @@ export const UnifiedMessageList: React.FC<UnifiedMessageListProps> = ({
 
                   {topic ? (
                     <div
-                      className={
+                      className={`kiki-topic-bubble ${
                         showAllTopicTags
-                          ? 'opacity-100'
-                          : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity'
-                      }
+                          ? 'opacity-100 scale-100 translate-y-0'
+                          : 'kiki-topic-bubble-hidden'
+                      }`}
                     >
                       <TopicBadge
                         topic={topic}
