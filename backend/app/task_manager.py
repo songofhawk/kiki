@@ -174,6 +174,8 @@ class TaskManager:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._run_adapters: dict[str, str] = {}
         self._run_states: dict[str, str] = {}
+        self._run_topics: dict[str, str] = {}
+        self._steering_queues: dict[str, list[dict[str, Any]]] = {}
         self._hitl_events: dict[str, asyncio.Event] = {}
         self._hitl_decisions: dict[str, dict[str, Any]] = {}
         self._shutting_down: bool = False
@@ -224,6 +226,8 @@ class TaskManager:
 
         self._run_states[run_id] = "queued"
         self._run_adapters[run_id] = canonical_type
+        self._run_topics[run_id] = topic_id
+        self._steering_queues[run_id] = []
         enriched = self.event_bus.enrich_run(run)
         self.event_bus.publish("run_created", {"run": enriched})
         self._publish_kiki_status(reason="后台任务已启动")
@@ -247,8 +251,113 @@ class TaskManager:
         self._tasks.pop(run_id, None)
         self._run_adapters.pop(run_id, None)
         self._run_states.pop(run_id, None)
+        self._run_topics.pop(run_id, None)
+        self._steering_queues.pop(run_id, None)
         self._hitl_events.pop(run_id, None)
         self._hitl_decisions.pop(run_id, None)
+
+    def get_active_run_for_topic(self, topic_id: str) -> Optional[dict[str, Any]]:
+        """Return the latest active (queued/running/waiting_input) SessionRun for a topic."""
+        active_ids = [
+            rid
+            for rid, tid in self._run_topics.items()
+            if tid == topic_id and self._run_states.get(rid) in ("queued", "running", "waiting_input")
+        ]
+        for rid in reversed(active_ids):
+            run = self.db.get_session_run(rid)
+            if run and run["status"] in ("queued", "running", "waiting_input"):
+                return self.event_bus.enrich_run(run)
+        # Fallback to DB in case of externally persisted active run
+        for run in self.db.list_active_session_runs():
+            if run.get("topic_id") == topic_id:
+                return self.event_bus.enrich_run(run)
+        return None
+
+    def list_active_runs(self) -> list[dict[str, Any]]:
+        """Return all currently active SessionRuns with trigger message snippets."""
+        active = self.db.list_active_session_runs()
+        result: list[dict[str, Any]] = []
+        for run in active:
+            enriched = self.event_bus.enrich_run(run)
+            trigger_msg = self.db.get_message(run["trigger_message_id"]) if run.get("trigger_message_id") else None
+            if trigger_msg and trigger_msg.get("content"):
+                enriched = dict(enriched)
+                enriched["trigger_content"] = str(trigger_msg["content"])
+            result.append(enriched)
+        return result
+
+    def steer_run(
+        self,
+        run_id: str,
+        *,
+        message_id: str,
+        content: str,
+    ) -> Optional[dict[str, Any]]:
+        """Queue a mid-run user follow-up message onto an active SessionRun."""
+        run = self.db.get_session_run(run_id)
+        if not run:
+            return None
+        status = self._run_states.get(run_id) or run.get("status")
+        if status not in ("queued", "running"):
+            return None
+
+        cleaned = (content or "").strip()
+        if not cleaned:
+            return self.event_bus.enrich_run(run)
+
+        queue = self._steering_queues.setdefault(run_id, [])
+        queue.append({"message_id": message_id, "content": cleaned})
+
+        preview = " ".join(cleaned.split())
+        if len(preview) > 80:
+            preview = preview[:79] + "…"
+        step_num = len(run.get("step_logs") or []) + 1
+        step_log = self.db.add_step_log(
+            run_id=run_id,
+            step_number=step_num,
+            action_type="user_steer",
+            detail=f"收到补充指令：{preview}",
+            status="success",
+        )
+        self.event_bus.publish("step_log", {"run_id": run_id, "step_log": step_log})
+        self.db.update_session_run(
+            run_id,
+            current_step=f"收到补充指令，正在整合：{preview[:48]}",
+        )
+        self.event_bus.append_raw_log(
+            run_id,
+            json.dumps(
+                {
+                    "event": "run_steered",
+                    "run_id": run_id,
+                    "message_id": message_id,
+                    "content": cleaned,
+                },
+                ensure_ascii=False,
+            ),
+            stream="ndjson",
+        )
+        enriched = self._publish_run_update(run_id)
+        if enriched is not None:
+            self.event_bus.publish(
+                "run_steered",
+                {
+                    "run_id": run_id,
+                    "topic_id": enriched["topic_id"],
+                    "message_id": message_id,
+                    "content": cleaned,
+                    "run": enriched,
+                },
+            )
+        return enriched
+
+    def _drain_steering_messages(self, run_id: str) -> list[dict[str, Any]]:
+        queue = self._steering_queues.get(run_id)
+        if not queue:
+            return []
+        drained = list(queue)
+        queue.clear()
+        return drained
 
     def _publish_run_update(self, run_id: str) -> Optional[dict[str, Any]]:
         run = self.db.get_session_run(run_id)
@@ -418,6 +527,7 @@ class TaskManager:
                 ),
                 _publish_run_update=self._publish_run_update,
                 _emit_interim_message=_emit_interim_message,
+                _drain_steering_messages=lambda rid=run_id: self._drain_steering_messages(rid),
             )
 
             result = await adapter.execute(ctx)

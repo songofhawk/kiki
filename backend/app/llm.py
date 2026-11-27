@@ -713,6 +713,8 @@ class KikiLLMClient:
                             "content": _stringify_tool_result_for_openai(item.get("result")),
                         }
                     )
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    messages.append({"role": "user", "content": str(item.get("text") or "")})
                 else:
                     messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
         else:

@@ -55,6 +55,8 @@ def _format_followup_prompt(decision_payload: dict[str, Any]) -> str:
         or ("approved" if decision_payload.get("approved") else "rejected")
     ).strip()
     comment = str(decision_payload.get("comment") or "").strip()
+    if decision == "steer" and comment:
+        return comment
     if comment:
         return f"用户已完成人工确认（决策: {decision}）。补充说明：{comment}。请继续执行任务。"
     return f"用户已完成人工确认（决策: {decision}）。请继续执行任务。"

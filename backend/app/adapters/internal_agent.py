@@ -394,6 +394,15 @@ class InternalAgentAdapter(HeavyTaskAdapter):
 
         turn = 0
         while turn < step_budget:
+            if turn == 0:
+                early_steers = ctx.drain_steering_messages()
+                if early_steers:
+                    early_prompt = ctx.format_steering_prompt(early_steers)
+                    if early_prompt and isinstance(input_data, str):
+                        input_data = f"{input_data}\n\n{early_prompt}"
+                        ctx.emit_event_log(
+                            {"event": "steering_injected", "turn": 1, "count": len(early_steers)}
+                        )
             turn += 1
             ctx.emit_event_log({"event": "llm_turn", "turn": turn})
             turn_kwargs: dict[str, Any] = {
@@ -417,6 +426,22 @@ class InternalAgentAdapter(HeavyTaskAdapter):
             function_calls = [s for s in steps if getattr(s, "type", None) == "function_call"]
 
             if not function_calls:
+                late_steers = ctx.drain_steering_messages()
+                if late_steers:
+                    steering_prompt = ctx.format_steering_prompt(late_steers)
+                    if steering_prompt:
+                        ctx.emit_event_log(
+                            {"event": "steering_injected", "turn": turn, "count": len(late_steers)}
+                        )
+                        steer_step = ctx.start_step(
+                            "user_steer",
+                            "收到主人补充指令，继续整合处理...",
+                        )
+                        ctx.finish_step(steer_step["id"], status="success")
+                        if turn >= step_budget:
+                            step_budget = min(step_budget + 4, 40)
+                        input_data = steering_prompt
+                        continue
                 final_text = getattr(interaction, "output_text", None) or ""
                 completed_cleanly = True
                 break
@@ -593,6 +618,22 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                             "is_error": is_error,
                         }
                     )
+
+            mid_steers = ctx.drain_steering_messages()
+            if mid_steers:
+                steering_prompt = ctx.format_steering_prompt(mid_steers)
+                if steering_prompt:
+                    ctx.emit_event_log(
+                        {"event": "steering_injected", "turn": turn, "count": len(mid_steers)}
+                    )
+                    steer_step = ctx.start_step(
+                        "user_steer",
+                        "已将主人补充指令注入当前任务，调整后续步骤...",
+                    )
+                    ctx.finish_step(steer_step["id"], status="success")
+                    if turn >= step_budget - 1:
+                        step_budget = min(step_budget + 4, 40)
+                    function_results.append({"type": "text", "text": steering_prompt})
 
             input_data = function_results
 

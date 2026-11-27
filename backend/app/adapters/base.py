@@ -160,10 +160,38 @@ class AdapterContext:
     ] = None
     _publish_run_update: Optional[Callable[[str], Optional[dict[str, Any]]]] = None
     _emit_interim_message: Optional[Callable[[str], Optional[dict[str, Any]]]] = None
+    _drain_steering_messages: Optional[Callable[[], list[dict[str, Any]]]] = None
     _step_counter: int = 0
     session_id: Optional[str] = None
     last_emitted_message_id: Optional[str] = None
     last_emitted_text: Optional[str] = None
+
+    def drain_steering_messages(self) -> list[dict[str, Any]]:
+        """Drain any user follow-up/steering messages queued while this run is active."""
+        if self._drain_steering_messages is None:
+            return []
+        return self._drain_steering_messages()
+
+    @staticmethod
+    def format_steering_prompt(messages: list[dict[str, Any]]) -> str:
+        """Format one or more mid-run user follow-up messages into a clear prompt block."""
+        cleaned = [
+            str(m.get("content") or "").strip()
+            for m in messages
+            if str(m.get("content") or "").strip()
+        ]
+        if not cleaned:
+            return ""
+        if len(cleaned) == 1:
+            return (
+                "【用户在任务执行期间补充了以下新要求/说明，请结合当前进度将其一并纳入并完成，不要重复已完成的工作】\n"
+                f"{cleaned[0]}"
+            )
+        bullets = "\n".join(f"{idx}. {text}" for idx, text in enumerate(cleaned, start=1))
+        return (
+            "【用户在任务执行期间补充了以下新要求/说明，请结合当前进度将其一并纳入并完成，不要重复已完成的工作】\n"
+            f"{bullets}"
+        )
 
     def build_workspace_context_block(self) -> str:
         """Return a concise workspace directory guide for cross-agent collaboration."""
@@ -516,6 +544,23 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
         """Build the argv list to resume a session after HITL approval."""
         return None
 
+    def build_steering_resume_command(
+        self,
+        binary: str,
+        ctx: AdapterContext,
+        profile: ExecutionProfile,
+        session_id: str,
+        steering_prompt: str,
+    ) -> Optional[list[str]]:
+        """Build the argv list to continue the same CLI session with mid-run user steering."""
+        return self.build_resume_command(
+            binary,
+            ctx,
+            profile,
+            session_id,
+            {"decision": "steer", "approved": True, "comment": steering_prompt},
+        )
+
     @staticmethod
     def _detect_macos_system_proxies() -> dict[str, str]:
         """Read macOS system proxy (scutil --proxy) when env proxy vars are absent."""
@@ -852,6 +897,66 @@ class SubprocessCLIAdapter(HeavyTaskAdapter):
                             status="success" if returncode == 0 else "failed",
                         )
                         state.active_step_id = None
+
+        # Handle mid-run user steering messages in the same SessionRun before completing
+        steering_rounds = 0
+        while returncode == 0 and steering_rounds < 5:
+            pending_steers = ctx.drain_steering_messages()
+            if not pending_steers:
+                break
+            steering_prompt = ctx.format_steering_prompt(pending_steers)
+            if not steering_prompt:
+                break
+            steering_rounds += 1
+            steer_step = ctx.start_step(
+                "user_steer",
+                f"正在处理主人补充指令（第 {steering_rounds} 轮续跑）...",
+            )
+            ctx.emit_event_log(
+                {
+                    "event": "steering_followup",
+                    "round": steering_rounds,
+                    "count": len(pending_steers),
+                    "session_id": state.session_id,
+                }
+            )
+            resume_argv = (
+                self.build_steering_resume_command(
+                    binary, ctx, profile, state.session_id, steering_prompt
+                )
+                if state.session_id
+                else None
+            )
+            if resume_argv:
+                returncode = await self._run_process(resume_argv, ctx, profile, state)
+            else:
+                prev_summary = state.best_summary()
+                orig_content = ctx.user_content
+                ctx.user_content = (
+                    f"{orig_content}\n\n"
+                    + (f"【上一轮已完成进展】\n{prev_summary}\n\n" if prev_summary else "")
+                    + steering_prompt
+                )
+                try:
+                    fallback_argv = self.build_command(binary, ctx, profile)
+                    returncode = await self._run_process(fallback_argv, ctx, profile, state)
+                finally:
+                    ctx.user_content = orig_content
+            if state.active_step_id is not None:
+                ctx.finish_step(
+                    state.active_step_id,
+                    status="success" if returncode == 0 else "failed",
+                )
+                state.active_step_id = None
+            ctx.finish_step(
+                steer_step["id"],
+                status="success" if returncode == 0 else "failed",
+                detail=(
+                    f"已完成主人补充指令（第 {steering_rounds} 轮）"
+                    if returncode == 0
+                    else "处理主人补充指令失败"
+                ),
+            )
 
         ctx.finish_step(init_step["id"], status="success" if returncode == 0 else "failed")
 
