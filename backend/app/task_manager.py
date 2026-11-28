@@ -467,6 +467,11 @@ class TaskManager:
             topic = self.db.get_topic(topic_id)
             topic_title = topic["title"] if topic else "后台任务"
             topic_summary = topic.get("summary") if topic else None
+            core_memories = (
+                self.db.list_core_memories(limit=20)
+                if hasattr(self.db, "list_core_memories")
+                else []
+            )
             raw_history = self.db.list_messages(topic_id=topic_id, limit=16)
             topic_history = [
                 m
@@ -520,6 +525,7 @@ class TaskManager:
                 thinking_override=thinking_override,
                 history=topic_history,
                 topic_summary=topic_summary,
+                core_memories=core_memories,
                 kiki_workspace_root=resolved_ws.workspace_root,
                 topic_dir=resolved_ws.topic_dir,
                 shared_dir=resolved_ws.shared_dir,

@@ -24,10 +24,10 @@ from .base import (
 )
 
 AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (internal_agent)。
-你可以使用工作区、联网与桌面 ComputerUse 工具（list_files, read_file, write_artifact, run_shell, web_search, fetch_webpage, computer_screenshot, computer_action, request_human_approval, request_desktop_takeover）来完成用户的复杂任务。
+你可以使用工作区、长期记忆、联网与桌面 ComputerUse 工具（list_files, read_file, write_artifact, run_shell, recall_memory, save_memory, forget_memory, web_search, fetch_webpage, computer_screenshot, computer_action, request_human_approval, request_desktop_takeover）来完成用户的复杂任务。
 
 执行规范：
-1. 先探索再操作，合理调用工具获取真实信息；需要最新资讯、文档或外部资料时，优先调用 `web_search` 与 `fetch_webpage`。
+1. 先探索再操作，合理调用工具获取真实信息；需要回忆之前其他话题的讨论、偏好或项目背景时，优先调用 `recall_memory`；若用户明确要求记住或忘掉某条偏好/事实时，调用 `save_memory` / `forget_memory`；需要最新资讯、文档或外部资料时，优先调用 `web_search` 与 `fetch_webpage`。
 2. 若需要产出报告、分析文档或代码，使用 `write_artifact` 保存为产物文件。
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
 4. 若任务遇到必须人工在服务器桌面亲自操作的场景（如登录/二步验证、图形验证码、滑块校验、OAuth 授权、桌面软件弹窗或系统权限确认），必须立即调用 `request_desktop_takeover` 挂起并交由主人接管服务器桌面（切勿尝试绕过验证码），待主人处理完成后继续执行。
@@ -80,6 +80,14 @@ def _step_label_for_tool(tool_name: str, args: dict[str, Any]) -> str:
         u = str(args.get("url", ""))
         short_u = u if len(u) <= 42 else u[:42] + "…"
         return f"正在读取网页 {short_u}..."
+    if tool_name == "recall_memory":
+        q = str(args.get("query", ""))
+        short_q = q if len(q) <= 36 else q[:36] + "…"
+        return f"正在检索记忆「{short_q}」..."
+    if tool_name == "save_memory":
+        return "正在记录长期记忆..."
+    if tool_name == "forget_memory":
+        return "正在清理指定记忆..."
     if tool_name == "computer_screenshot":
         return "正在截取桌面屏幕观察画面..."
     if tool_name == "computer_action":

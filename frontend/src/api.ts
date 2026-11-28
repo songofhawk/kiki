@@ -16,6 +16,10 @@ import type {
   HealthResponse,
   HitlRequest,
   KikiStatus,
+  MemoryCategory,
+  MemoryConsolidateResult,
+  MemoryItem,
+  MemorySearchResponse,
   Message,
   MessagePage,
   RawLogLine,
@@ -535,4 +539,68 @@ export function buildDesktopWsUrl(sessionId: string, wsToken: string): string {
   return `${proto}//${window.location.host}${API_BASE}/desktop/sessions/${encodeURIComponent(
     sessionId
   )}/ws?${params.toString()}`;
+}
+
+export async function fetchMemories(category?: MemoryCategory): Promise<MemoryItem[]> {
+  const params = new URLSearchParams();
+  if (category) params.set('category', category);
+  const qs = params.toString();
+  return requestJson<MemoryItem[]>(`/memories${qs ? `?${qs}` : ''}`, { cache: 'no-store' });
+}
+
+export async function searchMemories(
+  query: string,
+  includeHistory = true
+): Promise<MemorySearchResponse> {
+  const params = new URLSearchParams({
+    q: query,
+    include_history: includeHistory ? 'true' : 'false',
+  });
+  return requestJson<MemorySearchResponse>(`/memories/search?${params.toString()}`, {
+    cache: 'no-store',
+  });
+}
+
+export async function createMemory(payload: {
+  content: string;
+  category: MemoryCategory;
+  pinned?: boolean;
+  source_topic_id?: string | null;
+}): Promise<MemoryItem> {
+  return requestJson<MemoryItem>('/memories', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateMemory(
+  memoryId: string,
+  payload: {
+    content?: string;
+    category?: MemoryCategory;
+    pinned?: boolean;
+    status?: 'active' | 'superseded' | 'deleted';
+  }
+): Promise<MemoryItem> {
+  return requestJson<MemoryItem>(`/memories/${encodeURIComponent(memoryId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteMemory(memoryId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/memories/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    if (res.status === 401) notifyUnauthorized();
+    throw new Error(`HTTP ${res.status}`);
+  }
+}
+
+export async function consolidateMemoriesNow(): Promise<MemoryConsolidateResult> {
+  return requestJson<MemoryConsolidateResult>('/memories/consolidate', {
+    method: 'POST',
+  });
 }

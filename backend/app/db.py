@@ -13,6 +13,7 @@ from typing import Any, Iterator, Optional
 
 GENERAL_TOPIC_ID = "topic-general"
 GENERAL_TOPIC_TITLE = "日常闲聊"
+MEMORY_CATEGORIES = ("profile", "preference", "project", "lesson")
 
 SCHEMA_SQL = """
 -- 1. 话题表 (Topics)
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS topics (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     summary TEXT,
+    summary_msg_count INTEGER DEFAULT 0,
     status TEXT CHECK(status IN ('active', 'archived', 'deleted')) DEFAULT 'active',
     unread INTEGER DEFAULT 0,
     workspace_dir TEXT,
@@ -88,6 +90,22 @@ CREATE TABLE IF NOT EXISTS workspace_mounts (
     FOREIGN KEY(topic_id) REFERENCES topics(id) ON DELETE CASCADE
 );
 
+-- 7. 长期记忆表 (Memories)
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    category TEXT CHECK(category IN ('profile', 'preference', 'project', 'lesson')) NOT NULL DEFAULT 'preference',
+    content TEXT NOT NULL,
+    source_topic_id TEXT,
+    confidence REAL DEFAULT 0.9,
+    pinned INTEGER DEFAULT 0,
+    status TEXT CHECK(status IN ('active', 'superseded', 'deleted')) DEFAULT 'active',
+    access_count INTEGER DEFAULT 0,
+    last_used_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(source_topic_id) REFERENCES topics(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages(topic_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_session_runs_topic_id ON session_runs(topic_id);
@@ -96,6 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_session_runs_trigger_msg ON session_runs(trigger_
 CREATE INDEX IF NOT EXISTS idx_step_logs_run_id ON step_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_mounts_scope_topic ON workspace_mounts(scope, topic_id);
+CREATE INDEX IF NOT EXISTS idx_memories_status_cat ON memories(status, category);
+CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at);
 """
 
 
@@ -127,6 +147,7 @@ class Database:
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._workspace_manager: Optional[Any] = None
+        self._fts_enabled: bool = False
 
     def set_workspace_manager(self, workspace_manager: Optional[Any]) -> None:
         self._workspace_manager = workspace_manager
@@ -164,13 +185,71 @@ class Database:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA_SQL)
-            # Ensure unread & workspace_dir columns exist on pre-existing DBs
+            # Ensure newer columns exist on pre-existing DBs
             cols = {row["name"] for row in conn.execute("PRAGMA table_info(topics)").fetchall()}
             if "unread" not in cols:
                 conn.execute("ALTER TABLE topics ADD COLUMN unread INTEGER DEFAULT 0")
             if "workspace_dir" not in cols:
                 conn.execute("ALTER TABLE topics ADD COLUMN workspace_dir TEXT")
+            if "summary_msg_count" not in cols:
+                conn.execute("ALTER TABLE topics ADD COLUMN summary_msg_count INTEGER DEFAULT 0")
+            self._init_fts(conn)
             conn.commit()
+
+    def _init_fts(self, conn: sqlite3.Connection) -> None:
+        """Initialize FTS5 virtual tables for memories and messages (with graceful fallback)."""
+        self._fts_enabled = False
+        for tokenizer in ("trigram", "unicode61"):
+            try:
+                conn.execute(
+                    f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                        memory_id UNINDEXED,
+                        content,
+                        tokenize='{tokenizer}'
+                    )
+                    """
+                )
+                conn.execute(
+                    f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                        message_id UNINDEXED,
+                        topic_id UNINDEXED,
+                        content,
+                        tokenize='{tokenizer}'
+                    )
+                    """
+                )
+                self._fts_enabled = True
+                break
+            except sqlite3.OperationalError:
+                continue
+
+        if not self._fts_enabled:
+            return
+
+        # Backfill FTS tables on first upgrade if main table has rows but FTS is empty
+        mem_fts_count = conn.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0]
+        if mem_fts_count == 0:
+            active_mems = conn.execute(
+                "SELECT id, content FROM memories WHERE status = 'active'"
+            ).fetchall()
+            if active_mems:
+                conn.executemany(
+                    "INSERT INTO memories_fts (memory_id, content) VALUES (?, ?)",
+                    [(r["id"], r["content"]) for r in active_mems],
+                )
+
+        msg_fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        if msg_fts_count == 0:
+            existing_msgs = conn.execute(
+                "SELECT id, topic_id, content FROM messages WHERE LENGTH(TRIM(content)) > 0"
+            ).fetchall()
+            if existing_msgs:
+                conn.executemany(
+                    "INSERT INTO messages_fts (message_id, topic_id, content) VALUES (?, ?, ?)",
+                    [(r["id"], r["topic_id"], r["content"]) for r in existing_msgs],
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -246,10 +325,12 @@ class Database:
     # ------------------------------------------------------------------
     @staticmethod
     def _topic_row_from_joined(row: sqlite3.Row) -> dict[str, Any]:
+        keys = row.keys()
         return {
             "id": row["id"],
             "title": row["title"],
             "summary": row["summary"],
+            "summary_msg_count": int(row["summary_msg_count"] or 0) if "summary_msg_count" in keys else 0,
             "status": row["status"],
             "unread": bool(row["unread"]),
             "workspace_dir": row["workspace_dir"],
@@ -376,6 +457,7 @@ class Database:
         *,
         title: Optional[str] = None,
         summary: Optional[str] = None,
+        summary_msg_count: Optional[int] = None,
         status: Optional[str] = None,
         unread: Optional[bool] = None,
         workspace_dir: Optional[str] = None,
@@ -388,6 +470,9 @@ class Database:
         if summary is not None:
             fields.append("summary = ?")
             values.append(summary)
+        if summary_msg_count is not None:
+            fields.append("summary_msg_count = ?")
+            values.append(max(0, int(summary_msg_count)))
         if status is not None:
             fields.append("status = ?")
             values.append(status)
@@ -809,6 +894,11 @@ class Database:
                 """,
                 (mid, topic_id, role, content, meta_json, now),
             )
+            if self._fts_enabled and (content or "").strip():
+                conn.execute(
+                    "INSERT INTO messages_fts (message_id, topic_id, content) VALUES (?, ?, ?)",
+                    (mid, topic_id, content),
+                )
             conn.execute("UPDATE topics SET updated_at = ? WHERE id = ?", (now, topic_id))
             conn.commit()
             row = conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
@@ -838,6 +928,13 @@ class Database:
                 "UPDATE messages SET content = ?, metadata = ? WHERE id = ?",
                 (new_content, new_meta, message_id),
             )
+            if self._fts_enabled and content is not None:
+                conn.execute("DELETE FROM messages_fts WHERE message_id = ?", (message_id,))
+                if (new_content or "").strip():
+                    conn.execute(
+                        "INSERT INTO messages_fts (message_id, topic_id, content) VALUES (?, ?, ?)",
+                        (message_id, existing["topic_id"], new_content),
+                    )
             conn.execute(
                 "UPDATE topics SET updated_at = ? WHERE id = ?",
                 (utc_now_iso(), existing["topic_id"]),
@@ -1135,6 +1232,11 @@ class Database:
                     "UPDATE messages SET topic_id = ?, metadata = ? WHERE id = ?",
                     (target_topic_id, json.dumps(meta, ensure_ascii=False), msg_row["id"]),
                 )
+                if self._fts_enabled:
+                    conn.execute(
+                        "UPDATE messages_fts SET topic_id = ? WHERE message_id = ?",
+                        (target_topic_id, msg_row["id"]),
+                    )
                 conn.execute(
                     "UPDATE session_runs SET topic_id = ?, updated_at = ? WHERE trigger_message_id = ?",
                     (target_topic_id, now, msg_row["id"]),
@@ -1388,3 +1490,425 @@ class Database:
             cur = conn.execute("DELETE FROM workspace_mounts WHERE id = ?", (mount_id,))
             conn.commit()
             return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Long-Term Memories & FTS5 Search
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _memory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "category": row["category"],
+            "content": row["content"],
+            "source_topic_id": row["source_topic_id"],
+            "confidence": float(row["confidence"] if row["confidence"] is not None else 0.9),
+            "pinned": bool(row["pinned"]),
+            "status": row["status"],
+            "access_count": int(row["access_count"] or 0),
+            "last_used_at": row["last_used_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _sync_memory_markdown(self) -> None:
+        ws_mgr = self._workspace_manager
+        if ws_mgr is None or not hasattr(ws_mgr, "sync_memory_markdown"):
+            return
+        try:
+            active_memories = self.list_memories(status="active", limit=200)
+            ws_mgr.sync_memory_markdown(active_memories)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fts_phrase(query: str) -> str:
+        escaped = query.replace('"', '""').strip()
+        return f'"{escaped}"'
+
+    def create_memory(
+        self,
+        *,
+        content: str,
+        category: str = "preference",
+        source_topic_id: Optional[str] = None,
+        confidence: float = 0.9,
+        pinned: bool = False,
+        memory_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        cleaned = " ".join((content or "").split()).strip()
+        if not cleaned:
+            raise ValueError("记忆内容不能为空")
+        cat = category if category in MEMORY_CATEGORIES else "preference"
+        conf = max(0.0, min(1.0, float(confidence)))
+        now = utc_now_iso()
+
+        with self._connect() as conn:
+            # Deduplicate identical active memory content
+            existing = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE status = 'active' AND LOWER(TRIM(content)) = LOWER(?)
+                LIMIT 1
+                """,
+                (cleaned,),
+            ).fetchone()
+            if existing:
+                new_pinned = 1 if (pinned or bool(existing["pinned"])) else 0
+                new_conf = max(conf, float(existing["confidence"] or 0.0))
+                conn.execute(
+                    """
+                    UPDATE memories
+                    SET category = ?, confidence = ?, pinned = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (cat, new_conf, new_pinned, now, existing["id"]),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM memories WHERE id = ?", (existing["id"],)).fetchone()
+                result = self._memory_row_to_dict(row)
+            else:
+                mid = memory_id or _new_id("mem")
+                valid_topic_id = source_topic_id
+                if valid_topic_id:
+                    t_exists = conn.execute(
+                        "SELECT 1 FROM topics WHERE id = ?", (valid_topic_id,)
+                    ).fetchone()
+                    if not t_exists:
+                        valid_topic_id = None
+                conn.execute(
+                    """
+                    INSERT INTO memories (
+                        id, category, content, source_topic_id, confidence,
+                        pinned, status, access_count, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?)
+                    """,
+                    (mid, cat, cleaned, valid_topic_id, conf, 1 if pinned else 0, now, now),
+                )
+                if self._fts_enabled:
+                    conn.execute(
+                        "INSERT INTO memories_fts (memory_id, content) VALUES (?, ?)",
+                        (mid, cleaned),
+                    )
+                conn.commit()
+                row = conn.execute("SELECT * FROM memories WHERE id = ?", (mid,)).fetchone()
+                result = self._memory_row_to_dict(row)
+
+        self._sync_memory_markdown()
+        return result
+
+    def get_memory(self, memory_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            return self._memory_row_to_dict(row) if row else None
+
+    def list_memories(
+        self,
+        *,
+        status: Optional[str] = "active",
+        category: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if category and category in MEMORY_CATEGORIES:
+            clauses.append("category = ?")
+            params.append(category)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM memories
+                {where_sql}
+                ORDER BY pinned DESC, confidence DESC, updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [self._memory_row_to_dict(r) for r in rows]
+
+    def list_core_memories(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return always-in-context core memories (pinned + profile/preference)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE status = 'active'
+                  AND (pinned = 1 OR category IN ('profile', 'preference'))
+                ORDER BY pinned DESC, confidence DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [self._memory_row_to_dict(r) for r in rows]
+
+    def update_memory(
+        self,
+        memory_id: str,
+        *,
+        content: Optional[str] = None,
+        category: Optional[str] = None,
+        pinned: Optional[bool] = None,
+        status: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if not existing:
+                return None
+
+            fields: list[str] = []
+            values: list[Any] = []
+            new_content = existing["content"]
+            new_status = existing["status"]
+
+            if content is not None:
+                cleaned = " ".join(content.split()).strip()
+                if not cleaned:
+                    raise ValueError("记忆内容不能为空")
+                fields.append("content = ?")
+                values.append(cleaned)
+                new_content = cleaned
+            if category is not None and category in MEMORY_CATEGORIES:
+                fields.append("category = ?")
+                values.append(category)
+            if pinned is not None:
+                fields.append("pinned = ?")
+                values.append(1 if pinned else 0)
+            if status is not None and status in ("active", "superseded", "deleted"):
+                fields.append("status = ?")
+                values.append(status)
+                new_status = status
+            if confidence is not None:
+                fields.append("confidence = ?")
+                values.append(max(0.0, min(1.0, float(confidence))))
+
+            if not fields:
+                return self._memory_row_to_dict(existing)
+
+            fields.append("updated_at = ?")
+            values.append(utc_now_iso())
+            values.append(memory_id)
+            conn.execute(
+                f"UPDATE memories SET {', '.join(fields)} WHERE id = ?",
+                values,
+            )
+            if self._fts_enabled:
+                conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+                if new_status == "active" and (new_content or "").strip():
+                    conn.execute(
+                        "INSERT INTO memories_fts (memory_id, content) VALUES (?, ?)",
+                        (memory_id, new_content),
+                    )
+            conn.commit()
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            result = self._memory_row_to_dict(row) if row else None
+
+        self._sync_memory_markdown()
+        return result
+
+    def delete_memory(self, memory_id: str) -> bool:
+        updated = self.update_memory(memory_id, status="deleted")
+        return updated is not None
+
+    def touch_memories(self, memory_ids: list[str]) -> None:
+        unique_ids = [mid for mid in dict.fromkeys(memory_ids) if mid]
+        if not unique_ids:
+            return
+        now = utc_now_iso()
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE memories
+                SET access_count = COALESCE(access_count, 0) + 1,
+                    last_used_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now, *unique_ids],
+            )
+            conn.commit()
+
+    def search_memories(
+        self,
+        query: str,
+        *,
+        category: Optional[str] = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        clean_q = (query or "").strip()
+        if not clean_q:
+            return self.list_memories(status="active", category=category, limit=limit)
+
+        capped = max(1, min(int(limit), 50))
+        cat_clause = " AND m.category = ?" if (category and category in MEMORY_CATEGORIES) else ""
+        cat_params = [category] if cat_clause else []
+
+        with self._connect() as conn:
+            rows: list[sqlite3.Row] = []
+            # FTS5 trigram works best for >=3-char terms; fallback to LIKE for short or unmatched queries
+            if self._fts_enabled and len(clean_q) >= 3:
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT m.*
+                        FROM memories_fts f
+                        JOIN memories m ON m.id = f.memory_id
+                        WHERE f.content MATCH ?
+                          AND m.status = 'active'{cat_clause}
+                        ORDER BY m.pinned DESC, bm25(memories_fts), m.confidence DESC
+                        LIMIT ?
+                        """,
+                        [self._fts_phrase(clean_q), *cat_params, capped],
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+
+            if not rows:
+                tokens = [t for t in clean_q.split() if t]
+                if len(tokens) > 1:
+                    like_clauses = " AND ".join("m.content LIKE ?" for _ in tokens)
+                    like_params = [f"%{t}%" for t in tokens]
+                else:
+                    like_clauses = "m.content LIKE ?"
+                    like_params = [f"%{clean_q}%"]
+                rows = conn.execute(
+                    f"""
+                    SELECT m.*
+                    FROM memories m
+                    WHERE m.status = 'active'
+                      AND ({like_clauses}){cat_clause}
+                    ORDER BY m.pinned DESC, m.confidence DESC, m.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*like_params, *cat_params, capped],
+                ).fetchall()
+
+            return [self._memory_row_to_dict(r) for r in rows]
+
+    def search_history(
+        self,
+        query: str,
+        *,
+        topic_id: Optional[str] = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Search cross-topic conversation messages using FTS5 with LIKE fallback."""
+        clean_q = (query or "").strip()
+        if not clean_q:
+            return []
+
+        capped = max(1, min(int(limit), 30))
+        topic_clause = " AND m.topic_id = ?" if topic_id else ""
+        topic_params = [topic_id] if topic_id else []
+
+        with self._connect() as conn:
+            rows: list[sqlite3.Row] = []
+            if self._fts_enabled and len(clean_q) >= 3:
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT m.id, m.topic_id, m.role, m.content, m.created_at, t.title AS topic_title
+                        FROM messages_fts f
+                        JOIN messages m ON m.id = f.message_id
+                        LEFT JOIN topics t ON t.id = m.topic_id
+                        WHERE f.content MATCH ?
+                          AND COALESCE(t.status, 'active') != 'deleted'{topic_clause}
+                        ORDER BY bm25(messages_fts), m.rowid DESC
+                        LIMIT ?
+                        """,
+                        [self._fts_phrase(clean_q), *topic_params, capped],
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+
+            if not rows:
+                tokens = [t for t in clean_q.split() if t]
+                if len(tokens) > 1:
+                    like_clauses = " AND ".join("m.content LIKE ?" for _ in tokens)
+                    like_params = [f"%{t}%" for t in tokens]
+                else:
+                    like_clauses = "m.content LIKE ?"
+                    like_params = [f"%{clean_q}%"]
+                rows = conn.execute(
+                    f"""
+                    SELECT m.id, m.topic_id, m.role, m.content, m.created_at, t.title AS topic_title
+                    FROM messages m
+                    LEFT JOIN topics t ON t.id = m.topic_id
+                    WHERE ({like_clauses})
+                      AND COALESCE(t.status, 'active') != 'deleted'{topic_clause}
+                    ORDER BY m.rowid DESC
+                    LIMIT ?
+                    """,
+                    [*like_params, *topic_params, capped],
+                ).fetchall()
+
+            return [
+                {
+                    "id": r["id"],
+                    "topic_id": r["topic_id"],
+                    "topic_title": r["topic_title"] or GENERAL_TOPIC_TITLE,
+                    "role": r["role"],
+                    "content": r["content"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+
+    def list_messages_for_memory_extraction(self, *, limit: int = 24) -> list[dict[str, Any]]:
+        """Return chronological recent messages across active topics not yet distilled for memories."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.*
+                FROM messages m
+                JOIN topics t ON t.id = m.topic_id
+                WHERE t.status = 'active'
+                  AND LENGTH(TRIM(m.content)) >= 4
+                ORDER BY m.rowid DESC
+                LIMIT ?
+                """,
+                (max(limit * 4, limit),),
+            ).fetchall()
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                meta = _parse_metadata(row["metadata"])
+                if meta.get("streaming") or meta.get("source") == "heavy_agent_interim":
+                    continue
+                if meta.get("memory_extracted_at"):
+                    continue
+                hydrated = self._hydrate_message_row(conn, row)
+                topic = hydrated.get("topic")
+                hydrated["topic_title"] = (
+                    topic["title"]
+                    if isinstance(topic, dict) and topic.get("title")
+                    else GENERAL_TOPIC_TITLE
+                )
+                candidates.append(hydrated)
+                if len(candidates) >= limit:
+                    break
+            candidates.reverse()
+            return candidates
+
+    def mark_messages_memory_extracted(self, message_ids: list[str], extracted_at: str) -> None:
+        if not message_ids:
+            return
+        unique_ids = list(dict.fromkeys(message_ids))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, metadata FROM messages WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            for row in rows:
+                meta = _parse_metadata(row["metadata"])
+                meta["memory_extracted_at"] = extracted_at
+                conn.execute(
+                    "UPDATE messages SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=False), row["id"]),
+                )
+            conn.commit()

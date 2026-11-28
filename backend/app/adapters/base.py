@@ -147,6 +147,7 @@ class AdapterContext:
     thinking_override: Optional[ThinkingLevel] = None
     history: list[dict[str, Any]] = field(default_factory=list)
     topic_summary: Optional[str] = None
+    core_memories: list[dict[str, Any]] = field(default_factory=list)
     kiki_workspace_root: Optional[Path] = None
     topic_dir: Optional[Path] = None
     shared_dir: Optional[Path] = None
@@ -195,7 +196,10 @@ class AdapterContext:
 
     def build_workspace_context_block(self) -> str:
         """Return a concise workspace directory guide for cross-agent collaboration."""
-        if not (self.topic_dir or self.shared_dir or self.rules_dir or self.extra_dirs):
+        has_memory_file = bool(
+            self.kiki_workspace_root and (self.kiki_workspace_root / "MEMORY.md").is_file()
+        )
+        if not (self.topic_dir or self.shared_dir or self.rules_dir or self.extra_dirs or has_memory_file):
             return ""
         lines: list[str] = [
             "【Kiki 工作空间与协作目录】",
@@ -216,6 +220,10 @@ class AdapterContext:
                 lines.append(f"- 规则目录 (rules): {self.rules_dir}（可用规则文件: {rule_names}）")
             else:
                 lines.append(f"- 规则目录 (rules): {self.rules_dir}")
+        if self.kiki_workspace_root is not None:
+            mem_file = self.kiki_workspace_root / "MEMORY.md"
+            if mem_file.is_file():
+                lines.append(f"- 长期记忆文件 (MEMORY.md): {mem_file}")
         custom_extras = [
             p
             for p in self.extra_dirs
@@ -226,24 +234,26 @@ class AdapterContext:
         return "\n".join(lines)
 
     def build_task_prompt(self, max_history: int = 14) -> str:
-        """Build an execution prompt enriched with workspace context and recent topic history."""
-        ws_block = self.build_workspace_context_block()
-        if not self.history:
-            if not ws_block:
-                return self.user_content
-            return (
-                f"当前话题：{self.topic_title}\n"
-                f"{ws_block}\n\n"
-                f"用户当前任务：{self.user_content}"
-            )
+        """Build an execution prompt enriched with workspace context, core memories, and recent topic history."""
         from ..llm import KikiLLMClient
 
-        history_text = KikiLLMClient._format_context_lines(self.history[-max_history:])
+        ws_block = self.build_workspace_context_block()
+        mem_block = KikiLLMClient.format_core_memories_block(self.core_memories)
+
         header_parts = [f"当前话题：{self.topic_title}"]
         if self.topic_summary and self.topic_summary.strip():
             header_parts.append(f"话题摘要：{self.topic_summary.strip()}")
+        if mem_block:
+            header_parts.append(mem_block)
         if ws_block:
             header_parts.append(ws_block)
+
+        if not self.history:
+            if len(header_parts) == 1:
+                return self.user_content
+            return "\n".join(header_parts) + f"\n\n用户当前任务：{self.user_content}"
+
+        history_text = KikiLLMClient._format_context_lines(self.history[-max_history:])
         header = "\n".join(header_parts)
         return (
             f"{header}\n"

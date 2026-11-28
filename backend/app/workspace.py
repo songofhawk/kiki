@@ -248,3 +248,50 @@ class WorkspaceManager:
             if topic_rule.is_file():
                 files.append(topic_rule)
         return files
+
+    @property
+    def memory_file(self) -> Path:
+        return (self.workspace_root / "MEMORY.md").resolve()
+
+    def sync_memory_markdown(self, memories: list[dict[str, Any]]) -> Path:
+        """Mirror active SQLite memories to ~/.kiki/workspace/MEMORY.md for transparency & external CLI agents."""
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        category_titles = (
+            ("profile", "个人画像 (Profile)"),
+            ("preference", "偏好与约束 (Preference)"),
+            ("project", "长期项目背景 (Project)"),
+            ("lesson", "经验与踩坑 (Lesson)"),
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {k: [] for k, _ in category_titles}
+        for mem in memories:
+            if mem.get("status", "active") != "active":
+                continue
+            cat = str(mem.get("category") or "preference")
+            grouped.setdefault(cat, []).append(mem)
+
+        lines: list[str] = [
+            "# Kiki Long-Term Memory",
+            "",
+            "> 本文件由 Kiki 记忆系统自动同步自本地 SQLite，方便查阅或供外部 Agent 参考。",
+            "",
+        ]
+        has_any = False
+        for key, label in category_titles:
+            items = grouped.get(key) or []
+            if not items:
+                continue
+            has_any = True
+            lines.append(f"## {label}")
+            for item in items:
+                pin_prefix = "📌 " if item.get("pinned") else ""
+                content = str(item.get("content") or "").strip()
+                if content:
+                    lines.append(f"- {pin_prefix}{content}")
+            lines.append("")
+        if not has_any:
+            lines.append("（暂无长期记忆）")
+            lines.append("")
+
+        target = self.memory_file
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return target

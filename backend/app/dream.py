@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import Any, Callable, Optional
 
-from .db import GENERAL_TOPIC_ID, Database, utc_now_iso
+from .db import GENERAL_TOPIC_ID, MEMORY_CATEGORIES, Database, utc_now_iso
 from .llm import KikiLLMClient
 from .sse import EventBus
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class DreamConsolidator:
-    """Quietly consolidates 日常闲聊 messages and topic summaries while Kiki is idle."""
+    """Quietly consolidates 日常闲聊 messages, rolling topic summaries, and long-term memories while Kiki is idle."""
 
     def __init__(
         self,
@@ -31,6 +32,8 @@ class DreamConsolidator:
         min_move_confidence: float = 0.78,
         min_create_confidence: float = 0.82,
         min_create_messages: int = 3,
+        min_memory_confidence: float = 0.78,
+        summary_refresh_delta: int = 10,
     ) -> None:
         self.db = db
         self.llm = llm
@@ -43,6 +46,8 @@ class DreamConsolidator:
         self.min_move_confidence = min_move_confidence
         self.min_create_confidence = min_create_confidence
         self.min_create_messages = min_create_messages
+        self.min_memory_confidence = min_memory_confidence
+        self.summary_refresh_delta = summary_refresh_delta
 
         now = time.monotonic()
         self._last_activity_at: float = now
@@ -140,23 +145,54 @@ class DreamConsolidator:
             for t in active_topics:
                 if t["id"] == GENERAL_TOPIC_ID:
                     continue
-                if not (t.get("summary") or "").strip() and int(t.get("message_count") or 0) >= 2:
-                    recent = self.db.get_topic_history(t["id"], limit=6)
+                msg_count = int(t.get("message_count") or 0)
+                summarized_count = int(t.get("summary_msg_count") or 0)
+                has_summary = bool((t.get("summary") or "").strip())
+                needs_initial = (not has_summary) and msg_count >= 2
+                needs_rolling_refresh = (
+                    has_summary
+                    and self.summary_refresh_delta > 0
+                    and (msg_count - summarized_count) >= self.summary_refresh_delta
+                )
+                if needs_initial or needs_rolling_refresh:
+                    recent = self.db.get_topic_history(t["id"], limit=10)
                     if recent:
                         topics_to_summarize.append({**t, "recent_messages": recent})
                 if len(topics_to_summarize) >= 5:
                     break
 
-            if not general_messages and not topics_to_summarize:
+            existing_memories = (
+                self.db.list_memories(status="active", limit=40)
+                if hasattr(self.db, "list_memories")
+                else []
+            )
+            memory_candidates = (
+                self.db.list_messages_for_memory_extraction(limit=self.batch_size)
+                if hasattr(self.db, "list_messages_for_memory_extraction")
+                else []
+            )
+
+            if not general_messages and not topics_to_summarize and not memory_candidates:
                 self._last_dream_at = time.monotonic()
                 self._topics_changed_since_dream = False
                 return {"ran": False, "reason": "nothing_to_consolidate"}
 
-            plan = await self.llm.consolidate_dream(
-                active_topics=active_topics,
-                general_messages=general_messages,
-                topics_to_summarize=topics_to_summarize,
+            consolidate_sig = inspect.signature(self.llm.consolidate_dream)
+            has_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in consolidate_sig.parameters.values()
             )
+            dream_kwargs: dict[str, Any] = {
+                "active_topics": active_topics,
+                "general_messages": general_messages,
+                "topics_to_summarize": topics_to_summarize,
+            }
+            if has_varkw or "existing_memories" in consolidate_sig.parameters:
+                dream_kwargs["existing_memories"] = existing_memories
+            if has_varkw or "memory_candidates" in consolidate_sig.parameters:
+                dream_kwargs["memory_candidates"] = memory_candidates
+
+            plan = await self.llm.consolidate_dream(**dream_kwargs)
 
             # Yield immediately if foreground user activity happened while waiting on LLM
             if not force and self._activity_epoch != start_epoch:
@@ -241,16 +277,70 @@ class DreamConsolidator:
                     item.topic_id in active_non_general
                     and summary_text
                 ):
-                    updated_topic = self.db.update_topic(item.topic_id, summary=summary_text)
+                    current_topic = self.db.get_topic(item.topic_id) or active_non_general[item.topic_id]
+                    updated_topic = self.db.update_topic(
+                        item.topic_id,
+                        summary=summary_text,
+                        summary_msg_count=int(current_topic.get("message_count") or 0),
+                    )
                     if updated_topic:
                         updated_summaries.append(item.topic_id)
                         touched_topic_ids.add(item.topic_id)
 
+            existing_mem_ids = {m["id"] for m in existing_memories}
+            memories_added: list[str] = []
+            memories_updated: list[str] = []
+            memories_invalidated: list[str] = []
+            for op in getattr(plan, "memory_ops", None) or []:
+                if float(op.confidence) < self.min_memory_confidence:
+                    continue
+                if op.action == "add":
+                    content_text = (op.content or "").strip()
+                    if not content_text:
+                        continue
+                    cat = op.category if op.category in MEMORY_CATEGORIES else "preference"
+                    src_tid = op.source_topic_id if op.source_topic_id in active_non_general else None
+                    created_mem = self.db.create_memory(
+                        content=content_text,
+                        category=cat,
+                        source_topic_id=src_tid,
+                        confidence=float(op.confidence),
+                    )
+                    memories_added.append(created_mem["id"])
+                    self.event_bus.publish("memory_updated", {"action": "created", "memory": created_mem})
+                elif op.action == "update":
+                    content_text = (op.content or "").strip()
+                    if not op.memory_id or op.memory_id not in existing_mem_ids or not content_text:
+                        continue
+                    cat = op.category if op.category in MEMORY_CATEGORIES else None
+                    updated_mem = self.db.update_memory(
+                        op.memory_id,
+                        content=content_text,
+                        category=cat,
+                        confidence=float(op.confidence),
+                    )
+                    if updated_mem:
+                        memories_updated.append(updated_mem["id"])
+                        self.event_bus.publish("memory_updated", {"action": "updated", "memory": updated_mem})
+                elif op.action == "invalidate":
+                    if not op.memory_id or op.memory_id not in existing_mem_ids:
+                        continue
+                    inv_mem = self.db.update_memory(op.memory_id, status="superseded")
+                    if inv_mem:
+                        memories_invalidated.append(inv_mem["id"])
+                        self.event_bus.publish("memory_updated", {"action": "deleted", "memory_id": inv_mem["id"]})
+
+            now_iso = utc_now_iso()
             remaining_checked_ids = [
                 m["id"] for m in general_messages if m["id"] not in migrated_ids
             ]
             if remaining_checked_ids:
-                self.db.mark_messages_dream_checked(remaining_checked_ids, utc_now_iso())
+                self.db.mark_messages_dream_checked(remaining_checked_ids, now_iso)
+            if memory_candidates and hasattr(self.db, "mark_messages_memory_extracted"):
+                self.db.mark_messages_memory_extracted(
+                    [m["id"] for m in memory_candidates],
+                    now_iso,
+                )
 
             for tid in touched_topic_ids:
                 refreshed = self.db.get_topic(tid)
@@ -265,4 +355,7 @@ class DreamConsolidator:
                 "migrated_count": len(migrated_messages_out),
                 "created_topics": [t["id"] for t in created_topics_out],
                 "updated_summaries": updated_summaries,
+                "memories_added": memories_added,
+                "memories_updated": memories_updated,
+                "memories_invalidated": memories_invalidated,
             }

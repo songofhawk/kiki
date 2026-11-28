@@ -403,6 +403,11 @@ class FastPathService:
         history = self.db.get_recent_messages_with_topic(limit=12, topic_id=topic_id)
         # Remove the current user message from history so it isn't duplicated (safe under concurrency)
         history = [m for m in history if m.get("id") != user_message_id]
+        core_memories = (
+            self.db.list_core_memories(limit=20)
+            if hasattr(self.db, "list_core_memories")
+            else []
+        )
 
         placeholder = self.db.create_message(
             topic_id=topic_id,
@@ -418,6 +423,8 @@ class FastPathService:
                 message_id=placeholder["id"],
                 topic_id=topic_id,
                 topic_title=topic["title"],
+                topic_summary=topic.get("summary"),
+                core_memories=core_memories,
                 user_content=user_content,
                 history=history,
             )
@@ -433,15 +440,27 @@ class FastPathService:
         topic_title: str,
         user_content: str,
         history: list[dict[str, str]],
+        topic_summary: Optional[str] = None,
+        core_memories: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self.event_bus.publish_kiki_status("thinking", reason="Kiki 正在回复...")
         chunks: list[str] = []
         cancelled = False
         try:
+            sig = inspect.signature(self.llm.stream_fast_reply)
+            has_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            extra_kwargs: dict[str, Any] = {}
+            if has_varkw or "topic_summary" in sig.parameters:
+                extra_kwargs["topic_summary"] = topic_summary
+            if has_varkw or "core_memories" in sig.parameters:
+                extra_kwargs["core_memories"] = core_memories
             async for delta in self.llm.stream_fast_reply(
                 content=user_content,
                 history=history,
                 topic_title=topic_title,
+                **extra_kwargs,
             ):
                 chunks.append(delta)
                 self.event_bus.publish(

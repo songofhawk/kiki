@@ -225,6 +225,71 @@ AGENT_TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "recall_memory",
+        "description": "Search Kiki's local long-term memories and cross-topic conversation history for past decisions, preferences, project context, or lessons learned.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords or phrase to search in memories and past conversations.",
+                },
+                "include_history": {
+                    "type": "boolean",
+                    "description": "Whether to also search cross-topic message history (default true).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results per section (1-15, default 6).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "save_memory",
+        "description": "Save a durable long-term memory about the user (profile, preference, project context, or lesson learned) when explicitly asked to remember something or when discovering a reusable long-term constraint.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Concise, self-contained fact or preference to remember (under 100 chars).",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["profile", "preference", "project", "lesson"],
+                    "description": "Memory category (default 'preference').",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "Pin so this memory is always included in core prompt context (default false).",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "forget_memory",
+        "description": "Delete/forget a previously saved long-term memory by memory_id or matching query when the user asks to forget or correct it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "Exact memory ID (e.g. 'mem-...') to delete.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Keywords to locate and delete matching memory if memory_id is unknown.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
         "name": "request_human_approval",
         "description": "Pause execution and ask the human user to approve or choose an option before proceeding with a risky, destructive, or ambiguous action.",
         "parameters": {
@@ -502,6 +567,89 @@ class WorkspaceToolExecutor:
             combined = combined[:4000] + "\n... (output truncated)"
         return combined, is_error
 
+    def recall_memory(
+        self,
+        query: str,
+        *,
+        include_history: bool = True,
+        limit: int = 6,
+    ) -> str:
+        clean_q = (query or "").strip()
+        if not clean_q:
+            raise ValueError("recall_memory 需要提供非空的查询词 query。")
+        capped = max(1, min(int(limit or 6), 15))
+        memories = self.db.search_memories(clean_q, limit=capped)
+        if memories:
+            self.db.touch_memories([m["id"] for m in memories])
+
+        lines: list[str] = [f"记忆检索结果（关键词：{clean_q}）："]
+        if memories:
+            lines.append("\n### 长期记忆")
+            for m in memories:
+                pin = " [置顶]" if m.get("pinned") else ""
+                lines.append(f"- ({m['id']}) [{m['category']}]{pin} {m['content']}")
+        else:
+            lines.append("\n### 长期记忆\n（未找到匹配的长期记忆）")
+
+        if include_history:
+            history_hits = self.db.search_history(clean_q, limit=capped)
+            if history_hits:
+                lines.append("\n### 跨话题历史消息")
+                for h in history_hits:
+                    snippet = " ".join(str(h.get("content") or "").split())
+                    if len(snippet) > 180:
+                        snippet = snippet[:180] + "…"
+                    role_label = "用户" if h.get("role") == "user" else "Kiki"
+                    lines.append(f"- [#{h.get('topic_title')}] {role_label}: {snippet}")
+            else:
+                lines.append("\n### 跨话题历史消息\n（未找到匹配的历史消息）")
+        return "\n".join(lines)
+
+    def save_memory(
+        self,
+        *,
+        run_id: str,
+        content: str,
+        category: str = "preference",
+        pinned: bool = False,
+    ) -> str:
+        run = self.db.get_session_run(run_id) if run_id else None
+        source_topic_id = run["topic_id"] if run else None
+        mem = self.db.create_memory(
+            content=content,
+            category=category,
+            source_topic_id=source_topic_id,
+            confidence=1.0,
+            pinned=pinned,
+        )
+        self.event_bus.publish("memory_updated", {"action": "created", "memory": mem})
+        return f"已记住长期记忆 ({mem['id']}, category={mem['category']}): {mem['content']}"
+
+    def forget_memory(
+        self,
+        *,
+        memory_id: Optional[str] = None,
+        query: Optional[str] = None,
+    ) -> str:
+        mid = (memory_id or "").strip() if isinstance(memory_id, str) else ""
+        if mid:
+            ok = self.db.delete_memory(mid)
+            if not ok:
+                return f"未找到记忆 ID: {mid}"
+            self.event_bus.publish("memory_updated", {"action": "deleted", "memory_id": mid})
+            return f"已删除记忆 ({mid})。"
+
+        q = (query or "").strip() if isinstance(query, str) else ""
+        if not q:
+            raise ValueError("forget_memory 需要提供 memory_id 或 query。")
+        matches = self.db.search_memories(q, limit=3)
+        if not matches:
+            return f"未找到与「{q}」匹配的长期记忆。"
+        target = matches[0]
+        self.db.delete_memory(target["id"])
+        self.event_bus.publish("memory_updated", {"action": "deleted", "memory_id": target["id"]})
+        return f"已删除匹配记忆 ({target['id']}): {target['content']}"
+
     async def execute(self, run_id: str, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
         """Execute a non-HITL workspace tool. Returns (result_text, is_error)."""
         try:
@@ -546,6 +694,24 @@ class WorkspaceToolExecutor:
                     max_chars=int(arguments.get("max_chars", 6000) or 6000),
                 )
                 return content, False
+            if name == "recall_memory":
+                return self.recall_memory(
+                    query=str(arguments.get("query", "")),
+                    include_history=bool(arguments.get("include_history", True)),
+                    limit=int(arguments.get("limit", 6) or 6),
+                ), False
+            if name == "save_memory":
+                return self.save_memory(
+                    run_id=run_id,
+                    content=str(arguments.get("content", "")),
+                    category=str(arguments.get("category", "preference") or "preference"),
+                    pinned=bool(arguments.get("pinned", False)),
+                ), False
+            if name == "forget_memory":
+                return self.forget_memory(
+                    memory_id=arguments.get("memory_id"),
+                    query=arguments.get("query"),
+                ), False
             return f"Unknown tool: {name}", True
         except Exception as exc:
             return f"Tool '{name}' failed: {exc}", True

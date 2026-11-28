@@ -56,6 +56,7 @@ import UnifiedMessageList from './components/UnifiedMessageList';
 import LogDrawer from './components/LogDrawer';
 import ToastContainer from './components/ToastContainer';
 import WorkspaceModal from './components/WorkspaceModal';
+import MemoryModal from './components/MemoryModal';
 import DesktopTakeoverModal from './components/DesktopTakeoverModal';
 import ArtifactPreviewModal, {
   type ArtifactPreviewItem,
@@ -397,6 +398,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
 
   const [activeDrawerRunId, setActiveDrawerRunId] = useState<string | null>(null);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
   const [workspaceTargetTopic, setWorkspaceTargetTopic] = useState<Topic | null>(null);
   const [desktopModalOpen, setDesktopModalOpen] = useState(false);
   const [desktopContext, setDesktopContext] = useState<DesktopTakeoverContext | null>(null);
@@ -1764,6 +1766,7 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
             setWorkspaceTargetTopic(topic);
             setWorkspaceModalOpen(true);
           }}
+          onOpenMemoryModal={() => setMemoryModalOpen(true)}
           onReassignMessage={handleReassignMessage}
           authUsername={authUsername}
           onLogout={onLogout}
@@ -1794,6 +1797,10 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
                 setMobileSidebarOpen(false);
                 setWorkspaceTargetTopic(topic);
                 setWorkspaceModalOpen(true);
+              }}
+              onOpenMemoryModal={() => {
+                setMobileSidebarOpen(false);
+                setMemoryModalOpen(true);
               }}
               onReassignMessage={handleReassignMessage}
               authUsername={authUsername}
@@ -2262,6 +2269,13 @@ const KikiWorkspace: React.FC<KikiWorkspaceProps> = ({
           setWorkspaceModalOpen(false);
           setWorkspaceTargetTopic(null);
         }}
+      />
+
+      {/* Long-Term Memory Management Modal */}
+      <MemoryModal
+        open={memoryModalOpen}
+        onClose={() => setMemoryModalOpen(false)}
+        onSelectTopic={(tid) => void handleSelectTopic(tid)}
       />
 
       {/* Server Desktop Takeover Modal */}

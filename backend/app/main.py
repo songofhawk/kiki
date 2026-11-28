@@ -36,6 +36,11 @@ from .schemas import (
     DirectoryEntry,
     GlobalWorkspaceResponse,
     HealthResponse,
+    HistorySearchHit,
+    MemoryCreateRequest,
+    MemoryItem,
+    MemorySearchResponse,
+    MemoryUpdateRequest,
     MessageItem,
     MessagePageResponse,
     MessageTopicReassignRequest,
@@ -176,6 +181,7 @@ def create_app(
         database.init_db()
         database.ensure_all_topic_workspaces()
         database.reconcile_orphaned_state()
+        database._sync_memory_markdown()
         cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
         dream_consolidator.start()
 
@@ -582,6 +588,79 @@ def create_app(
         if callable(probe_fn):
             return await probe_fn()
         return await get_llm_status()
+
+    # ------------------------------------------------------------------
+    # Long-Term Memories & Cross-Topic Recall
+    # ------------------------------------------------------------------
+    @app.get("/api/memories", response_model=list[MemoryItem])
+    async def list_memories(
+        category: Optional[Literal["profile", "preference", "project", "lesson"]] = Query(default=None),
+        status: Optional[Literal["active", "superseded", "deleted"]] = Query(default="active"),
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> list[MemoryItem]:
+        items = database.list_memories(status=status, category=category, limit=limit)
+        return [MemoryItem.model_validate(m) for m in items]
+
+    @app.get("/api/memories/search", response_model=MemorySearchResponse)
+    async def search_memories_endpoint(
+        q: str = Query(..., min_length=1),
+        category: Optional[Literal["profile", "preference", "project", "lesson"]] = Query(default=None),
+        include_history: bool = Query(default=True),
+        limit: int = Query(default=10, ge=1, le=30),
+    ) -> MemorySearchResponse:
+        mem_hits = database.search_memories(q, category=category, limit=limit)
+        hist_hits = database.search_history(q, limit=limit) if include_history else []
+        return MemorySearchResponse(
+            query=q,
+            memories=[MemoryItem.model_validate(m) for m in mem_hits],
+            history=[HistorySearchHit.model_validate(h) for h in hist_hits],
+        )
+
+    @app.post("/api/memories", response_model=MemoryItem, status_code=201)
+    async def create_memory_endpoint(req: MemoryCreateRequest) -> MemoryItem:
+        try:
+            mem = database.create_memory(
+                content=req.content,
+                category=req.category,
+                source_topic_id=req.source_topic_id,
+                confidence=1.0,
+                pinned=req.pinned,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        bus.publish("memory_updated", {"action": "created", "memory": mem})
+        return MemoryItem.model_validate(mem)
+
+    @app.patch("/api/memories/{memory_id}", response_model=MemoryItem)
+    async def update_memory_endpoint(
+        memory_id: str,
+        req: MemoryUpdateRequest,
+    ) -> MemoryItem:
+        try:
+            mem = database.update_memory(
+                memory_id,
+                content=req.content,
+                category=req.category,
+                pinned=req.pinned,
+                status=req.status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if mem is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        bus.publish("memory_updated", {"action": "updated", "memory": mem})
+        return MemoryItem.model_validate(mem)
+
+    @app.delete("/api/memories/{memory_id}", status_code=204)
+    async def delete_memory_endpoint(memory_id: str) -> None:
+        ok = database.delete_memory(memory_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        bus.publish("memory_updated", {"action": "deleted", "memory_id": memory_id})
+
+    @app.post("/api/memories/consolidate")
+    async def consolidate_memories_now() -> dict[str, Any]:
+        return await dream_consolidator.run_once(force=True, ignore_busy=True)
 
     # ------------------------------------------------------------------
     # Topics

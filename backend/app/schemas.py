@@ -81,9 +81,20 @@ class DreamTopicSummaryUpdate(BaseModel):
     summary: str
 
 
+class DreamMemoryOperation(BaseModel):
+    action: Literal["add", "update", "invalidate"]
+    memory_id: Optional[str] = None
+    category: Optional[Literal["profile", "preference", "project", "lesson"]] = None
+    content: Optional[str] = None
+    source_topic_id: Optional[str] = None
+    confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+    reasoning: str = Field(default="")
+
+
 class DreamConsolidationPlan(BaseModel):
     migrations: list[DreamMigrationGroup] = Field(default_factory=list)
     topic_summaries: list[DreamTopicSummaryUpdate] = Field(default_factory=list)
+    memory_ops: list[DreamMemoryOperation] = Field(default_factory=list)
     reasoning: str = Field(default="")
 
 
@@ -343,3 +354,46 @@ class RunResumeRequest(BaseModel):
 
 class RunActionResponse(BaseModel):
     run: SessionRunDetail
+
+
+class MemoryItem(BaseModel):
+    id: str
+    category: Literal["profile", "preference", "project", "lesson"] = "preference"
+    content: str
+    source_topic_id: Optional[str] = None
+    confidence: float = 0.9
+    pinned: bool = False
+    status: Literal["active", "superseded", "deleted"] = "active"
+    access_count: int = 0
+    last_used_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class MemoryCreateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=500)
+    category: Literal["profile", "preference", "project", "lesson"] = "preference"
+    source_topic_id: Optional[str] = None
+    pinned: bool = False
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    category: Optional[Literal["profile", "preference", "project", "lesson"]] = None
+    pinned: Optional[bool] = None
+    status: Optional[Literal["active", "superseded", "deleted"]] = None
+
+
+class HistorySearchHit(BaseModel):
+    id: str
+    topic_id: str
+    topic_title: str
+    role: str
+    content: str
+    created_at: str
+
+
+class MemorySearchResponse(BaseModel):
+    query: str
+    memories: list[MemoryItem] = Field(default_factory=list)
+    history: list[HistorySearchHit] = Field(default_factory=list)

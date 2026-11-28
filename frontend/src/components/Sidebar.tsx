@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Archive, Check, Hash, Layers, Loader2, LogOut, PawPrint, Pencil, Plus, Settings, X } from 'lucide-react';
+import { Archive, Brain, Check, Hash, Layers, Loader2, LogOut, PawPrint, Pencil, Plus, Settings, X } from 'lucide-react';
 import type { KikiStatus, ReassignTopicPayload, Topic } from '../types';
 import KikiAvatar, { KIKI_POSE_LABELS, KIKI_STATUS_LABELS, type KikiPose } from './KikiAvatar';
 import UserAvatar from './UserAvatar';
@@ -18,6 +18,7 @@ export interface SidebarProps {
   onRenameTopic?: (topicId: string, title: string) => Promise<void> | void;
   onArchiveTopic?: (topicId: string) => Promise<void> | void;
   onOpenTopicSettings?: (topic: Topic) => void;
+  onOpenMemoryModal?: () => void;
   onReassignMessage: (
     messageId: string,
     payload: ReassignTopicPayload
@@ -39,6 +40,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onRenameTopic,
   onArchiveTopic,
   onOpenTopicSettings,
+  onOpenMemoryModal,
   onReassignMessage,
   authUsername = null,
   onLogout,
@@ -143,7 +145,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Primary Navigation */}
-      <div className="px-3 pt-3 pb-2">
+      <div className="px-3 pt-3 pb-2 space-y-1">
         <button
           type="button"
           onClick={onSelectAllStream}
@@ -163,6 +165,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="text-[11px] text-[#8C8378] font-normal">全局流</span>
           </span>
         </button>
+        {onOpenMemoryModal && (
+          <button
+            type="button"
+            onClick={onOpenMemoryModal}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-sm font-medium text-[#5A534C] hover:bg-[#ECE6DD] border border-transparent transition-all"
+          >
+            <span className="flex items-center gap-2.5">
+              <Brain className="w-4 h-4 text-amber-600/80" />
+              <span>长期记忆</span>
+              <span className="text-[11px] text-[#8C8378] font-normal">Memory</span>
+            </span>
+          </button>
+        )}
       </div>
 
       {/* Active Topics List */}

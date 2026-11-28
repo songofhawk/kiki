@@ -344,3 +344,45 @@ export interface DesktopTakeoverContext {
   instructions?: string | null;
   url?: string | null;
 }
+
+export type MemoryCategory = 'profile' | 'preference' | 'project' | 'lesson';
+
+export interface MemoryItem {
+  id: string;
+  category: MemoryCategory;
+  content: string;
+  source_topic_id?: string | null;
+  confidence: number;
+  pinned: boolean;
+  status: 'active' | 'superseded' | 'deleted';
+  access_count: number;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HistorySearchHit {
+  id: string;
+  topic_id: string;
+  topic_title: string;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+export interface MemorySearchResponse {
+  query: string;
+  memories: MemoryItem[];
+  history: HistorySearchHit[];
+}
+
+export interface MemoryConsolidateResult {
+  ran: boolean;
+  reason?: string;
+  migrated_count?: number;
+  created_topics?: string[];
+  updated_summaries?: string[];
+  memories_added?: string[];
+  memories_updated?: string[];
+  memories_invalidated?: string[];
+}

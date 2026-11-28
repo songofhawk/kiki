@@ -89,7 +89,10 @@ BACKTRACK_SYSTEM_PROMPT_TEMPLATE = """你是一个话题历史回溯整理助手
 """
 
 DREAM_SYSTEM_PROMPT_TEMPLATE = """你是 Kiki 在后台空闲打盹时的“做梦记忆整理”引擎。
-你的职责：在用户不知不觉中，安静地整理“日常闲聊（topic-general）”里被错放或逐渐成形的历史对话，并为缺少/过时摘要的活跃话题补全一句话摘要。
+你的职责有三项：
+1. 安静地整理“日常闲聊（topic-general）”里被错放或逐渐成形的历史对话。
+2. 为缺少摘要或新增较多对话的活跃话题生成/滚动更新简洁的状态摘要（保留已有关键决策与最新进展，不超过 120 字）。
+3. 从近期对话中提炼高价值的**长期记忆**（个人画像 `profile`、偏好与约束 `preference`、长期项目背景 `project`、经验与踩坑 `lesson`），并与现有长期记忆对比，执行新增（`add`）、更新（`update`）或废弃冲突旧记忆（`invalidate`）。
 
 现有活跃话题（含已有摘要）：
 {active_topics_json}
@@ -97,8 +100,14 @@ DREAM_SYSTEM_PROMPT_TEMPLATE = """你是 Kiki 在后台空闲打盹时的“做�
 待整理的“日常闲聊”历史消息（按时间从早到晚排列）：
 {general_messages_text}
 
-缺少摘要或需要刷新摘要的话题近期内容：
+缺少摘要或需要滚动刷新摘要的话题近期内容：
 {topics_to_summarize_text}
+
+现有长期记忆（用于去重与冲突更新）：
+{existing_memories_json}
+
+近期尚未提炼记忆的跨话题对话：
+{memory_candidates_text}
 
 请输出 JSON，切勿包含其他多余字符：
 {{
@@ -116,7 +125,18 @@ DREAM_SYSTEM_PROMPT_TEMPLATE = """你是 Kiki 在后台空闲打盹时的“做�
   "topic_summaries": [
     {{
       "topic_id": "topic-...",
-      "summary": "一句简明扼要的话题摘要（不超过40字）"
+      "summary": "简明扼要的话题滚动状态摘要（保留关键结论/决定与当前进展，不超过120字）"
+    }}
+  ],
+  "memory_ops": [
+    {{
+      "action": "add" | "update" | "invalidate",
+      "memory_id": "已有记忆 ID（仅 update/invalidate 时填写，add 时为 null）",
+      "category": "profile" | "preference" | "project" | "lesson",
+      "content": "一句凝练、客观、可跨话题复用的长期事实（不超过80字；invalidate 时可为 null）",
+      "source_topic_id": "来源话题 ID（可选）",
+      "confidence": 0.0 - 1.0,
+      "reasoning": "简短说明提炼或更新理由"
     }}
   ],
   "reasoning": "本次做梦整理的整体说明"
@@ -125,9 +145,13 @@ DREAM_SYSTEM_PROMPT_TEMPLATE = """你是 Kiki 在后台空闲打盹时的“做�
 整理原则（宁缺毋滥）：
 1. 仅当确信“日常闲聊”里的某些消息明显属于某个已有非闲聊话题时，使用 `move_to_existing`（建议 `confidence >= 0.78`）。切勿把消息迁移到 `topic-general`。
 2. 仅当“日常闲聊”里存在连续多条（至少 2 轮/3 条以上）围绕同一个具体主题展开的实质性对话、且现有活跃话题都无法覆盖时，才使用 `create_topic` 新建简短话题（建议 `confidence >= 0.82`）。
-3. 纯寒暄（如“早安”“哈哈”“好的”）、一次性随口吐槽不要强行归类或建话题，保持在“日常闲聊”即可。
-4. `message_ids` 必须严格来自上述待整理消息列表，并将对应的用户提问与 Kiki 回复一并选入。
-5. 若暂无需要整理的内容，返回空的 `migrations: []`。
+3. 纯寒暄（如“早安”“哈哈”“好的”）、一次性随口吐槽不要强行归类、建话题或写入长期记忆。
+4. `message_ids` 必须严格来自待整理“日常闲聊”消息列表，并将对应的用户提问与 Kiki 回复一并选入。
+5. **长期记忆提炼原则**：
+   - 只提炼**跨话题有长期复用价值**的事实（如主人的职业/背景/称呼、工具/语言/排版偏好、长期在做的项目、明确踩过的坑）。
+   - 切勿记录一次性任务琐事（如“帮我查一下今天天气”）、临时报错或敏感密码/API Key。
+   - 若新对话与现有记忆语义重复，不要重复 `add`；若主人的偏好或现状发生变化，优先用 `update` 修改原 `memory_id`，或用 `invalidate` 废弃旧记忆后再 `add` 新记忆。
+6. 若暂无需要整理的内容，对应数组返回空 `[]`。
 """
 
 KIKI_FAST_SYSTEM_PROMPT = """你是 Kiki，一只聪明、温暖、略带一点傲娇小性格的手绘风蓝灰虎斑小猫个人智能体（Personal Agent）。
@@ -1469,8 +1493,10 @@ class KikiLLMClient:
         active_topics: list[dict[str, Any]],
         general_messages: list[dict[str, Any]],
         topics_to_summarize: Optional[list[dict[str, Any]]] = None,
+        existing_memories: Optional[list[dict[str, Any]]] = None,
+        memory_candidates: Optional[list[dict[str, Any]]] = None,
     ) -> DreamConsolidationPlan:
-        if not general_messages and not topics_to_summarize:
+        if not general_messages and not topics_to_summarize and not memory_candidates:
             return DreamConsolidationPlan(reasoning="暂无需要做梦整理的内容")
 
         compact_topics = [
@@ -1492,13 +1518,29 @@ class KikiLLMClient:
                 + self._format_context_lines(msgs)
             )
 
+        compact_memories = [
+            {
+                "id": m["id"],
+                "category": m.get("category", "preference"),
+                "content": m.get("content", ""),
+                "pinned": bool(m.get("pinned", False)),
+            }
+            for m in (existing_memories or [])[:40]
+        ]
+
         system_instruction = DREAM_SYSTEM_PROMPT_TEMPLATE.format(
             active_topics_json=json.dumps(compact_topics, ensure_ascii=False, indent=2),
             general_messages_text=self._format_context_lines(general_messages, include_id=True),
             topics_to_summarize_text="\n\n".join(summary_blocks) if summary_blocks else "（无）",
+            existing_memories_json=json.dumps(compact_memories, ensure_ascii=False, indent=2)
+            if compact_memories
+            else "[]",
+            memory_candidates_text=self._format_context_lines(memory_candidates)
+            if memory_candidates
+            else "（无）",
         )
         parsed, last_exc = await self._run_structured_json(
-            input_text="请整理待处理的日常闲聊记录并生成必要的话题摘要。",
+            input_text="请整理待处理的日常闲聊记录、更新话题滚动摘要并提炼高价值长期记忆。",
             system_instruction=system_instruction,
             schema_cls=DreamConsolidationPlan,
             call_label="Dream Model",
@@ -1509,16 +1551,49 @@ class KikiLLMClient:
         return DreamConsolidationPlan(
             migrations=[],
             topic_summaries=[],
+            memory_ops=[],
             reasoning=f"做梦模型暂不可用 ({type(last_exc).__name__ if last_exc else 'Error'})",
         )
+
+    @staticmethod
+    def format_core_memories_block(memories: Optional[list[dict[str, Any]]]) -> str:
+        if not memories:
+            return ""
+        cat_labels = {
+            "profile": "画像",
+            "preference": "偏好",
+            "project": "项目",
+            "lesson": "经验",
+        }
+        lines: list[str] = []
+        for mem in memories[:20]:
+            text = str(mem.get("content") or "").strip()
+            if not text:
+                continue
+            cat = cat_labels.get(str(mem.get("category") or "preference"), "记忆")
+            pin = "★" if mem.get("pinned") else ""
+            lines.append(f"- [{cat}{pin}] {text}")
+        if not lines:
+            return ""
+        return "【关于主人的长期记忆（请自然遵循，无需刻意复述）】\n" + "\n".join(lines)
 
     async def stream_fast_reply(
         self,
         content: str,
         history: list[dict[str, str]],
         topic_title: str,
+        topic_summary: Optional[str] = None,
+        core_memories: Optional[list[dict[str, Any]]] = None,
     ) -> AsyncIterator[str]:
         system_instruction = KIKI_FAST_SYSTEM_PROMPT.format(topic_title=topic_title)
+        extra_sections: list[str] = []
+        if topic_summary and topic_summary.strip():
+            extra_sections.append(f"【当前话题滚动摘要】\n{topic_summary.strip()}")
+        mem_block = self.format_core_memories_block(core_memories)
+        if mem_block:
+            extra_sections.append(mem_block)
+        if extra_sections:
+            system_instruction = system_instruction.rstrip() + "\n\n" + "\n\n".join(extra_sections)
         # Format recent conversation context cleanly for stateless Interactions call
         context_lines: list[str] = []
         for msg in history[-10:]:
