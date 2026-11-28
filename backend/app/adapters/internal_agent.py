@@ -443,7 +443,7 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                         )
                         ctx.finish_step(steer_step["id"], status="success")
                         if turn >= step_budget:
-                            step_budget = min(step_budget + 4, 40)
+                            step_budget = min(hard_step_cap, step_budget + 4)
                         input_data = steering_prompt
                         continue
                 final_text = getattr(interaction, "output_text", None) or ""
@@ -547,7 +547,7 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                 elif tool_name in COMPUTER_USE_TOOL_NAMES:
                     if not used_computer_use:
                         used_computer_use = True
-                        step_budget = cu_max_steps
+                        step_budget = max(step_budget, cu_max_steps)
                     if cu_executor is None:
                         result_text = json.dumps(
                             {"ok": False, "error": "ComputerUse 桌面控制当前未启用或不可用。"},
@@ -640,7 +640,7 @@ class InternalAgentAdapter(HeavyTaskAdapter):
                     )
                     ctx.finish_step(steer_step["id"], status="success")
                     if turn >= step_budget - 1:
-                        step_budget = min(step_budget + 4, 40)
+                        step_budget = min(hard_step_cap, step_budget + 4)
                     function_results.append({"type": "text", "text": steering_prompt})
 
             input_data = function_results
@@ -682,6 +682,7 @@ class InternalAgentAdapter(HeavyTaskAdapter):
             metadata={
                 "adapter": self.agent_type,
                 "max_steps_reached": not completed_cleanly,
+                "step_budget": step_budget,
                 "used_computer_use": used_computer_use,
             },
         )

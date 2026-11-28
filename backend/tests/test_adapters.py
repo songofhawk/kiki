@@ -920,6 +920,151 @@ print("  --model <model>  Model for the current session. Currently supported: (h
     assert wb.select_profile("实现用户分页查询接口").model == "hy4std"
 
 
+@pytest.mark.asyncio
+async def test_internal_agent_steering_does_not_shrink_high_step_budget(tmp_path: Path):
+    """Steering near a >40 step budget (e.g. ComputerUse budget=80) must expand instead of clamping to 40."""
+    adapter = InternalAgentAdapter()
+    ctx = _make_context(tmp_path, "连续操作并在后期注入 steering")
+    ctx.max_steps = 45
+
+    steered = False
+
+    def fake_drain() -> list[dict[str, Any]]:
+        nonlocal steered
+        if turn_count == 44 and not steered:
+            steered = True
+            return [{"content": "顺便再多做一步检查"}]
+        return []
+
+    ctx._drain_steering_messages = fake_drain
+
+    turn_count = 0
+
+    async def fake_turn(**kwargs: Any) -> Any:
+        nonlocal turn_count
+        turn_count += 1
+        if turn_count <= 46:
+            return SimpleNamespace(
+                id=f"int-{turn_count}",
+                steps=[
+                    SimpleNamespace(
+                        type="function_call",
+                        id=f"fc-{turn_count}",
+                        name="list_files",
+                        arguments={"path": "."},
+                    )
+                ],
+                output_text="",
+            )
+        return SimpleNamespace(id=f"int-{turn_count}", steps=[], output_text="已完成所有 47 轮。")
+
+    ctx.llm = MagicMock()
+    ctx.llm.last_used_model = "gemini-3.8-flash"
+    ctx.llm.run_agent_turn = AsyncMock(side_effect=fake_turn)
+
+    result = await adapter.execute(ctx)
+    assert turn_count == 47
+    assert result.metadata["max_steps_reached"] is False
+    assert result.metadata["step_budget"] == 49
+    assert "已完成所有 47 轮" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_task_manager_marks_max_steps_reached_as_failed_with_summary(tmp_path: Path):
+    """When an adapter reaches max steps, TaskManager marks run failed while preserving the summary message."""
+    from app.adapters.base import AdapterResult
+    from app.adapters.registry import AdapterRegistry
+    from app.task_manager import TaskManager
+    from app.workspace import WorkspaceManager
+
+    class _MaxStepsAdapter(InternalAgentAdapter):
+        async def execute(self, ctx: AdapterContext) -> AdapterResult:
+            return AdapterResult(
+                summary="已扫描一半目录，剩余部分尚未完成。",
+                raw_output="已扫描一半目录，剩余部分尚未完成。",
+                session_id="sess-1",
+                model_used="gemini-3.8-flash",
+                thinking_level_used="low",
+                metadata={
+                    "adapter": "internal_agent",
+                    "max_steps_reached": True,
+                    "step_budget": 10,
+                },
+            )
+
+    db = Database(tmp_path / "kiki.db")
+    db.init_db()
+    bus = EventBus()
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    tool_exec = WorkspaceToolExecutor(ws_root, tmp_path / "artifacts", db, bus)
+    ws_mgr = WorkspaceManager(ws_root)
+    reg = AdapterRegistry([_MaxStepsAdapter()])
+
+    tm = TaskManager(
+        db=db,
+        llm=MagicMock(),
+        event_bus=bus,
+        tool_executor=tool_exec,
+        adapter_registry=reg,
+        workspace_manager=ws_mgr,
+    )
+
+    topic = db.create_topic("测试触顶")
+    user_msg = db.create_message(topic["id"], "user", "执行长任务")
+    run = tm.enqueue_run(
+        topic_id=topic["id"],
+        trigger_message_id=user_msg["id"],
+        user_content="执行长任务",
+        agent_type="internal_agent",
+    )
+    task = tm._tasks[run["id"]]
+    await task
+
+    updated_run = db.get_session_run(run["id"])
+    assert updated_run is not None
+    assert updated_run["status"] == "failed"
+    assert "最大步数上限" in (updated_run["current_step"] or "")
+    assert "10 步" in (updated_run["error_message"] or "")
+
+    msgs = db.list_messages(topic["id"])
+    assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert "已扫描一半目录" in assistant_msgs[0]["content"]
+    assert assistant_msgs[0]["metadata"]["max_steps_reached"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_shell_grep_no_match_is_not_error(tmp_path: Path):
+    """POSIX grep/rg no-match (exit code 1 without stderr) should not be treated as a tool error."""
+    db = Database(tmp_path / "kiki.db")
+    db.init_db()
+    bus = EventBus()
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir()
+    (ws_root / "sample.txt").write_text("hello world\n", encoding="utf-8")
+    executor = WorkspaceToolExecutor(ws_root, tmp_path / "artifacts", db, bus)
+
+    out1, err1 = await executor.run_shell("run-1", "grep definitely_not_present sample.txt")
+    assert err1 is False
+    assert "no matches" in out1
+
+    out2, err2 = await executor.run_shell("run-1", "printf 'hello\\n' | grep nope")
+    assert err2 is False
+    assert "no matches" in out2
+
+    # Real grep error (missing file -> exit code 2 + stderr) must still be an error
+    out3, err3 = await executor.run_shell("run-1", "grep foo nonexistent_file.txt")
+    assert err3 is True
+    assert "[exit code 2]" in out3
+
+    # Non-search command returning exit code 1 must still be an error
+    out4, err4 = await executor.run_shell("run-1", "false")
+    assert err4 is True
+    assert "[exit code 1]" in out4
+
+
+
 
 
 

@@ -537,14 +537,26 @@ class TaskManager:
 
             result = await adapter.execute(ctx)
             summary = result.summary.strip() or "后台任务已完成。"
+            result_meta = result.metadata or {}
+            max_steps_reached = bool(result_meta.get("max_steps_reached"))
+            step_budget = result_meta.get("step_budget")
 
             self._run_states.pop(run_id, None)
             self.event_bus.clear_hitl_request(run_id)
-            self.db.update_session_run(
-                run_id,
-                status="completed",
-                current_step="任务已完成",
-            )
+            if max_steps_reached:
+                limit_label = f"（{step_budget} 步）" if step_budget else ""
+                self.db.update_session_run(
+                    run_id,
+                    status="failed",
+                    current_step=f"已达最大步数上限{limit_label}",
+                    error_message=f"已达到最大执行步数上限{limit_label}，任务尚未完全收敛",
+                )
+            else:
+                self.db.update_session_run(
+                    run_id,
+                    status="completed",
+                    current_step="任务已完成",
+                )
             self._publish_run_update(run_id)
 
             final_metadata = {
@@ -556,6 +568,7 @@ class TaskManager:
                 "model_used": result.model_used,
                 "thinking_level_used": result.thinking_level_used,
                 "session_id": result.session_id,
+                "max_steps_reached": max_steps_reached,
             }
             already_emitted_same = bool(
                 ctx.last_emitted_message_id
@@ -606,10 +619,11 @@ class TaskManager:
                 run_id,
                 json.dumps(
                     {
-                        "event": "run_completed",
+                        "event": "run_max_steps_reached" if max_steps_reached else "run_completed",
                         "agent_type": adapter.agent_type,
                         "model_used": result.model_used,
                         "thinking_level_used": result.thinking_level_used,
+                        "max_steps_reached": max_steps_reached,
                         "summary": summary,
                     },
                     ensure_ascii=False,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,6 +55,40 @@ def _is_sensitive_path(target: Path, allowed_roots: list[Path] | Path) -> bool:
         except ValueError:
             continue
     return True
+
+
+_SEARCH_NO_MATCH_COMMANDS = {"grep", "egrep", "fgrep", "rg"}
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _extract_last_shell_command(cmd: str) -> Optional[str]:
+    """Return the executable basename of the final command segment in a shell pipeline/list."""
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars="|;&")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = cmd.split()
+
+    segment: list[str] = []
+    for tok in tokens:
+        if tok in {"|", ";", "&&", "||", "&"}:
+            segment = []
+        else:
+            segment.append(tok)
+
+    for tok in segment:
+        if _ENV_ASSIGN_RE.match(tok):
+            continue
+        return Path(tok).name
+    return None
+
+
+def _is_search_no_match(cmd: str, exit_code: Optional[int], stderr_lines: list[str]) -> bool:
+    """POSIX grep/rg return exit code 1 when no matches are found (exit code 2+ indicates real error)."""
+    if exit_code != 1 or stderr_lines:
+        return False
+    return _extract_last_shell_command(cmd) in _SEARCH_NO_MATCH_COMMANDS
 
 
 def _sanitized_shell_env() -> dict[str, str]:
@@ -449,17 +484,23 @@ class WorkspaceToolExecutor:
             return msg, True
 
         exit_code = proc.returncode
+        no_match = _is_search_no_match(cmd, exit_code, stderr_lines)
+        is_error = exit_code != 0 and not no_match
         combined = "\n".join(stdout_lines)
         if stderr_lines:
             err_text = "\n".join(stderr_lines)
             combined = f"{combined}\n[stderr]\n{err_text}" if combined else f"[stderr]\n{err_text}"
         if not combined:
-            combined = f"(exit code {exit_code}, no output)"
-        if exit_code != 0:
+            combined = (
+                "(no matches, exit code 1)"
+                if no_match
+                else f"(exit code {exit_code}, no output)"
+            )
+        if exit_code != 0 and not no_match:
             combined = f"{combined}\n[exit code {exit_code}]"
         if len(combined) > 4000:
             combined = combined[:4000] + "\n... (output truncated)"
-        return combined, exit_code != 0
+        return combined, is_error
 
     async def execute(self, run_id: str, name: str, arguments: dict[str, Any]) -> tuple[str, bool]:
         """Execute a non-HITL workspace tool. Returns (result_text, is_error)."""
