@@ -77,6 +77,8 @@ class MockDesktopDriver:
         self.cua_driver_available: bool = False
         self.recorded_ax_actions: list[dict[str, Any]] = []
         self.ax_action_fail_refs: set[str] = set()
+        self.wake_calls: int = 0
+        self.display_awake_held: bool = False
         self.ui_tree: list[UIElementNode] = [
             UIElementNode(
                 ref="e1",
@@ -159,6 +161,17 @@ class MockDesktopDriver:
             ),
             error=None if self.available else "Mock desktop unavailable",
         )
+
+    def wake_display(self, *, keep_awake: bool = True) -> bool:
+        if not self.available:
+            return False
+        self.wake_calls += 1
+        if keep_awake:
+            self.display_awake_held = True
+        return True
+
+    def release_display_awake(self) -> None:
+        self.display_awake_held = False
 
     def capture_frame(
         self,

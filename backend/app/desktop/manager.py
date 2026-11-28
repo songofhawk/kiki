@@ -121,10 +121,28 @@ class DesktopTakeoverManager:
         self.default_max_width = max(640, min(2560, default_max_width))
         self._active_session: Optional[DesktopSession] = None
 
+    def wake_display(self, *, keep_awake: bool = True) -> bool:
+        fn = getattr(self.driver, "wake_display", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(keep_awake=keep_awake))
+        except Exception:
+            return False
+
+    def _release_display_awake(self) -> None:
+        fn = getattr(self.driver, "release_display_awake", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
     def _evict_if_expired(self) -> None:
         if self._active_session and self._active_session.is_expired():
             expired = self._active_session
             self._active_session = None
+            self._release_display_awake()
             self._publish_session_event("expired", expired)
 
     def _publish_session_event(self, state: str, session: Optional[DesktopSession]) -> None:
@@ -214,6 +232,7 @@ class DesktopTakeoverManager:
             instructions=instructions,
         )
         self._active_session = session
+        self.wake_display(keep_awake=True)
         self._publish_session_event("started", session)
         return session
 
@@ -263,6 +282,7 @@ class DesktopTakeoverManager:
         if session_id is not None and sess.id != session_id:
             raise DesktopNotFoundError("桌面接管会话不存在或已结束")
         self._active_session = None
+        self._release_display_awake()
         summary = sess.to_public_dict()
         self._publish_session_event("ended", sess)
         return summary

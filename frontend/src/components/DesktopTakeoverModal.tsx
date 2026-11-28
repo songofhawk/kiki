@@ -43,6 +43,7 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
   const [handoffBusy, setHandoffBusy] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const lastMoveSentRef = useRef<number>(0);
@@ -224,6 +225,45 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
     return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
   }, [open, sendWs]);
 
+  const isEditableTarget = useCallback((target: EventTarget | null): boolean => {
+    if (!(target instanceof HTMLElement)) return false;
+    if (target.isContentEditable) return true;
+    const tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }, []);
+
+  const focusCanvas = useCallback(() => {
+    canvasRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  useEffect(() => {
+    if (!open || !canControl) return;
+    if (!isEditableTarget(document.activeElement)) {
+      focusCanvas();
+    }
+
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target) || isEditableTarget(document.activeElement)) return;
+      if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return;
+      if (['Meta', 'Control', 'Alt', 'Shift', 'CapsLock', 'OS'].includes(e.key)) return;
+      e.preventDefault();
+      const modifiers: string[] = [];
+      if (e.metaKey) modifiers.push('meta');
+      if (e.ctrlKey) modifiers.push('ctrl');
+      if (e.altKey) modifiers.push('alt');
+      if (
+        e.shiftKey ||
+        (e.key.length === 1 && e.key >= 'A' && e.key <= 'Z' && !e.metaKey && !e.ctrlKey && !e.altKey)
+      ) {
+        modifiers.push('shift');
+      }
+      sendWs({ type: 'input', payload: { action: 'key_tap', key: e.key, modifiers } });
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [open, canControl, isEditableTarget, focusCanvas, sendWs]);
+
   const handleMouseMove = (e: React.MouseEvent<HTMLImageElement>) => {
     if (!canControl) return;
     const now = performance.now();
@@ -240,7 +280,7 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
   const handleMouseDown = (e: React.MouseEvent<HTMLImageElement>) => {
     if (!canControl) return;
     e.preventDefault();
-    (e.currentTarget as HTMLElement).focus();
+    focusCanvas();
     const pt = mapPointerCoords(e);
     if (pt) {
       const btn = mapButton(e.button);
@@ -275,19 +315,6 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
       type: 'input',
       payload: { action: 'mouse_scroll', delta_x: -Math.round(e.deltaX / 3), delta_y: -Math.round(e.deltaY / 3) },
     });
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!canControl) return;
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-    e.preventDefault();
-    const modifiers: string[] = [];
-    if (e.metaKey) modifiers.push('meta');
-    if (e.ctrlKey) modifiers.push('ctrl');
-    if (e.altKey) modifiers.push('alt');
-    if (e.shiftKey) modifiers.push('shift');
-    if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return;
-    sendWs({ type: 'input', payload: { action: 'key_tap', key: e.key, modifiers } });
   };
 
   const handleUpdateConfig = async (patch: {
@@ -373,8 +400,14 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
           onChangeDisplay={(display_index) => void handleUpdateConfig({ display_index })}
           onSwitchSpace={(payload) => void handleSwitchSpace(payload)}
           onRefresh={() => sendWs({ type: 'refresh' })}
-          onSendShortcut={(key, modifiers = []) => sendWs({ type: 'input', payload: { action: 'key_combo', key, modifiers } })}
-          onSendText={(text) => sendWs({ type: 'input', payload: { action: 'type_text', text } })}
+          onSendShortcut={(key, modifiers = []) => {
+            sendWs({ type: 'input', payload: { action: 'key_combo', key, modifiers } });
+            focusCanvas();
+          }}
+          onSendText={(text) => {
+            sendWs({ type: 'input', payload: { action: 'type_text', text } });
+            focusCanvas();
+          }}
           onSyncClipboardFromServer={() => {
             if (!session) return;
             fetchDesktopClipboard(session.id)
@@ -409,8 +442,8 @@ export const DesktopTakeoverModal: React.FC<DesktopTakeoverModalProps> = ({
 
         {/* Interactive Remote Desktop Canvas */}
         <div
+          ref={canvasRef}
           tabIndex={0}
-          onKeyDown={handleKeyDown}
           className="flex-1 bg-[#181716] flex items-center justify-center overflow-hidden relative focus:outline-none select-none"
         >
           {loading && !frameSrc ? (

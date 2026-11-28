@@ -95,6 +95,8 @@ class MacOSDesktopDriver:
         self._pressed_buttons: set[str] = set()
         self._screencapture = shutil.which("screencapture") or "/usr/sbin/screencapture"
         self._sips = shutil.which("sips") or "/usr/bin/sips"
+        self._caffeinate = shutil.which("caffeinate") or "/usr/bin/caffeinate"
+        self._awake_proc: Optional[subprocess.Popen[bytes]] = None
         self._load_frameworks()
         self._a11y = MacOSA11yEngine()
         self._cua = CuaDriverBridge(mode=cua_mode, binary=cua_bin)
@@ -254,6 +256,46 @@ class MacOSDesktopDriver:
             for d in displays
         )
 
+    def wake_display(self, *, keep_awake: bool = True) -> bool:
+        """Wake sleeping macOS display via caffeinate (-u) and optionally prevent display sleep (-d)."""
+        if platform.system() != "Darwin" or not os.path.exists(self._caffeinate):
+            return False
+        self.release_display_awake()
+        try:
+            if keep_awake:
+                self._awake_proc = subprocess.Popen(
+                    [self._caffeinate, "-d", "-u", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    [self._caffeinate, "-u", "-t", "1"],
+                    capture_output=True,
+                    timeout=3,
+                    check=False,
+                )
+            return True
+        except OSError:
+            return False
+
+    def release_display_awake(self) -> None:
+        """Release any active display-awake caffeinate assertion held for a takeover session."""
+        proc = self._awake_proc
+        self._awake_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+        except OSError:
+            pass
+
     def capture_frame(self, display_index: int = 0, max_width: int = 1280, quality: int = 75) -> CapturedFrame:
         displays = self._list_displays()
         if not displays:
@@ -351,6 +393,7 @@ class MacOSDesktopDriver:
                 arr = (ctypes.c_uint16 * len(units))(*units)
                 for is_down in (True, False):
                     evt = self._cg.CGEventCreateKeyboardEvent(None, 0, is_down)
+                    self._cg.CGEventSetFlags(evt, 0)
                     self._cg.CGEventKeyboardSetUnicodeString(evt, len(units), arr)
                     self._post_and_release(evt)
         elif act in ("key_down", "key_up", "key_tap", "key_combo") and event.key:
@@ -363,8 +406,7 @@ class MacOSDesktopDriver:
             steps = (True,) if act == "key_down" else ((False,) if act == "key_up" else (True, False))
             for is_down in steps:
                 evt = self._cg.CGEventCreateKeyboardEvent(None, code, is_down)
-                if flags:
-                    self._cg.CGEventSetFlags(evt, flags)
+                self._cg.CGEventSetFlags(evt, flags)
                 self._post_and_release(evt)
 
     def get_clipboard(self) -> str:

@@ -315,6 +315,7 @@ def create_desktop_router(
                     except Exception as exc:
                         await websocket.send_json({"type": "error", "message": str(exc)})
                 elif msg_type == "refresh":
+                    await asyncio.to_thread(manager.wake_display, keep_awake=True)
                     force_refresh.set()
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong", "ts": msg.get("ts")})

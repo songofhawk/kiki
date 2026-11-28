@@ -98,6 +98,8 @@ async def test_manager_session_lifecycle_exclusive_lock_and_tokens() -> None:
     assert sess.fps == 5
     assert sess.run_id == "run-123"
     assert mgr.get_active_session() is sess
+    assert driver.wake_calls == 1
+    assert driver.display_awake_held is True
 
     # Exclusive lock blocks second session unless force=True
     with pytest.raises(DesktopConflictError):
@@ -144,6 +146,7 @@ async def test_manager_session_lifecycle_exclusive_lock_and_tokens() -> None:
     ended = mgr.end_session(sess2.id)
     assert ended is not None and ended["id"] == sess2.id
     assert mgr.get_active_session() is None
+    assert driver.display_awake_held is False
     with pytest.raises(DesktopNotFoundError):
         mgr.require_session(sess2.id)
 
