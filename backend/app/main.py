@@ -116,7 +116,11 @@ def create_app(
         event_bus=bus,
         search_service=search_service,
     )
-    resolved_desktop_driver = desktop_driver or create_desktop_driver(cfg.desktop_driver)
+    resolved_desktop_driver = desktop_driver or create_desktop_driver(
+        cfg.desktop_driver,
+        cua_mode=cfg.cua_driver_mode,
+        cua_bin=cfg.cua_driver_bin or None,
+    )
     desktop_manager = DesktopTakeoverManager(
         driver=resolved_desktop_driver,
         event_bus=bus,

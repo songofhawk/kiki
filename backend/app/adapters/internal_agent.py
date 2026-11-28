@@ -24,15 +24,16 @@ from .base import (
 )
 
 AGENT_SYSTEM_PROMPT = """你是 Kiki 的后台重型执行引擎 (internal_agent)。
-你可以使用工作区、长期记忆、联网与桌面 ComputerUse 工具（list_files, read_file, write_artifact, run_shell, recall_memory, save_memory, forget_memory, web_search, fetch_webpage, computer_screenshot, computer_action, request_human_approval, request_desktop_takeover）来完成用户的复杂任务。
+你可以使用工作区、长期记忆、联网与桌面 ComputerUse 工具（list_files, read_file, write_artifact, run_shell, recall_memory, save_memory, forget_memory, web_search, fetch_webpage, computer_ui_tree, computer_screenshot, computer_action, request_human_approval, request_desktop_takeover）来完成用户的复杂任务。
 
 执行规范：
 1. 先探索再操作，合理调用工具获取真实信息；需要回忆之前其他话题的讨论、偏好或项目背景时，优先调用 `recall_memory`；若用户明确要求记住或忘掉某条偏好/事实时，调用 `save_memory` / `forget_memory`；需要最新资讯、文档或外部资料时，优先调用 `web_search` 与 `fetch_webpage`。
 2. 若需要产出报告、分析文档或代码，使用 `write_artifact` 保存为产物文件。
 3. 若任务涉及高风险操作、破坏性变更或需要用户明确拍板确认，必须调用 `request_human_approval` 挂起等待用户决策。
 4. 若任务遇到必须人工在服务器桌面亲自操作的场景（如登录/二步验证、图形验证码、滑块校验、OAuth 授权、桌面软件弹窗或系统权限确认），必须立即调用 `request_desktop_takeover` 挂起并交由主人接管服务器桌面（切勿尝试绕过验证码），待主人处理完成后继续执行。
-5. **ComputerUse 桌面视觉操作与自媒体发布规范**（当可用 `computer_screenshot` / `computer_action` 时）：
-   - 坐标系统统一为 `0..1000` 归一化网格，`(0, 0)` 为当前显示器左上角，`(1000, 1000)` 为右下角；每次操作前先观察当前截图，操作后根据返回的最新截图确认状态再进行下一步。
+5. **ComputerUse 2.0 桌面操作与自媒体发布规范**（当可用 `computer_ui_tree` / `computer_screenshot` / `computer_action` 时）：
+   - **优先 A11y 语义树 + 后台动作（省 Token、精准、不抢鼠键）**：定位原生应用或网页控件时，优先调用 `computer_ui_tree`（可传 `app_name` 直接查看后台窗口，可传 `query` 过滤关键词）获取元素引用 `ref`（如 `e1`, `e2`），然后用 `computer_action(action="ax_press", ref=...)` / `ax_set_value` / `ax_focus`（或在 `click`/`type` 中传 `ref`）直接后台触发，失败时会自动回退到精确中心坐标。仅在需要视觉核验、遇到 Canvas/自绘控件或 A11y 树为空时，再用 `computer_screenshot` + `0..1000` 归一化像素坐标。
+   - 坐标系统统一为 `0..1000` 归一化网格，`(0, 0)` 为当前显示器左上角，`(1000, 1000)` 为右下角；每次视觉操作前先观察当前截图，操作后根据返回的最新状态确认再进行下一步。
    - **多显示器协同**：每次截屏或操作返回的 JSON 中都包含 `displays`（列出所有显示器及每个显示器上可见的应用窗口 `windows`）和 `display_index`。`open_url` / `open_app` 会自动跟随前台窗口所在的显示器并记住当前激活显示器；如果没在当前屏幕看到目标窗口，**切勿重复打开同一网页或乱切其他浏览器**，请查看 `displays` 并传入对应的 `display_index` 截屏定位！
    - 发布自媒体文章/视频（如小红书、微信公众号、抖音、B站、知乎、YouTube、X 等）推荐流程：
      a) 先在工作区准备好正文、标题、标签或核实本地视频/封面图路径；
@@ -88,10 +89,17 @@ def _step_label_for_tool(tool_name: str, args: dict[str, Any]) -> str:
         return "正在记录长期记忆..."
     if tool_name == "forget_memory":
         return "正在清理指定记忆..."
+    if tool_name == "computer_ui_tree":
+        app_hint = str(args.get("app_name") or "").strip()
+        return f"正在读取 {app_hint or '当前窗口'} 的 A11y 界面语义树..."
     if tool_name == "computer_screenshot":
         return "正在截取桌面屏幕观察画面..."
     if tool_name == "computer_action":
         act = str(args.get("action") or "").strip().lower()
+        if act in ("ax_press", "ax_set_value", "ax_focus"):
+            ref = args.get("ref", "?")
+            verb = {"ax_press": "后台点击元素", "ax_set_value": "后台填写元素", "ax_focus": "后台聚焦元素"}[act]
+            return f"正在通过 A11y {verb} `{ref}`..."
         if act == "open_url":
             u = str(args.get("url", ""))
             short_u = u if len(u) <= 42 else u[:42] + "…"

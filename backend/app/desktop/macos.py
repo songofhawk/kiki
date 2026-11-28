@@ -14,13 +14,18 @@ import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+from .cua_bridge import CuaDriverBridge
+from .macos_a11y import MacOSA11yEngine
 from .models import (
+    AXActionResult,
     CapturedFrame,
     DesktopCapabilities,
     DesktopInputEvent,
     DesktopPermissions,
     DesktopSpaceInfo,
     DisplayInfo,
+    UIElementNode,
+    UITreeSnapshot,
 )
 
 # CoreGraphics constants
@@ -79,11 +84,11 @@ class _CGRect(ctypes.Structure):
 
 
 class MacOSDesktopDriver:
-    """Zero-dependency macOS desktop capture & CoreGraphics input driver."""
+    """Zero-dependency macOS desktop capture, A11y tree, optional CUA bridge & CoreGraphics driver."""
 
     driver_name = "macos"
 
-    def __init__(self) -> None:
+    def __init__(self, *, cua_mode: str = "auto", cua_bin: Optional[str] = None) -> None:
         self._cg: Any = None
         self._cf: Any = None
         self._ax: Any = None
@@ -91,6 +96,8 @@ class MacOSDesktopDriver:
         self._screencapture = shutil.which("screencapture") or "/usr/sbin/screencapture"
         self._sips = shutil.which("sips") or "/usr/bin/sips"
         self._load_frameworks()
+        self._a11y = MacOSA11yEngine()
+        self._cua = CuaDriverBridge(mode=cua_mode, binary=cua_bin)
 
     def _load_frameworks(self) -> None:
         if platform.system() != "Darwin":
@@ -192,6 +199,8 @@ class MacOSDesktopDriver:
             displays=displays,
             spaces=spaces,
             supports_space_switch=ax_ok,
+            supports_a11y=ax_ok,
+            cua_driver_available=self._cua.is_available,
             permissions=DesktopPermissions(screen_recording=screen_ok, accessibility=ax_ok, warnings=tuple(warnings)),
         )
 
@@ -561,3 +570,146 @@ class MacOSDesktopDriver:
             if owner not in bucket and len(bucket) < 5:
                 bucket.append(owner)
         return by_display
+
+    def _find_app_pid(self, app_name: str) -> tuple[Optional[int], Optional[str], Optional[int]]:
+        """Find (pid, owner_name, display_index) for a visible app window matching app_name."""
+        needle = (app_name or "").strip().lower()
+        if not needle or not self._cg or not self._cf:
+            return None, None, None
+        cf = self._cf
+        arr = self._cg.CGWindowListCopyWindowInfo(17, 0)
+        if not arr:
+            return None, None, None
+        displays = self._list_displays()
+        cf_keys: list[Any] = []
+        try:
+            def _cfstr(s: str) -> Any:
+                ref = cf.CFStringCreateWithCString(None, s.encode("utf-8"), 0x08000100)
+                if ref:
+                    cf_keys.append(ref)
+                return ref
+
+            def _to_str(ref: Any) -> str:
+                if not ref:
+                    return ""
+                buf = ctypes.create_string_buffer(512)
+                if cf.CFStringGetCString(ref, buf, 512, 0x08000100):
+                    return buf.value.decode("utf-8", errors="replace")
+                return ""
+
+            def _to_int(ref: Any) -> int:
+                if not ref:
+                    return 0
+                v = ctypes.c_longlong(0)
+                cf.CFNumberGetValue(ref, 4, ctypes.byref(v))
+                return v.value
+
+            def _to_double(ref: Any) -> float:
+                if not ref:
+                    return 0.0
+                v = ctypes.c_double(0.0)
+                cf.CFNumberGetValue(ref, 13, ctypes.byref(v))
+                return v.value
+
+            k_owner = _cfstr("kCGWindowOwnerName")
+            k_pid = _cfstr("kCGWindowOwnerPID")
+            k_layer = _cfstr("kCGWindowLayer")
+            k_bounds = _cfstr("kCGWindowBounds")
+            k_x, k_y, k_w, k_h = _cfstr("X"), _cfstr("Y"), _cfstr("Width"), _cfstr("Height")
+
+            count = int(cf.CFArrayGetCount(arr))
+            for i in range(count):
+                entry = cf.CFArrayGetValueAtIndex(arr, i)
+                if not entry or _to_int(cf.CFDictionaryGetValue(entry, k_layer)) != 0:
+                    continue
+                owner = _to_str(cf.CFDictionaryGetValue(entry, k_owner))
+                if not owner or needle not in owner.lower():
+                    continue
+                pid = _to_int(cf.CFDictionaryGetValue(entry, k_pid))
+                bounds = cf.CFDictionaryGetValue(entry, k_bounds)
+                d_idx: Optional[int] = None
+                if bounds and displays:
+                    x = _to_double(cf.CFDictionaryGetValue(bounds, k_x))
+                    y = _to_double(cf.CFDictionaryGetValue(bounds, k_y))
+                    w = _to_double(cf.CFDictionaryGetValue(bounds, k_w))
+                    h = _to_double(cf.CFDictionaryGetValue(bounds, k_h))
+                    d_idx = self._match_display_for_rect(displays, x, y, w, h)
+                if pid > 0:
+                    return pid, owner, d_idx
+            return None, None, None
+        finally:
+            cf.CFRelease(arr)
+            for ref in cf_keys:
+                cf.CFRelease(ref)
+
+    def get_cua_status(self) -> dict[str, Any]:
+        return self._cua.probe().to_dict()
+
+    def get_ui_tree(
+        self,
+        *,
+        display_index: int = 0,
+        app_name: Optional[str] = None,
+        interactive_only: bool = True,
+        query: Optional[str] = None,
+        max_depth: int = 8,
+        max_nodes: int = 120,
+        prefer_cua: bool = True,
+    ) -> UITreeSnapshot:
+        """Inspect UI accessibility tree via cua-driver (if installed) or native macOS AXUIElement."""
+        displays = self._list_displays()
+        if not displays:
+            raise RuntimeError("No active macOS displays found")
+        target_display = displays[min(max(0, display_index), len(displays) - 1)]
+
+        pid: Optional[int] = None
+        resolved_app_name: Optional[str] = app_name
+        if app_name:
+            found_pid, found_owner, found_display = self._find_app_pid(app_name)
+            if found_pid:
+                pid = found_pid
+                resolved_app_name = found_owner or app_name
+                if found_display is not None and 0 <= found_display < len(displays):
+                    target_display = displays[found_display]
+
+        if prefer_cua and self._cua.is_available and not query:
+            cua_tree = self._cua.get_ui_tree(
+                display=target_display,
+                app_name=resolved_app_name,
+                max_nodes=max_nodes,
+            )
+            if cua_tree is not None:
+                return cua_tree
+
+        return self._a11y.get_ui_tree(
+            display=target_display,
+            pid=pid,
+            app_name_hint=resolved_app_name,
+            interactive_only=interactive_only,
+            query=query,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
+
+    def get_cached_ui_node(self, ref: str) -> Optional[tuple[UIElementNode, int]]:
+        return self._a11y.get_cached_node(ref)
+
+    def perform_ax_action(
+        self,
+        *,
+        ref: str,
+        action: str,
+        value: Optional[str] = None,
+        display_index: int = 0,
+    ) -> AXActionResult:
+        """Execute a background A11y/CUA semantic action on a cached element ref."""
+        if ref.startswith("cua_") and self._cua.is_available:
+            cua_res = self._cua.perform_ax_action(
+                ref=ref,
+                action=action,
+                value=value,
+                display_index=display_index,
+            )
+            if cua_res is not None:
+                return cua_res
+        return self._a11y.perform_ax_action(ref=ref, action=action, value=value)

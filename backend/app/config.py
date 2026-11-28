@@ -89,6 +89,8 @@ class Settings:
     computer_use_max_steps: int = 80
     computer_use_screenshot_width: int = 1280
     computer_use_screenshot_quality: int = 70
+    cua_driver_mode: str = "auto"
+    cua_driver_bin: str = ""
 
     @property
     def api_key_configured(self) -> bool:
@@ -210,6 +212,9 @@ def load_settings() -> Settings:
     computer_use_max_steps = _parse_int_env("KIKI_COMPUTER_USE_MAX_STEPS", 80, 15, 200)
     computer_use_screenshot_width = _parse_int_env("KIKI_COMPUTER_USE_SCREENSHOT_WIDTH", 1280, 640, 1920)
     computer_use_screenshot_quality = _parse_int_env("KIKI_COMPUTER_USE_SCREENSHOT_QUALITY", 70, 35, 95)
+    raw_cua_mode = os.getenv("KIKI_CUA_DRIVER_MODE", "auto").strip().lower()
+    cua_driver_mode = raw_cua_mode if raw_cua_mode in ("auto", "prefer", "off") else "auto"
+    cua_driver_bin = os.getenv("KIKI_CUA_DRIVER_BIN", "").strip()
     auth_session_ttl = _parse_int_env("KIKI_AUTH_SESSION_TTL_SECONDS", 7 * 24 * 3600, 300, 90 * 24 * 3600)
     raw_auth_cookie_secure = os.getenv("KIKI_AUTH_COOKIE_SECURE", "false").strip().lower()
     auth_cookie_secure = raw_auth_cookie_secure in ("1", "true", "yes", "on")
@@ -262,6 +267,8 @@ def load_settings() -> Settings:
         computer_use_max_steps=computer_use_max_steps,
         computer_use_screenshot_width=computer_use_screenshot_width,
         computer_use_screenshot_quality=computer_use_screenshot_quality,
+        cua_driver_mode=cua_driver_mode,
+        cua_driver_bin=cua_driver_bin,
     )
 
 

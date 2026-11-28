@@ -10,7 +10,9 @@ from .computer_use import (
     ComputerUseExecutor,
     ComputerUseResult,
 )
+from .cua_bridge import CuaDriverBridge, CuaDriverStatus
 from .macos import MacOSDesktopDriver
+from .macos_a11y import MacOSA11yEngine
 from .manager import (
     DesktopConflictError,
     DesktopDisabledError,
@@ -22,6 +24,7 @@ from .manager import (
 )
 from .mock import MockDesktopDriver
 from .models import (
+    AXActionResult,
     CapturedFrame,
     ControlMode,
     DesktopCapabilities,
@@ -32,28 +35,38 @@ from .models import (
     DesktopSpaceInfo,
     DisplayInfo,
     MouseButton,
+    UIElementNode,
+    UITreeSnapshot,
 )
 
 
-def create_desktop_driver(driver_name: str = "auto") -> DesktopDriver:
+def create_desktop_driver(
+    driver_name: str = "auto",
+    *,
+    cua_mode: str = "auto",
+    cua_bin: str | None = None,
+) -> DesktopDriver:
     """Instantiate the configured desktop driver (auto -> macOS on Darwin, else Mock)."""
     name = (driver_name or "auto").strip().lower()
     if name == "mock":
         return MockDesktopDriver()
     if name == "macos":
-        return MacOSDesktopDriver()
+        return MacOSDesktopDriver(cua_mode=cua_mode, cua_bin=cua_bin)
     if platform.system() == "Darwin":
-        return MacOSDesktopDriver()
+        return MacOSDesktopDriver(cua_mode=cua_mode, cua_bin=cua_bin)
     return MockDesktopDriver(available=False)
 
 
 __all__ = [
+    "AXActionResult",
     "COMPUTER_USE_TOOL_DECLARATIONS",
     "COMPUTER_USE_TOOL_NAMES",
     "CapturedFrame",
     "ComputerUseExecutor",
     "ComputerUseResult",
     "ControlMode",
+    "CuaDriverBridge",
+    "CuaDriverStatus",
     "DesktopCapabilities",
     "DesktopConflictError",
     "DesktopDisabledError",
@@ -68,8 +81,11 @@ __all__ = [
     "DesktopTakeoverManager",
     "DesktopUnauthorizedError",
     "DisplayInfo",
+    "MacOSA11yEngine",
     "MacOSDesktopDriver",
     "MockDesktopDriver",
     "MouseButton",
+    "UIElementNode",
+    "UITreeSnapshot",
     "create_desktop_driver",
 ]

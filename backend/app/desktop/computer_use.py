@@ -21,7 +21,7 @@ from ..tools import (
 from .manager import DesktopTakeoverManager
 from .models import CapturedFrame, DesktopCapabilities, DesktopInputEvent
 
-COMPUTER_USE_TOOL_NAMES = frozenset({"computer_screenshot", "computer_action"})
+COMPUTER_USE_TOOL_NAMES = frozenset({"computer_screenshot", "computer_ui_tree", "computer_action"})
 
 _MUTATING_ACTIONS = frozenset(
     {
@@ -40,6 +40,8 @@ _MUTATING_ACTIONS = frozenset(
         "set_clipboard",
     }
 )
+
+_AX_ACTIONS = frozenset({"ax_press", "ax_set_value", "ax_focus"})
 
 _INPUT_INJECTION_ACTIONS = frozenset(
     {
@@ -89,12 +91,56 @@ COMPUTER_USE_TOOL_DECLARATIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "computer_ui_tree",
+        "description": (
+            "Inspect the structured OS Accessibility (A11y) / CUA UI tree for the frontmost app "
+            "or a specified background app_name. Returns compact JSON elements with short refs "
+            "('e1', 'e2', ...), roles, titles, values, supported AX actions, and 0..1000 bounds/centers. "
+            "Prefer this over repeated screenshots for fast, accurate, low-token UI inspection."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Optional app name (e.g. 'Google Chrome', 'Finder'). Supports inspecting background apps without stealing focus.",
+                },
+                "display_index": {
+                    "type": "integer",
+                    "description": "Target display index (default active display).",
+                },
+                "interactive_only": {
+                    "type": "boolean",
+                    "description": "Only return interactive/actionable controls (default true).",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive substring filter on role/title/description/value.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum tree depth to traverse (default 8, max 20).",
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "description": "Maximum elements to return (default 120, max 400).",
+                },
+                "include_screenshot": {
+                    "type": "boolean",
+                    "description": "Also attach a desktop screenshot (default false to save tokens).",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
         "name": "computer_action",
         "description": (
-            "Execute a desktop GUI action (click, double_click, right_click, move, drag, scroll, "
-            "type, key, wait, open_url, open_app, select_file_in_dialog, switch_space, "
-            "get_clipboard, set_clipboard) and optionally return a fresh post-action screenshot. "
-            "All coordinates (x, y, end_x, end_y) use the 0..1000 normalized grid."
+            "Execute a desktop GUI action. Supports both Computer-Use 2.0 background A11y/CUA semantic "
+            "actions by element ref ('ax_press', 'ax_set_value', 'ax_focus', or 'click'/'type' with 'ref') "
+            "and pixel-coordinate actions ('click', 'double_click', 'right_click', 'move', 'drag', 'scroll', "
+            "'type', 'key', 'wait', 'open_url', 'open_app', 'select_file_in_dialog', 'switch_space', "
+            "'get_clipboard', 'set_clipboard'). Coordinates use the 0..1000 normalized grid."
         ),
         "parameters": {
             "type": "object",
@@ -102,6 +148,9 @@ COMPUTER_USE_TOOL_DECLARATIONS: list[dict[str, Any]] = [
                 "action": {
                     "type": "string",
                     "enum": [
+                        "ax_press",
+                        "ax_set_value",
+                        "ax_focus",
                         "click",
                         "double_click",
                         "right_click",
@@ -119,6 +168,14 @@ COMPUTER_USE_TOOL_DECLARATIONS: list[dict[str, Any]] = [
                         "set_clipboard",
                     ],
                     "description": "Desktop action to perform.",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Element reference ID from computer_ui_tree (e.g. 'e3') for ax_press/ax_set_value/ax_focus or ref-targeted click/type.",
+                },
+                "fallback_to_click": {
+                    "type": "boolean",
+                    "description": "For ref-based actions: if background AX action fails, automatically fall back to clicking/typing at the element's center (default true).",
                 },
                 "x": {
                     "type": "number",
@@ -594,12 +651,177 @@ class ComputerUseExecutor:
         )
         return {"selected_file": str(resolved)}
 
+    async def _handle_ui_tree(self, run_id: str, arguments: dict[str, Any]) -> ComputerUseResult:
+        driver = self.desktop_manager.driver
+        caps: DesktopCapabilities = await asyncio.to_thread(driver.probe)
+        if not caps.available:
+            return self._error_result(caps.error or "当前服务器桌面不可用")
+        if not caps.permissions.accessibility:
+            return self._error_result("辅助功能权限未开启，无法读取桌面 A11y UI 树。")
+
+        get_tree_fn = getattr(driver, "get_ui_tree", None)
+        if not callable(get_tree_fn):
+            return self._error_result("当前桌面驱动不支持 A11y UI 树读取，请使用 computer_screenshot。")
+
+        display_index = self._resolve_display_index(arguments.get("display_index"), caps)
+        app_name = str(arguments.get("app_name") or "").strip() or None
+        interactive_only = bool(arguments.get("interactive_only", True))
+        query = str(arguments.get("query") or "").strip() or None
+        max_depth = max(1, min(20, int(arguments.get("max_depth") or 8)))
+        max_nodes = max(10, min(400, int(arguments.get("max_nodes") or 120)))
+        include_screenshot = bool(arguments.get("include_screenshot", False))
+
+        snapshot = await asyncio.to_thread(
+            get_tree_fn,
+            display_index=display_index,
+            app_name=app_name,
+            interactive_only=interactive_only,
+            query=query,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
+        self._active_display_index = snapshot.display_index
+
+        meta: dict[str, Any] = {
+            "ok": True,
+            "action": "ui_tree",
+            "cua_driver_available": caps.cua_driver_available,
+            **snapshot.to_dict(),
+        }
+
+        frame: Optional[CapturedFrame] = None
+        if include_screenshot:
+            if not caps.permissions.screen_recording:
+                meta["screenshot_warning"] = "屏幕录制权限未开启，已仅返回 A11y UI 树。"
+            else:
+                frame, _ = await self._capture_and_optionally_save(
+                    run_id,
+                    display_index=snapshot.display_index,
+                    save_artifact=False,
+                    artifact_label="",
+                    default_label="桌面截图",
+                )
+                meta["width"] = frame.width
+                meta["height"] = frame.height
+
+        return ComputerUseResult(
+            text=json.dumps(meta, ensure_ascii=False),
+            is_error=False,
+            image_bytes=frame.data if frame else None,
+            mime_type=frame.mime_type if frame else None,
+        )
+
+    async def _handle_ax_ref_action(
+        self,
+        *,
+        action: str,
+        ref: str,
+        text: Optional[str],
+        replace: bool,
+        paste_override: Any,
+        fallback_to_click: bool,
+        display_index: int,
+        caps: DesktopCapabilities,
+    ) -> tuple[Optional[dict[str, Any]], Optional[ComputerUseResult]]:
+        """Execute a background A11y/CUA action on `ref`, with optional coordinate fallback."""
+        driver = self.desktop_manager.driver
+        perform_fn = getattr(driver, "perform_ax_action", None)
+        if not callable(perform_fn):
+            return None, self._error_result("当前桌面驱动不支持 A11y 元素引用操作。")
+
+        ax_verb = {
+            "ax_press": "press",
+            "click": "press",
+            "ax_set_value": "set_value",
+            "type": "set_value",
+            "ax_focus": "focus",
+        }.get(action, action)
+
+        ax_res = await asyncio.to_thread(
+            perform_fn,
+            ref=ref,
+            action=ax_verb,
+            value=text,
+            display_index=display_index,
+        )
+        if ax_res.ok:
+            return {
+                "ref": ref,
+                "backend": ax_res.backend,
+                "method": ax_res.method,
+                "background": True,
+                **({"center": list(ax_res.center)} if ax_res.center else {}),
+            }, None
+
+        # Fallback to exact center-coordinate HID click/type when allowed and center is known
+        center = ax_res.center
+        target_display = ax_res.display_index
+        if center is None:
+            cached_fn = getattr(driver, "get_cached_ui_node", None)
+            if callable(cached_fn):
+                cached = cached_fn(ref)
+                if cached:
+                    center = cached[0].center
+                    target_display = cached[1]
+
+        if not fallback_to_click or center is None or ax_verb == "focus":
+            return None, self._error_result(
+                ax_res.error or f"A11y 动作 {action} 失败 (ref={ref})",
+                ref=ref,
+                backend=ax_res.backend,
+            )
+
+        conflict = self._check_human_takeover_conflict()
+        if conflict is not None:
+            return None, conflict
+
+        nx, ny = self._norm_coord(center[0]), self._norm_coord(center[1])
+        await self._send_input(
+            DesktopInputEvent(
+                action="mouse_click",
+                x=nx,
+                y=ny,
+                button="left",
+                display_index=target_display,
+            )
+        )
+        if ax_verb == "set_value" and text is not None:
+            await asyncio.sleep(0.08)
+            type_detail = await self._handle_type(
+                text=str(text),
+                paste_override=paste_override,
+                replace=replace,
+                display_index=target_display,
+                caps=caps,
+            )
+            return {
+                "ref": ref,
+                "backend": ax_res.backend,
+                "method": "fallback_click_type",
+                "background": False,
+                "ax_error": ax_res.error,
+                "center": [center[0], center[1]],
+                **type_detail,
+            }, None
+
+        return {
+            "ref": ref,
+            "backend": ax_res.backend,
+            "method": "fallback_click",
+            "background": False,
+            "ax_error": ax_res.error,
+            "center": [center[0], center[1]],
+        }, None
+
     async def _handle_action(self, run_id: str, arguments: dict[str, Any]) -> ComputerUseResult:
         action = str(arguments.get("action") or "").strip().lower()
         if not action:
             return self._error_result("Missing required parameter: 'action'")
 
-        if action in _MUTATING_ACTIONS:
+        ref = str(arguments.get("ref") or "").strip() or None
+        is_ref_action = action in _AX_ACTIONS or (ref is not None and action in ("click", "type"))
+
+        if action in _MUTATING_ACTIONS and not is_ref_action:
             conflict = self._check_human_takeover_conflict()
             if conflict is not None:
                 return conflict
@@ -609,10 +831,10 @@ class ComputerUseExecutor:
         if not caps.available:
             return self._error_result(caps.error or "当前服务器桌面不可用")
 
-        if action in _INPUT_INJECTION_ACTIONS and (
+        if (action in _INPUT_INJECTION_ACTIONS or is_ref_action) and (
             not caps.supports_control or not caps.permissions.accessibility
         ):
-            return self._error_result("辅助功能权限未开启，无法执行桌面鼠键操作。")
+            return self._error_result("辅助功能权限未开启，无法执行桌面鼠键或 A11y 操作。")
 
         if action in ("get_clipboard", "set_clipboard") and not caps.supports_clipboard:
             return self._error_result("当前桌面驱动不支持剪贴板读写。")
@@ -624,7 +846,27 @@ class ComputerUseExecutor:
 
         detail: dict[str, Any] = {}
 
-        if action in ("click", "double_click", "right_click", "move"):
+        if is_ref_action:
+            if not ref:
+                return self._error_result(f"Action '{action}' requires 'ref' from computer_ui_tree.")
+            text_val = arguments.get("text")
+            if action in ("ax_set_value", "type") and text_val is None:
+                return self._error_result(f"Action '{action}' requires 'text'.")
+            ax_detail, ax_err = await self._handle_ax_ref_action(
+                action=action,
+                ref=ref,
+                text=str(text_val) if text_val is not None else None,
+                replace=bool(arguments.get("replace", True)),
+                paste_override=arguments.get("paste"),
+                fallback_to_click=bool(arguments.get("fallback_to_click", True)),
+                display_index=display_index,
+                caps=caps,
+            )
+            if ax_err is not None:
+                return ax_err
+            detail = ax_detail or {}
+
+        elif action in ("click", "double_click", "right_click", "move"):
             x, y = arguments.get("x"), arguments.get("y")
             if x is None or y is None:
                 return self._error_result(f"Action '{action}' requires 'x' and 'y' coordinates.")
@@ -802,6 +1044,8 @@ class ComputerUseExecutor:
             wait_after = 0.0
         elif raw_wait is None and action in ("open_url", "open_app"):
             wait_after = 1.5
+        elif raw_wait is None and is_ref_action:
+            wait_after = 0.25
         else:
             wait_after = max(0.0, min(10.0, float(0.6 if raw_wait is None else raw_wait)))
         if wait_after > 0:
@@ -826,7 +1070,8 @@ class ComputerUseExecutor:
             self._active_display_index = front_display
             auto_switched_display = True
 
-        return_screenshot = bool(arguments.get("return_screenshot", True))
+        default_return_screenshot = not (action in _AX_ACTIONS)
+        return_screenshot = bool(arguments.get("return_screenshot", default_return_screenshot))
         save_artifact = bool(arguments.get("save_artifact", False))
         artifact_label = str(arguments.get("artifact_label") or "").strip()
 
@@ -878,6 +1123,8 @@ class ComputerUseExecutor:
             args = arguments if isinstance(arguments, dict) else {}
             if name == "computer_screenshot":
                 return await self._handle_screenshot(run_id, args)
+            if name == "computer_ui_tree":
+                return await self._handle_ui_tree(run_id, args)
             if name == "computer_action":
                 return await self._handle_action(run_id, args)
             return self._error_result(f"Unknown computer use tool: {name}")

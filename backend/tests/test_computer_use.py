@@ -55,7 +55,7 @@ def _make_env(tmp_path: Path, *, accessibility: bool = True, screen_recording: b
 
 def test_computer_use_tool_declarations_and_openai_flattening() -> None:
     names = {t["name"] for t in COMPUTER_USE_TOOL_DECLARATIONS}
-    assert names == {"computer_screenshot", "computer_action"}
+    assert names == {"computer_screenshot", "computer_ui_tree", "computer_action"}
 
     multimodal_result = [
         {"type": "text", "text": '{"ok": true, "action": "click"}'},
@@ -477,3 +477,103 @@ async def test_computer_use_multi_display_auto_follow_and_default_step_limits(tm
     assert "显示器 1" in meta_shot0.get("hint", "")
 
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_computer_ui_tree_and_background_ax_actions(tmp_path: Path) -> None:
+    cfg, db, bus, driver, desktop_manager, tool_executor = _make_env(tmp_path)
+    cu = ComputerUseExecutor(desktop_manager, tool_executor)
+
+    # 1. Inspect UI tree (no screenshot by default)
+    res_tree = await cu.execute("run-ax", "computer_ui_tree", {"app_name": "Google Chrome"})
+    assert not res_tree.is_error
+    assert res_tree.image_bytes is None
+    tree_meta = json.loads(res_tree.text)
+    assert tree_meta["ok"] is True
+    assert tree_meta["app_name"] == "Google Chrome"
+    assert tree_meta["backend"] == "mock_ax"
+    assert tree_meta["count"] == 2
+    assert tree_meta["elements"][0]["ref"] == "e1"
+    assert tree_meta["elements"][1]["title"] == "发布笔记"
+
+    # 2. Query filter on UI tree
+    res_filtered = await cu.execute("run-ax", "computer_ui_tree", {"query": "发布"})
+    filtered_meta = json.loads(res_filtered.text)
+    assert filtered_meta["count"] == 1
+    assert filtered_meta["elements"][0]["ref"] == "e2"
+
+    # 3. Background ax_press & ax_set_value work even while human takeover session is active!
+    sess = desktop_manager.start_session(control_mode="control", reason="测试人机并发")
+    assert sess.control_mode == "control"
+
+    res_press = await cu.execute("run-ax", "computer_action", {"action": "ax_press", "ref": "e2", "wait_after": 0})
+    assert not res_press.is_error
+    assert res_press.image_bytes is None
+    press_meta = json.loads(res_press.text)
+    assert press_meta["background"] is True
+    assert press_meta["method"] == "ax_press"
+    assert len(driver.recorded_events) == 0  # No physical mouse hijacking!
+    assert driver.recorded_ax_actions[-1] == {"ref": "e2", "action": "press", "value": None}
+
+    res_set = await cu.execute(
+        "run-ax",
+        "computer_action",
+        {"action": "ax_set_value", "ref": "e1", "text": "AI Agent 深度测评", "wait_after": 0},
+    )
+    assert not res_set.is_error
+    assert driver.recorded_ax_actions[-1] == {"ref": "e1", "action": "set_value", "value": "AI Agent 深度测评"}
+
+    # 4. When AX fails on an Electron-style element, fallback_to_click uses exact center coordinates
+    desktop_manager.end_session(sess.id)
+    driver.ax_action_fail_refs.add("e2")
+    res_fb = await cu.execute(
+        "run-ax",
+        "computer_action",
+        {"action": "click", "ref": "e2", "wait_after": 0, "return_screenshot": False},
+    )
+    assert not res_fb.is_error
+    fb_meta = json.loads(res_fb.text)
+    assert fb_meta["method"] == "fallback_click"
+    assert fb_meta["background"] is False
+    assert driver.recorded_events[-1].action == "mouse_click"
+    assert driver.recorded_events[-1].x == pytest.approx(0.76)
+    assert driver.recorded_events[-1].y == pytest.approx(0.842)
+
+    db.close()
+
+
+def test_cua_driver_bridge_probe_and_parse() -> None:
+    from app.desktop import CuaDriverBridge, DisplayInfo
+
+    bridge_off = CuaDriverBridge(mode="off")
+    st_off = bridge_off.probe()
+    assert st_off.available is False
+    assert st_off.mode == "off"
+
+    bridge_missing = CuaDriverBridge(mode="auto", binary="/nonexistent/cua-driver-bin")
+    st_missing = bridge_missing.probe()
+    assert st_missing.available is False
+    assert st_missing.install_hint is not None
+
+    display = DisplayInfo(index=0, display_id=1, name="Main", width=1000, height=500)
+    nodes, truncated = CuaDriverBridge._parse_elements_from_payload(
+        {
+            "elements": [
+                {
+                    "ref": "cua_1",
+                    "role": "AXButton",
+                    "name": "Submit",
+                    "actions": ["AXPress"],
+                    "bounds": {"x": 100, "y": 50, "width": 200, "height": 50},
+                }
+            ]
+        },
+        display,
+        max_nodes=50,
+    )
+    assert truncated is False
+    assert len(nodes) == 1
+    assert nodes[0].ref == "cua_1"
+    assert nodes[0].title == "Submit"
+    assert nodes[0].bounds == (100.0, 100.0, 200.0, 100.0)
+    assert nodes[0].center == (200.0, 150.0)

@@ -157,6 +157,8 @@ class DesktopTakeoverManager:
             "displays": [d.to_dict() for d in caps.displays],
             "spaces": [s.to_dict() for s in caps.spaces],
             "supports_space_switch": caps.supports_space_switch,
+            "supports_a11y": caps.supports_a11y,
+            "cua_driver_available": caps.cua_driver_available,
             "permissions": caps.permissions.to_dict(),
             "error": None if self.enabled else "服务端已禁用桌面接管 (KIKI_DESKTOP_TAKEOVER_ENABLED=false)",
             "driver_error": caps.error,

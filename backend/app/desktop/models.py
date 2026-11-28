@@ -82,6 +82,8 @@ class DesktopCapabilities:
     displays: tuple[DisplayInfo, ...] = ()
     spaces: tuple[DesktopSpaceInfo, ...] = ()
     supports_space_switch: bool = False
+    supports_a11y: bool = False
+    cua_driver_available: bool = False
     permissions: DesktopPermissions = field(default_factory=DesktopPermissions)
     error: Optional[str] = None
 
@@ -95,9 +97,105 @@ class DesktopCapabilities:
             "displays": [d.to_dict() for d in self.displays],
             "spaces": [s.to_dict() for s in self.spaces],
             "supports_space_switch": self.supports_space_switch,
+            "supports_a11y": self.supports_a11y,
+            "cua_driver_available": self.cua_driver_available,
             "permissions": self.permissions.to_dict(),
             "error": self.error,
         }
+
+
+@dataclass(frozen=True)
+class UIElementNode:
+    """One semantic UI element from the OS Accessibility (A11y) tree or CUA driver."""
+
+    ref: str
+    role: str
+    subrole: str = ""
+    title: str = ""
+    description: str = ""
+    value: str = ""
+    enabled: bool = True
+    focused: bool = False
+    actions: tuple[str, ...] = ()
+    bounds: Optional[tuple[float, float, float, float]] = None
+    center: Optional[tuple[float, float]] = None
+    depth: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ref": self.ref, "role": self.role}
+        if self.subrole:
+            payload["subrole"] = self.subrole
+        if self.title:
+            payload["title"] = self.title
+        if self.description and self.description != self.title:
+            payload["description"] = self.description
+        if self.value and self.value != self.title:
+            payload["value"] = self.value
+        if not self.enabled:
+            payload["enabled"] = False
+        if self.focused:
+            payload["focused"] = True
+        if self.actions:
+            payload["actions"] = list(self.actions)
+        if self.bounds is not None:
+            payload["bounds"] = list(self.bounds)
+        if self.center is not None:
+            payload["center"] = list(self.center)
+        return payload
+
+
+@dataclass(frozen=True)
+class UITreeSnapshot:
+    """A structured A11y/CUA UI tree snapshot for a target application/display."""
+
+    app_name: str
+    pid: Optional[int]
+    display_index: int
+    backend: str
+    elements: tuple[UIElementNode, ...]
+    truncated: bool = False
+    captured_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "app_name": self.app_name,
+            "pid": self.pid,
+            "display_index": self.display_index,
+            "backend": self.backend,
+            "coord_space": "0..1000",
+            "count": len(self.elements),
+            "truncated": self.truncated,
+            "elements": [el.to_dict() for el in self.elements],
+        }
+
+
+@dataclass(frozen=True)
+class AXActionResult:
+    """Result of an A11y/CUA semantic action on a UI element reference."""
+
+    ok: bool
+    ref: str
+    action: str
+    backend: str
+    method: str
+    center: Optional[tuple[float, float]] = None
+    display_index: int = 0
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ok": self.ok,
+            "ref": self.ref,
+            "action": self.action,
+            "backend": self.backend,
+            "method": self.method,
+            "display_index": self.display_index,
+        }
+        if self.center is not None:
+            payload["center"] = list(self.center)
+        if self.error:
+            payload["error"] = self.error
+        return payload
 
 
 @dataclass(frozen=True)

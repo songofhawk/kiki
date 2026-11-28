@@ -6,15 +6,18 @@ import hashlib
 import struct
 import time
 import zlib
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from .models import (
+    AXActionResult,
     CapturedFrame,
     DesktopCapabilities,
     DesktopInputEvent,
     DesktopPermissions,
     DesktopSpaceInfo,
     DisplayInfo,
+    UIElementNode,
+    UITreeSnapshot,
 )
 
 
@@ -71,6 +74,30 @@ class MockDesktopDriver:
         self._frame_seq: int = 0
         self._static_frame: Optional[bytes] = None
         self.dynamic_frames: bool = False
+        self.cua_driver_available: bool = False
+        self.recorded_ax_actions: list[dict[str, Any]] = []
+        self.ax_action_fail_refs: set[str] = set()
+        self.ui_tree: list[UIElementNode] = [
+            UIElementNode(
+                ref="e1",
+                role="AXTextField",
+                title="标题输入框",
+                value="",
+                actions=("AXConfirm",),
+                bounds=(200.0, 120.0, 400.0, 40.0),
+                center=(400.0, 140.0),
+                depth=2,
+            ),
+            UIElementNode(
+                ref="e2",
+                role="AXButton",
+                title="发布笔记",
+                actions=("AXPress",),
+                bounds=(700.0, 820.0, 120.0, 44.0),
+                center=(760.0, 842.0),
+                depth=2,
+            ),
+        ]
 
     def _build_displays(self) -> tuple[DisplayInfo, ...]:
         if not self.available:
@@ -123,6 +150,8 @@ class MockDesktopDriver:
             displays=self._build_displays(),
             spaces=self._build_spaces(),
             supports_space_switch=self.accessibility,
+            supports_a11y=self.accessibility,
+            cua_driver_available=self.cua_driver_available,
             permissions=DesktopPermissions(
                 screen_recording=self.screen_recording,
                 accessibility=self.accessibility,
@@ -240,3 +269,97 @@ class MockDesktopDriver:
             i: list(self.windows_by_display.get(i, []))
             for i in range(self.displays_count)
         }
+
+    def get_cua_status(self) -> dict[str, Any]:
+        return {
+            "mode": "auto",
+            "available": self.cua_driver_available,
+            "binary_path": "/mock/bin/cua-driver" if self.cua_driver_available else None,
+        }
+
+    def get_ui_tree(
+        self,
+        *,
+        display_index: int = 0,
+        app_name: Optional[str] = None,
+        interactive_only: bool = True,
+        query: Optional[str] = None,
+        max_depth: int = 8,
+        max_nodes: int = 120,
+        prefer_cua: bool = True,
+    ) -> UITreeSnapshot:
+        if not self.available:
+            raise RuntimeError("Mock desktop unavailable")
+        if not self.accessibility:
+            raise PermissionError("Accessibility permission required")
+        needle = (query or "").strip().lower()
+        items = list(self.ui_tree)
+        if needle:
+            items = [
+                n for n in items
+                if needle in f"{n.role} {n.title} {n.description} {n.value}".lower()
+            ]
+        truncated = len(items) > max_nodes
+        items = items[:max_nodes]
+        backend = "cua_driver" if (prefer_cua and self.cua_driver_available) else "mock_ax"
+        return UITreeSnapshot(
+            app_name=app_name or self.frontmost_app or "MockApp",
+            pid=4242,
+            display_index=min(max(0, display_index), self.displays_count - 1),
+            backend=backend,
+            elements=tuple(items),
+            truncated=truncated,
+            captured_at=time.time(),
+        )
+
+    def get_cached_ui_node(self, ref: str) -> Optional[tuple[UIElementNode, int]]:
+        for n in self.ui_tree:
+            if n.ref == ref:
+                return n, 0
+        return None
+
+    def perform_ax_action(
+        self,
+        *,
+        ref: str,
+        action: str,
+        value: Optional[str] = None,
+        display_index: int = 0,
+    ) -> AXActionResult:
+        if not self.available:
+            raise RuntimeError("Mock desktop unavailable")
+        if not self.accessibility:
+            raise PermissionError("Accessibility permission required")
+        node = next((n for n in self.ui_tree if n.ref == ref), None)
+        if node is None:
+            return AXActionResult(
+                ok=False,
+                ref=ref,
+                action=action,
+                backend="mock_ax",
+                method="cache_miss",
+                display_index=display_index,
+                error=f"未找到元素引用 '{ref}'",
+            )
+        self.recorded_ax_actions.append({"ref": ref, "action": action, "value": value})
+        if ref in self.ax_action_fail_refs:
+            return AXActionResult(
+                ok=False,
+                ref=ref,
+                action=action,
+                backend="mock_ax",
+                method=f"ax_{action}",
+                center=node.center,
+                display_index=display_index,
+                error="Simulated AX failure",
+            )
+        backend = "cua_driver" if self.cua_driver_available else "mock_ax"
+        return AXActionResult(
+            ok=True,
+            ref=ref,
+            action=action,
+            backend=backend,
+            method=f"ax_{action}",
+            center=node.center,
+            display_index=display_index,
+        )
